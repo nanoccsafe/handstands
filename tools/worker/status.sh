@@ -20,5 +20,8 @@ for name in $names; do
   fi
   procs="$(pids_in_worktree "$name" | wc -l)"
   echo "== $name [$(worker_state "$name")] commits=$commits uncommitted=$dirty procs_in_worktree=$procs"
-  grep -vE '^__(DONE|STOPPED)__' "$(log_path "$name")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -n "$lines"
+  if [[ "$lines" -gt 0 ]]; then
+    grep -vE '^__(DONE|STOPPED)__' "$(log_path "$name")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -n "$lines"
+  fi
 done
+exit 0
