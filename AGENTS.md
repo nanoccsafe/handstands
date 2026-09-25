@@ -9,6 +9,7 @@ prompt names the issue and its acceptance criteria. Stay inside that scope.
 - Generated data: `/mnt/sharedOs/handstand-workspace/data/` (shared, git-ignored). Read the path from the
   `HANDSTAND_DATA` env var with that directory as the default. Never commit data files.
 - Do not read or modify `.chainlink/` and do not run `chainlink`; the lead tracks issues.
+- `CLAUDE.md` is the lead's instructions, not yours: do not read or follow it.
 
 ## Layout
 - `pipeline/` Python package `handstand` (uv, src at `pipeline/handstand/`, tests in `pipeline/tests/`)

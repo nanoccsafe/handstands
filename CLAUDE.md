@@ -15,11 +15,14 @@ Workers follow `AGENTS.md`. The plan lives in chainlink (`.chainlink/`, local on
 - Models: default `opencode/space-bunny-free`; alternative `opencode/mimo-v2.6-flash-free` or
   `opencode-go/mimo-v2.6-flash`. Use a different model on retry if a worker fails.
 - Prompt file: write to `/tmp/prompt-<id>.md`, containing the issue title and description, acceptance
-  criteria, relevant existing files to read, and "Follow AGENTS.md."
+  criteria, relevant existing files to read, and "Follow AGENTS.md." Copy it to `docs/prompts/` so prompts
+  survive reboots and can be reused on retry.
 - Spawn: `tools/worker/spawn.sh <id> <slug> /tmp/prompt-<id>.md [model]`
   (creates worktree `../wt-i<id>-<slug>` on branch `i<id>-<slug>`, tmux window in session `workers`,
   log `/tmp/wt-i<id>-<slug>.log`). Then `chainlink issue comment <id> "worker: <branch>, <model>"`.
 - Status: `tools/worker/status.sh` (a log ending in `__DONE__` is finished). Watch live: `tmux attach -t workers`.
+- Stop: `tools/worker/stop.sh <name>` (closes the tmux window, ending the run); add `--clean` to also delete
+  the worktree, branch and log (only when its work is not wanted).
 - Run at most 2-3 workers at once, and only on issues that don't touch the same files.
 
 ## Review and merge
