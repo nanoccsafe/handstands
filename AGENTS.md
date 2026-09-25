@@ -8,6 +8,9 @@ prompt names the issue and its acceptance criteria. Stay inside that scope.
 - Raw videos (read-only): `/mnt/sharedOs/handstand-workspace/videos/`. Never copy, modify or commit them.
 - Generated data: `/mnt/sharedOs/handstand-workspace/data/` (shared, git-ignored). Read the path from the
   `HANDSTAND_DATA` env var with that directory as the default. Never commit data files.
+- Never `cd` into directories outside your worktree (data, videos, the main checkout): pass absolute paths to
+  commands instead (`ls /mnt/sharedOs/handstand-workspace/data/...`, `ffprobe <abs path>`) or use Python with
+  `handstand.paths`. A `cd` outside the worktree triggers a permission request nobody can answer and blocks you.
 - Do not read or modify `.chainlink/` and do not run `chainlink`; the lead tracks issues.
 - `CLAUDE.md` is the lead's instructions, not yours: do not read or follow it.
 
