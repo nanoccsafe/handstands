@@ -37,3 +37,6 @@ xcuserdata/
 
 # Local issue tracker (not synced; Mac reaches it over SSH)
 .chainlink/
+
+# Worker task prompt copied into each worktree
+.worker-prompt.md
