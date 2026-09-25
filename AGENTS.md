@@ -27,6 +27,7 @@ prompt names the issue and its acceptance criteria. Stay inside that scope.
 ## Finishing
 1. Run tests and lint; fix failures.
 2. `git add` only the files you created or changed, then commit on your branch with a clear message.
+   Use the repo's configured git identity: never pass `-c user.name`/`user.email` or `--author`.
 3. End with a short report: what you did, files changed, how to run it, anything unfinished or uncertain.
 Do not merge, push, or switch branches. Never use `git stash` (the stash is shared by every worktree).
 
