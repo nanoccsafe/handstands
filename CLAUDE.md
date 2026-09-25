@@ -20,6 +20,9 @@ The default flow is one issue at a time through the opencode-loop-plugin's singl
    reviewer approves; the issue stays open.
 3. When the loop finishes, review it yourself (see below) against the spec. If it falls short, put the findings
    in `chainlink issue comment <id> ...` and rerun: `spawn.sh <id> <slug> --chainlink --rerun` (same worktree).
+   The plugin is meant to work on its own: if the loop fails (no reviewer verdict, a timeout, the orchestrator
+   doing the task itself), say so plainly, write the plugin problem up in `docs/prompts/plugin-*.md` for the user
+   to route, and never patch over it silently.
 4. When it is good, summarize for the user and ask to merge. Merge only with `merge.sh` after approval.
 
 Fallback when the plugin is unavailable: `spawn.sh <id> <slug> <prompt-file> [model]` (one-shot worker; keep the

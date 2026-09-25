@@ -18,7 +18,7 @@ git show-ref --quiet "refs/heads/$name" || { echo "no branch $name" >&2; exit 1;
 # chainlink appends to CHANGELOG.md when issues close; commit that first so it cannot block the merge.
 if ! git diff --quiet -- CHANGELOG.md; then
   git add CHANGELOG.md
-  git commit -q -m "CHANGELOG: chainlink entries"
+  git commit -q -m "CHANGELOG: chainlink entries" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 fi
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo "main has uncommitted changes; commit or discard them first:" >&2
@@ -27,7 +27,7 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
 fi
 
 before="$(git rev-parse HEAD)"
-if ! git merge -q --no-ff "$name" -m "Merge $name (#$issue)"; then
+if ! git merge -q --no-ff "$name" -m "Merge $name (#$issue)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"; then
   echo "merge failed; resolve it by hand. Nothing was cleaned up." >&2
   exit 1
 fi
