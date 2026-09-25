@@ -46,6 +46,29 @@ uv run ruff check
 uv run ruff format .
 ```
 
+## Catalogue
+
+The entry point of the pipeline: one CSV row per video, ffprobe metadata filled in
+and the judgement calls left for a human.
+
+```sh
+cd pipeline
+uv run python -m handstand.catalogue              # -> $HANDSTAND_DATA/catalogue.csv
+uv run python -m handstand.catalogue --videos DIR --out FILE
+```
+
+The script fills `clip_id, filename, session_date, recorded_at, duration_s, fps_avg,
+fps_nominal, is_vfr, width, height, rotation, display_width, display_height,
+bitrate_kbps, codec` and leaves `camera_angle, full_body, skill, outcome, hold_s,
+good_clip, notes` for you, sorted by recording time. `clip_id` is the first 12 hex
+characters of the file's SHA-1, so a renamed clip keeps its row and its annotations.
+
+Re-running is the normal case: metadata is refreshed from the files, annotations
+already in the sheet are kept, clips that appeared since are added with blank
+annotations, and rows whose file has disappeared are kept with `missing` set to
+true. The sheet is written atomically (temp file plus rename), so a failed or
+interrupted run never damages what you have typed.
+
 ## Paths
 
 `handstand.paths` resolves the shared workspace at call time (never at import
