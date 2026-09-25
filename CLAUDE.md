@@ -37,9 +37,10 @@ Workers follow `AGENTS.md`. The plan lives in chainlink (`.chainlink/`, local on
 - `git -C ../wt-<name> log --oneline main..` and `git -C ../wt-<name> diff main...`. Run the tests yourself
   in the worktree. For `mac` issues: `rsync -a --delete --exclude .git ../wt-<name>/ macmini:~/wt/<name>/`
   then `ssh macmini 'cd ~/wt/<name>/swift/HandstandCore && swift test'` (or `xcodebuild` for the app).
-- Summarize the diff and test results for the user. Merge only after the user approves:
-  `git merge --no-ff <branch>`, `git push`, `git worktree remove ../wt-<name>`, `git branch -d <branch>`,
-  then `chainlink issue close <id>`.
+- Summarize the diff and test results for the user. Merge only after the user approves, and only with
+  `tools/worker/merge.sh <name>`: it commits chainlink's CHANGELOG edits, merges, runs the tests (undoing
+  the merge if they fail), pushes, and only then runs `stop.sh --clean` and closes the issue. Never chain
+  merge and cleanup commands by hand: a failed merge followed by `--clean` deletes unmerged work.
 - If rejected: comment the reasons on the issue, remove the worktree, and respawn with a better prompt.
 
 ## Machines
