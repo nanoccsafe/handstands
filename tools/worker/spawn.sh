@@ -2,10 +2,12 @@
 # Spawn an OpenCode worker for one chainlink issue in its own worktree + tmux window.
 #
 # Usage:
-#   tools/worker/spawn.sh <issue-id> <slug> --chainlink [model] [--rerun]
-#       Runs the opencode-loop-plugin single-issue loop: `/chainlink #<id> --no-close`. The plugin's worker
-#       and reviewer iterate until the reviewer approves; the issue stays open for the lead's review and the
-#       user's merge approval. The issue description is the spec, and issue comments carry review feedback.
+#   tools/worker/spawn.sh <issue-id> <slug> --chainlink [worker-model] [--rerun]
+#       Runs the opencode-loop-plugin's deterministic `chainlink-loop --task <id> --no-close` (no LLM in the
+#       control path; one-shot `opencode run --standalone --auto` steps: build-agent worker, plan-agent reviewer
+#       that cannot edit, findings fed back to the same worker session). Existing work on the branch or issue
+#       comments are reviewed first. The issue stays open for the lead's review and the user's merge approval.
+#       The issue description is the spec. Env: CHAINLINK_LOOP (path to the CLI), REVIEWER_MODEL.
 #   tools/worker/spawn.sh <issue-id> <slug> <prompt-file> [model] [--rerun]
 #       Plain one-shot worker with a prompt file (fallback when the plugin is unavailable).
 #
@@ -46,11 +48,14 @@ else
   git -C "$REPO" worktree add -q "$wt" -b "$name" main
 fi
 
+loop_cli="${CHAINLINK_LOOP:-/tmp/opencode/opencode-loop-plugin/bin/chainlink-loop}"
+reviewer_model="${REVIEWER_MODEL:-opencode-go/mimo-v2.6-flash}"
 if [[ "$mode" == "--chainlink" ]]; then
-  message="/chainlink #${issue} --no-close"
-  printf '%s\n' "$message" > "$wt/.worker-prompt.md"
+  [[ -x "$loop_cli" ]] || { echo "chainlink-loop not found at $loop_cli (set CHAINLINK_LOOP)" >&2; exit 1; }
+  run_cmd="'$loop_cli' --task $issue --no-close --worker-model '$model' --reviewer-model '$reviewer_model'"
 else
   cp "$mode" "$wt/.worker-prompt.md"
+  run_cmd="opencode run --standalone --auto -m '$model' --title '$name' \"\$(cat .worker-prompt.md)\""
 fi
 
 [[ -n "$rerun" ]] && echo "__RERUN__ $(date -Is)" >> "$log" || : > "$log"
@@ -59,6 +64,7 @@ NAME=$name
 ISSUE=$issue
 MODE=$([[ "$mode" == "--chainlink" ]] && echo chainlink || echo prompt)
 MODEL=$model
+REVIEWER_MODEL=$([[ "$mode" == "--chainlink" ]] && echo "$reviewer_model" || echo -)
 WORKTREE=$wt
 STARTED=$(date -Is)
 EOF
@@ -66,7 +72,8 @@ EOF
 tmux has-session -t "$TMUX_SESSION" 2>/dev/null || tmux new-session -d -s "$TMUX_SESSION" -n idle
 tmux new-window -d -t "$TMUX_SESSION" -n "$name" -c "$wt" \
   -e "CHAINLINK_DB=$REPO/.chainlink" \
-  "opencode run --standalone --auto -m '$model' --title '$name' \"\$(cat .worker-prompt.md)\" 2>&1 | tee -a '$log';
+  -e "OPENCODE_LOOP_STATE_PATH=$WORKER_STATE/$name.loop-state.json" \
+  "$run_cmd 2>&1 | tee -a '$log';
    echo \"__DONE__ exit=\${PIPESTATUS[0]} \$(date -Is)\" >> '$log'"
 
-echo "spawned $name ($([[ "$mode" == "--chainlink" ]] && echo "chainlink loop" || echo "prompt file"), model $model) in $wt, log $log"
+echo "spawned $name ($([[ "$mode" == "--chainlink" ]] && echo "chainlink-loop, worker $model, reviewer $reviewer_model" || echo "prompt file, model $model")) in $wt, log $log"

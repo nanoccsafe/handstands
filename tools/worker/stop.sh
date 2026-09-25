@@ -44,7 +44,7 @@ stop_one() {
     opencode session list 2>/dev/null | awk -v n="$name" -F '\t' '$2 == n {print $1}' | while read -r sid; do
       opencode session delete "$sid" >/dev/null 2>&1 && echo "$name: deleted opencode session $sid"
     done
-    rm -f "$log" "$(env_path "$name")"
+    rm -f "$log" "$(env_path "$name")" "$WORKER_STATE/$name.loop-state.json"
   fi
 }
 
