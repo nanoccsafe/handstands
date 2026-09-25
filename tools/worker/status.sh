@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
-# Show state of every worker log: running / done, plus the last lines.
+# Show every worker: state, branch commits, uncommitted files, and the last log lines.
+# States: RUNNING (window alive), DONE, STOPPED, ORPHANED (no window, no end marker: it died or was killed
+# outside stop.sh; run stop.sh <name> to make sure nothing is left).
 # Usage: tools/worker/status.sh [lines]
+set -uo pipefail
+source "$(dirname "$0")/lib.sh"
 lines="${1:-5}"
-shopt -s nullglob
-for log in /tmp/wt-i*.log; do
-  name="$(basename "$log" .log)"
-  last="$(tail -n 1 "$log")"
-  case "$last" in __DONE__) state=DONE ;; __STOPPED__) state=STOPPED ;; *) state=RUNNING ;; esac
-  echo "== ${name#wt-} [$state]"
-  grep -vE "__DONE__|__STOPPED__" "$log" | tail -n "$lines"
+
+names="$( { ls "$WORKER_STATE" 2>/dev/null | sed -n 's/\.env$//p';
+            tmux list-windows -t "$TMUX_SESSION" -F '#W' 2>/dev/null | grep '^i[0-9]' || true; } | sort -u)"
+[[ -z "$names" ]] && { echo "no workers"; exit 0; }
+
+for name in $names; do
+  wt="$(wt_path "$name")"
+  commits="-"; dirty="-"
+  if [[ -d "$wt" ]]; then
+    commits="$(git -C "$wt" rev-list --count main..HEAD 2>/dev/null || echo ?)"
+    dirty="$(git -C "$wt" status --porcelain 2>/dev/null | grep -vc 'worker-prompt' || true)"
+  fi
+  procs="$(pids_in_worktree "$name" | wc -l)"
+  echo "== $name [$(worker_state "$name")] commits=$commits uncommitted=$dirty procs_in_worktree=$procs"
+  grep -vE '^__(DONE|STOPPED)__' "$(log_path "$name")" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -n "$lines"
 done

@@ -18,11 +18,19 @@ Workers follow `AGENTS.md`. The plan lives in chainlink (`.chainlink/`, local on
   criteria, relevant existing files to read, and "Follow AGENTS.md." Copy it to `docs/prompts/` so prompts
   survive reboots and can be reused on retry.
 - Spawn: `tools/worker/spawn.sh <id> <slug> /tmp/prompt-<id>.md [model]`
-  (creates worktree `../wt-i<id>-<slug>` on branch `i<id>-<slug>`, tmux window in session `workers`,
-  log `/tmp/wt-i<id>-<slug>.log`). Then `chainlink issue comment <id> "worker: <branch>, <model>"`.
-- Status: `tools/worker/status.sh` (a log ending in `__DONE__` is finished). Watch live: `tmux attach -t workers`.
-- Stop: `tools/worker/stop.sh <name>` (closes the tmux window, ending the run); add `--clean` to also delete
-  the worktree, branch and log (only when its work is not wanted).
+  (worktree `../wt-i<id>-<slug>`, branch `i<id>-<slug>`, tmux window in session `workers`, state and log in
+  `/tmp/handstand-workers/<name>.{env,log}`). It runs `opencode run --standalone`, so each worker has a
+  private server that dies with its window; never drop `--standalone` (the shared service keeps runs going
+  after the client is gone). It refuses to start if any window, worktree, branch or process of that name is
+  left over. Then `chainlink issue comment <id> "worker: <branch>, <model>"`.
+- Status: `tools/worker/status.sh` shows RUNNING / DONE / STOPPED / ORPHANED, commits, uncommitted files and
+  processes still inside the worktree. ORPHANED means it ended without a marker: run `stop.sh` on it.
+  Watch live: `tmux attach -t workers`.
+- Stop: `tools/worker/stop.sh <name>` closes the window, TERMs then KILLs the process tree and anything whose
+  cwd is in the worktree, and verifies nothing is left. `--clean` also deletes the worktree, branch, state
+  and the worker's OpenCode sessions (only when its work is not wanted). `stop.sh --all [--clean]` for all.
+- Shutdown: before ending a lead session, or when the user says stop, run `tools/worker/stop.sh --all` and
+  confirm `status.sh` shows no RUNNING workers and `procs_in_worktree=0`.
 - Run at most 2-3 workers at once, and only on issues that don't touch the same files.
 
 ## Review and merge

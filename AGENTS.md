@@ -28,4 +28,7 @@ prompt names the issue and its acceptance criteria. Stay inside that scope.
 1. Run tests and lint; fix failures.
 2. `git add` only the files you created or changed, then commit on your branch with a clear message.
 3. End with a short report: what you did, files changed, how to run it, anything unfinished or uncertain.
-Do not merge, push, or switch branches.
+Do not merge, push, or switch branches. Never use `git stash` (the stash is shared by every worktree).
+
+You run non-interactively: nobody can answer questions. If you are blocked or unsure, stop and explain it
+in your final report instead of asking.
