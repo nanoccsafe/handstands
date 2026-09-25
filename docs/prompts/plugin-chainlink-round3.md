@@ -53,7 +53,39 @@ session `i67-multipose` and the workflow records:
    - the stall retry prompt ("continue; your last response stalled") is misleading for this case: the model
      retried the same command and blocked again.
 
+6. **Permissions per role (decided by the user).**
+   - Worker: full auto approval, same as the parent's `--auto` (everything not explicitly denied is allowed).
+   - Reviewer: auto approval too, but it must never edit code: run it as the `plan` agent (or an agent whose
+     edit/write/patch permissions are `deny`, not `ask`), so `--auto` cannot approve edits. It may read files and
+     run tests. Its only output is the verdict JSON; the plugin relays the findings to the worker session, as it
+     does now. Add a test that a reviewer edit attempt is denied without blocking.
+
+## Proposal: drive the loop with one-shot processes instead of an orchestrator LLM and in-server child sessions
+
+Almost every failure so far came from two layers: the orchestrator LLM that sits between `/chainlink` and
+`run_chainlink_outer` (items 1 and 3: retyped input, repeated calls), and long-lived child sessions inside one
+server (item 2 and 5: interrupted state, unanswerable permission requests). Nobody interacts with these
+sessions, so the interactive machinery buys nothing. A deterministic loop over one-shot `opencode run`
+processes would remove those failure classes:
+
+```
+worker:   opencode run --standalone --auto -m <worker model> --title "Chainlink <id> worker" "<issue spec>"
+reviewer: opencode run --standalone --auto --agent plan -m <reviewer model> "<review prompt>"   -> verdict JSON
+if not approved:
+worker:   opencode run --standalone --auto -s <worker session id> "<review findings>"          (keeps context)
+repeat until approved or the attempt limit; stop; never close unless close_on_approval.
+```
+
+- No LLM in the control path: code picks the issue, counts attempts and stops.
+- Every step is a process with `--auto`, its agent's permissions, an exit code and a timeout; killing it stops it.
+- `-s <session>` continues the same worker session, so feedback keeps context (verify `-s` works together with
+  `--standalone`).
+- Cost: a few seconds of startup per step; the in-server wait/interrupt APIs are no longer needed.
+Possible shapes: a non-LLM CLI entry point in the plugin (e.g. `bun run chainlink-loop --task 67 --no-close`),
+or `/chainlink` executing the loop directly instead of prompting a model. If adopted, items 1-4 above become
+unnecessary; item 5's lesson (never leave a permission request unanswered) still applies.
+
 ## Tests
 Adapter or tool normalises `#67`; a second tool call in the same turn is refused; a running workflow owned by a
 live process is never marked interrupted by another instance starting; a finished worker plus stale interrupt
-proceeds to review; a child session's permission request is answered by the configured policy (never left pending); a pending permission is reported by the stall detector.
+proceeds to review; a child session's permission request is answered by the configured policy (never left pending); a pending permission is reported by the stall detector; a reviewer edit attempt is denied without blocking.
