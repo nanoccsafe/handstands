@@ -7,8 +7,10 @@ same columns, same types, same coordinate conventions.
 ## Files
 
 ```
-<data_dir>/keypoints/mediapipe/<rotate>/<clip_id>.parquet   # the keypoints
-<data_dir>/keypoints/mediapipe/<rotate>/<clip_id>.json       # sidecar metadata
+<data_dir>/keypoints/mediapipe/<rotate>/<clip_id>.parquet         # the keypoints
+<data_dir>/keypoints/mediapipe/<rotate>/<clip_id>.json             # sidecar metadata
+<data_dir>/keypoints/mediapipe_multi/<rotate>/<clip_id>.parquet    # --num-poses > 1
+<data_dir>/keypoints/mediapipe_multi/<rotate>/<clip_id>.json        # sidecar metadata
 ```
 
 * `<data_dir>` = `handstand.paths.data_dir()` (default
@@ -16,6 +18,9 @@ same columns, same types, same coordinate conventions.
 * `<rotate>` = the rotation mode the file was produced with: `none`, `180` or
   `auto`. The three modes are independent outputs of the same clip, never
   merged — compare them side by side.
+* `mediapipe_multi` only exists for `--num-poses > 1`. A multi-person run
+  writes to its own root, so it can never overwrite the single-person
+  parquets the other stages read.
 * `<clip_id>` = the `clip_id` column of `<data_dir>/catalogue.csv`
   (`clip_id,filename`) when that file exists, otherwise the first 12 hex
   characters of the SHA-1 of the video file's bytes (same definition as the
@@ -28,12 +33,14 @@ Generate the model first with `cd pipeline && uv run python scripts/download_mod
 cd pipeline
 uv run python -m handstand.pose_mediapipe --rotate none --limit 3
 uv run python -m handstand.pose_mediapipe --rotate auto --limit 3
+uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
 ```
 
 ## Parquet: one row per (frame, joint)
 
 Long format — every frame contributes exactly 33 rows, one per landmark,
-even when nothing was detected.
+even when nothing was detected. (`--num-poses > 1` keeps this layout and adds
+a block per person; see [Several people per frame](#several-people-per-frame---num-poses-25).)
 
 | column | type | meaning |
 |---|---|---|
@@ -92,6 +99,48 @@ Frames where the model found nothing still get their 33 rows with
 consumer can therefore assume `len(frame) == 33` for every frame and filter on
 `detected` instead of re-indexing.
 
+## Several people per frame (`--num-poses 2..5`)
+
+Clips often contain the trainer next to the athlete, and a single-pose
+detector happily snaps the athlete's joints onto whoever is closest to the
+camera. `--num-poses N` asks MediaPipe for up to N people and keeps **all** of
+them; the runner never picks the athlete — that is a later step, reading the
+`person_idx` column described here.
+
+```
+uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
+```
+
+* Output root: `keypoints/mediapipe_multi/<rotate>/<clip_id>.{parquet,json}`.
+  Single-person output is left byte-for-byte alone: same paths, same columns,
+  no `person_idx`, and a sidecar with exactly the keys it always had.
+* Columns: the single-person schema above **plus** one column.
+
+| column | type | meaning |
+|---|---|---|
+| `person_idx` | int64 | which person of that frame the row is about, `0 .. P-1`, in the order MediaPipe returned them (most confident first) |
+
+* One **block of 33 rows per person**, ordered by `frame_idx`, then
+  `person_idx`, then landmark index. A frame with `P` people therefore has
+  `33 * P` rows, and `P` varies from frame to frame.
+* A frame with nobody in it keeps **one** block of 33 rows with
+  `person_idx = -1`, `detected = false` and NaN coordinates — the same
+  placeholder the single-person schema uses, so a frame is never missing from
+  the file. `person_idx = -1` therefore means "no person", never "person -1".
+* `frame_idx`, `t_ms` and `rotated` describe the *frame*, so they repeat
+  across the blocks of that frame.
+* Coordinates are display-frame pixels, as above; `z`, `visibility` and
+  `presence` are that person's own scores.
+
+```python
+import pandas as pd
+
+df = pd.read_parquet(".../keypoints/mediapipe_multi/auto/1a2b3c4d5e6f.parquet")
+people = df[df["detected"]]  # drops the person_idx = -1 placeholder blocks
+for person_idx, block in people[people["frame_idx"] == 0].groupby("person_idx"):
+    print(person_idx, block.set_index("joint").loc["nose", ["x", "y"]])
+```
+
 ## Joint names
 
 The 33 MediaPipe pose landmarks, snake_case, in model order (this is the
@@ -146,6 +195,16 @@ The authoritative list in code is `handstand.pose_mediapipe.JOINT_NAMES`.
 | `mediapipe_version` | version used for the run |
 | `runtime_seconds` | wall-clock seconds for the whole clip, including writing the parquet |
 
+A sidecar under `mediapipe_multi` (i.e. `--num-poses > 1`) adds two keys:
+
+| key | meaning |
+|---|---|
+| `num_poses` | people per frame the model was asked for (2..5) |
+| `frames_by_people` | how many frames had how many people, e.g. `{"0": 3, "1": 120, "2": 98, "3": 23}`; the values add up to `frame_count` |
+
+A single-person sidecar does **not** carry them, so `--num-poses 1` output is
+unchanged.
+
 ## Rotation modes
 
 | mode | frames fed to the model | `rotated` column |
@@ -157,6 +216,14 @@ The authoritative list in code is `handstand.pose_mediapipe.JOINT_NAMES`.
 `auto` owns two landmarker instances (one that only ever sees upright frames,
 one that only ever sees rotated frames) so each MediaPipe VIDEO-mode tracker
 observes a consistent orientation.
+
+With `--num-poses > 1` the `auto` judgement is taken from **the person whose
+wrists are lowest in the image** of the previous frame — the largest mean wrist
+`y` — because that is the one most likely to be the athlete on their hands.
+People whose wrists are not both visible cannot be ranked and are skipped; if
+no person can be ranked the first person is judged instead, which for a
+single-person frame is exactly the rule above. A frame where nobody was
+detected at all still keeps the previous decision.
 
 ## Reading the file
 

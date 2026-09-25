@@ -82,12 +82,28 @@ def make_pose(x: float = 0.5, y: float = 0.5, **overrides: float) -> list[StubLa
 
 def upright_pose(x: float = 0.5) -> list[StubLandmark]:
     """Standing pose: wrists above (smaller y than) ankles in display coords."""
-    return make_pose(x=x, y=0.5, left_wrist=0.2, right_wrist=0.2, left_ankle=0.8, right_ankle=0.8)
+    return handstand_pose(ankles_y=0.8, wrists_y=0.2, x=x)
 
 
 def inverted_pose(x: float = 0.5) -> list[StubLandmark]:
     """Handstand pose: wrists below (greater y than) ankles in display coords."""
-    return make_pose(x=x, y=0.5, left_wrist=0.9, right_wrist=0.9, left_ankle=0.1, right_ankle=0.1)
+    return handstand_pose(ankles_y=0.1, wrists_y=0.9, x=x)
+
+
+def handstand_pose(ankles_y: float, wrists_y: float, x: float = 0.5) -> list[StubLandmark]:
+    """Pose with both wrists at ``wrists_y`` and both ankles at ``ankles_y``.
+
+    Everything else sits at ``y = 0.5``, so only the wrist/ankle comparison
+    decides :func:`pm.is_inverted`. ``wrists_y > ankles_y`` is a handstand.
+    """
+    return make_pose(
+        x=x,
+        y=0.5,
+        left_wrist=wrists_y,
+        right_wrist=wrists_y,
+        left_ankle=ankles_y,
+        right_ankle=ankles_y,
+    )
 
 
 def landmark_array(pose: list[StubLandmark]) -> np.ndarray:
@@ -99,11 +115,16 @@ def landmark_array(pose: list[StubLandmark]) -> np.ndarray:
 
 
 class StubLandmarker:
-    """Fake ``PoseLandmarker``: pops the next scripted result per call."""
+    """Fake ``PoseLandmarker``: pops the next scripted result per call.
+
+    A scripted entry is either ``None`` (nobody detected) or a *list of people*,
+    each one a list of 33 :class:`StubLandmark`. People come back in script
+    order, which is what a real ``num_poses > 1`` run does too.
+    """
 
     def __init__(
         self,
-        script: list[list[StubLandmark] | None],
+        script: list[list[list[StubLandmark]] | None],
         counter: itertools.count[int],
         fed_images: list[np.ndarray],
     ) -> None:
@@ -117,17 +138,17 @@ class StubLandmarker:
         self.timestamps.append(timestamp_ms)
         self.fed_images.append(image.numpy_view().copy())
         index = next(self._counter)
-        pose = self._script[index] if index < len(self._script) else None
-        if pose is None:
+        people = self._script[index] if index < len(self._script) else None
+        if people is None:
             return SimpleNamespace(pose_landmarks=[])
-        return SimpleNamespace(pose_landmarks=[pose])
+        return SimpleNamespace(pose_landmarks=list(people))
 
     def close(self) -> None:
         self.closed = True
 
 
 def stub_factory(
-    script: list[list[StubLandmark] | None],
+    script: list[list[list[StubLandmark]] | None],
 ) -> tuple[object, list[StubLandmarker], list[np.ndarray]]:
     """Return ``(factory, created_landmarkers, fed_images)`` for a scripted run."""
     counter = itertools.count()
@@ -142,15 +163,22 @@ def stub_factory(
     return factory, created, fed_images
 
 
-def default_script() -> list[list[StubLandmark] | None]:
-    """Frames 0-9 and 13-19 detect; frames 10-12 have no pose at all."""
-    script: list[list[StubLandmark] | None] = []
+def default_script() -> list[list[list[StubLandmark]] | None]:
+    """One person per frame; frames 0-9 and 13-19 detect, 10-12 nobody at all."""
+    script: list[list[list[StubLandmark]] | None] = []
     for index in range(FRAME_COUNT):
         if index in (10, 11, 12):
             script.append(None)
         else:
-            script.append(make_pose(x=(index + 0.5) / FRAME_COUNT, y=(index + 0.5) / FRAME_COUNT))
+            script.append([make_pose(x=(index + 0.5) / FRAME_COUNT, y=(index + 0.5) / FRAME_COUNT)])
     return script
+
+
+def people_script(
+    *people_per_frame: list[list[StubLandmark]] | None,
+) -> list[list[list[StubLandmark]] | None]:
+    """Script exactly the given frames; short scripts answer ``None`` afterwards."""
+    return list(people_per_frame)
 
 
 def raw_display_frame(video_path: pathlib.Path, index: int) -> np.ndarray:
@@ -175,7 +203,13 @@ def run(
     clip_id: str = "clip0000000001",
     **kwargs: object,
 ) -> tuple[pm.ClipReport, pathlib.Path]:
-    out_root = tmp_path / "keypoints" / "mediapipe"
+    """Run a clip into ``<tmp_path>/keypoints/<root>`` and return (report, out dir).
+
+    ``root`` is the sub-directory :func:`pm.output_dirname` would pick for
+    ``num_poses``, so a multi-person run cannot land in the single-person root.
+    """
+    num_poses = int(kwargs.get("num_poses", pm.DEFAULT_NUM_POSES))  # type: ignore[arg-type]
+    out_root = tmp_path / "keypoints" / pm.output_dirname(num_poses)
     report = pm.run_clip(
         video_path,
         clip_id=clip_id,
@@ -185,6 +219,57 @@ def run(
         **kwargs,  # type: ignore[arg-type]
     )
     return report, out_root / rotate_mode
+
+
+# --------------------------------------------------------------------------- #
+# A video that does not need ffmpeg: fixed frames, fixed timestamps
+# --------------------------------------------------------------------------- #
+
+STUB_VIDEO_WIDTH = 64
+STUB_VIDEO_HEIGHT = 48
+STUB_VIDEO_FRAMES = 4
+
+
+class StubVideo:
+    """Stand-in for :class:`pm.DisplayVideo` with fixed frames and timestamps.
+
+    Decoding an ffmpeg clip makes the output depend on the ffmpeg build, which
+    is no good for a byte-for-byte regression test: these frames are plain
+    black images with a constant ``t_ms`` ladder.
+    """
+
+    def __init__(self, video_path: str | pathlib.Path) -> None:
+        self.video_path = pathlib.Path(video_path)
+
+    @property
+    def display_width(self) -> int:
+        return STUB_VIDEO_WIDTH
+
+    @property
+    def display_height(self) -> int:
+        return STUB_VIDEO_HEIGHT
+
+    def __iter__(self):
+        for index in range(STUB_VIDEO_FRAMES):
+            frame = np.zeros((STUB_VIDEO_HEIGHT, STUB_VIDEO_WIDTH, 3), dtype=np.uint8)
+            frame[:, :, 0] = index
+            yield pm.FramePacket(frame_idx=index, t_ms=100 * index, frame=frame)
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> StubVideo:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+
+@pytest.fixture
+def stub_video(monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Make the runner read :class:`StubVideo` instead of a real video file."""
+    monkeypatch.setattr(pm, "DisplayVideo", StubVideo)
+    return pathlib.Path("synthetic.mp4")
 
 
 # --------------------------------------------------------------------------- #
@@ -215,6 +300,117 @@ def test_parquet_columns_match_the_documented_schema() -> None:
         "rotated",
         "detected",
     )
+
+
+def test_multi_schema_is_the_single_schema_plus_person_idx() -> None:
+    assert pm.PARQUET_COLUMNS_MULTI == (*pm.PARQUET_COLUMNS, "person_idx")
+    assert pm.PERSON_COLUMN == "person_idx"
+    assert pm.NO_PERSON_IDX == -1
+    assert pm.DEFAULT_NUM_POSES == 1
+    assert pm.MAX_NUM_POSES == 5
+
+
+def test_multi_person_runs_get_their_own_output_root() -> None:
+    assert pm.output_dirname() == "mediapipe"
+    assert pm.output_dirname(1) == "mediapipe"
+    assert pm.output_dirname(2) == "mediapipe_multi"
+    assert pm.output_dirname(5) == "mediapipe_multi"
+    assert pm.SINGLE_OUTPUT_DIRNAME == "mediapipe"
+    assert pm.MULTI_OUTPUT_DIRNAME == "mediapipe_multi"
+    for invalid in (0, 6, -1):
+        with pytest.raises(ValueError, match="num_poses"):
+            pm.output_dirname(invalid)
+
+
+def test_mean_wrist_y_is_the_average_of_both_wrists() -> None:
+    pose = landmark_array(handstand_pose(ankles_y=0.1, wrists_y=0.9))
+    assert pm.mean_wrist_y(pose) == pytest.approx(0.9)
+    one_wrist = make_pose(y=0.5, left_wrist=0.4, right_wrist=0.6)
+    assert pm.mean_wrist_y(landmark_array(one_wrist)) == pytest.approx(0.5)
+    # A missing wrist cannot be ranked.
+    missing = make_pose(y=0.5, left_wrist=0.4, right_wrist=float("nan"))
+    assert np.isnan(pm.mean_wrist_y(landmark_array(missing)))
+    with pytest.raises(ValueError, match="landmarks"):
+        pm.mean_wrist_y(np.zeros((12, 2)))
+
+
+def test_lowest_wrist_pose_picks_the_person_lowest_in_the_image() -> None:
+    # Listed first, but with wrists higher up in the image (y=0.4) than the
+    # second person's (y=0.8), so the second person is the one on their hands.
+    standing = handstand_pose(ankles_y=0.9, wrists_y=0.4, x=0.2)
+    on_hands = handstand_pose(ankles_y=0.1, wrists_y=0.8, x=0.8)
+    picked = pm.lowest_wrist_pose(np.stack([landmark_array(standing), landmark_array(on_hands)]))
+    assert picked is not None
+    assert picked[:, 0].mean() == pytest.approx(0.8)
+
+    # Order does not matter: the lowest wrists win whoever they belong to.
+    picked = pm.lowest_wrist_pose(np.stack([landmark_array(on_hands), landmark_array(standing)]))
+    assert picked is not None
+    assert picked[:, 0].mean() == pytest.approx(0.8)
+
+    # A lone person is always its own winner, so nothing changes for them.
+    picked = pm.lowest_wrist_pose(np.stack([landmark_array(standing)]))
+    assert picked is not None
+    assert picked[:, 0].mean() == pytest.approx(0.2)
+
+
+def test_lowest_wrist_pose_skips_people_without_visible_wrists() -> None:
+    unknown = make_pose(x=0.2, y=0.5, left_wrist=0.9, right_wrist=0.9)
+    broken = make_pose(x=0.8, y=0.5, left_wrist=float("nan"), right_wrist=float("nan"))
+    picked = pm.lowest_wrist_pose(np.stack([landmark_array(broken), landmark_array(unknown)]))
+    assert picked is not None
+    assert picked[:, 0].mean() == pytest.approx(0.2)
+
+    # Nobody rankable -> the first person, exactly as a single-person frame is judged.
+    picked = pm.lowest_wrist_pose(np.stack([landmark_array(broken), landmark_array(broken)]))
+    assert picked is not None
+    assert picked[:, 0].mean() == pytest.approx(0.8)
+
+    with pytest.raises(ValueError, match="poses"):
+        pm.lowest_wrist_pose(np.zeros((0, 33, 2)))
+    with pytest.raises(ValueError, match="poses"):
+        pm.lowest_wrist_pose(np.zeros((2, 12, 2)))
+
+
+def test_detect_pose_keeps_every_person_in_the_order_media_pipe_returned() -> None:
+    """``(P, 33, 5)`` per frame: nobody is dropped or re-sorted."""
+    people = [make_pose(x=0.2), make_pose(x=0.7), make_pose(x=0.4)]
+    landmarker = SimpleNamespace(
+        detect_for_video=lambda image, t_ms: SimpleNamespace(pose_landmarks=people)
+    )
+    frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+
+    poses = pm._detect_pose(landmarker, frame, 0, pathlib.Path("clip.mp4"))
+    assert poses.shape == (3, len(pm.JOINT_NAMES), 5)
+    assert poses.dtype == np.float64
+    assert np.allclose(poses[:, 0, 0], [0.2, 0.7, 0.4])  # x of the nose, per person
+    assert np.allclose(poses[:, :, 3], 0.9)  # visibility survives
+
+    empty = pm._detect_pose(
+        SimpleNamespace(detect_for_video=lambda image, t_ms: SimpleNamespace(pose_landmarks=[])),
+        frame,
+        1,
+        pathlib.Path("clip.mp4"),
+    )
+    assert empty.shape == (0, len(pm.JOINT_NAMES), 5)
+    assert not np.isfinite(empty).any()
+
+    with pytest.raises(RuntimeError, match="landmarks"):
+        pm._detect_pose(
+            SimpleNamespace(
+                detect_for_video=lambda image, t_ms: SimpleNamespace(
+                    pose_landmarks=[[StubLandmark(0, 0, 0, 0, 0)]]
+                )
+            ),
+            frame,
+            2,
+            pathlib.Path("clip.mp4"),
+        )
+
+
+def test_people_histogram_counts_frames_per_number_of_people() -> None:
+    assert pm.people_histogram([]) == {}
+    assert pm.people_histogram([0, 1, 1, 3]) == {0: 1, 1: 2, 3: 1}
 
 
 def test_normalized_to_pixels_uses_edge_pixel_indices() -> None:
@@ -424,7 +620,7 @@ def test_none_mode_writes_the_documented_parquet_schema(
 def test_180_mode_rotates_every_frame_and_maps_back(
     synthetic_video: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    script = [make_pose(x=0.25, y=0.75) for _ in range(FRAME_COUNT)]
+    script = [[make_pose(x=0.25, y=0.75)] for _ in range(FRAME_COUNT)]
     factory, created, fed_images = stub_factory(script)
     report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="180")
 
@@ -449,12 +645,13 @@ def test_180_mode_rotates_every_frame_and_maps_back(
 def test_auto_mode_decides_from_the_previous_frame(
     synthetic_video: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    script: list[list[StubLandmark] | None] = [
-        upright_pose(),  # frame 0: upright -> frame 1 stays upright
-        inverted_pose(),  # frame 1: inverted -> frame 2 gets rotated
-        make_pose(x=0.25, y=0.75),  # frame 2: fed rotated, uniform y -> frame 3 upright
+    script: list[list[list[StubLandmark]] | None] = [
+        [upright_pose()],  # frame 0: upright -> frame 1 stays upright
+        [inverted_pose()],  # frame 1: inverted -> frame 2 gets rotated
+        # frame 2: fed rotated, uniform y -> frame 3 upright
+        [make_pose(x=0.25, y=0.75)],
     ]
-    script += [upright_pose() for _ in range(FRAME_COUNT - 3)]
+    script += [[upright_pose()] for _ in range(FRAME_COUNT - 3)]
     factory, created, fed_images = stub_factory(script)
     report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="auto")
 
@@ -497,8 +694,8 @@ def test_auto_mode_keeps_the_last_decision_when_detection_is_lost(
     # Frame 0 is inverted, frames 1-2 are lost, so frame 3 must still be rotated.
     # Frames 3+ are orientation-neutral (all joints share a y) so they never
     # request a rotation of their own, whatever frame they end up in.
-    script: list[list[StubLandmark] | None] = [inverted_pose(), None, None]
-    script += [make_pose() for _ in range(FRAME_COUNT - 3)]
+    script: list[list[list[StubLandmark]] | None] = [[inverted_pose()], None, None]
+    script += [[make_pose()] for _ in range(FRAME_COUNT - 3)]
     factory, created, _ = stub_factory(script)
     report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="auto")
 
@@ -507,6 +704,321 @@ def test_auto_mode_keeps_the_last_decision_when_detection_is_lost(
     table = pd.read_parquet(out_dir / "clip0000000001.parquet")
     rotated_by_frame = table.groupby("frame_idx")["rotated"].first().tolist()
     assert rotated_by_frame == [False, True, True, True] + [False] * (FRAME_COUNT - 4)
+
+
+# --------------------------------------------------------------------------- #
+# Runner: multi-person
+# --------------------------------------------------------------------------- #
+
+
+def test_multi_person_frame_gets_one_33_row_block_per_person(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Two people in one frame: 33 rows each, labelled 0 and 1."""
+    athlete = make_pose(x=0.25, y=0.30)
+    trainer = make_pose(x=0.75, y=0.70)
+    script = [[athlete, trainer]] + [[upright_pose()] for _ in range(FRAME_COUNT - 1)]
+    factory, created, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, num_poses=3)
+
+    assert not report.skipped
+    assert report.num_poses == 3
+    assert report.frame_count == FRAME_COUNT
+    assert report.detected_frames == FRAME_COUNT
+
+    table = pd.read_parquet(report.parquet_path)
+    assert list(table.columns) == list(pm.PARQUET_COLUMNS_MULTI)
+    assert table["person_idx"].dtype == "int64"
+    assert table["frame_idx"].dtype == "int64"
+    assert table["rotated"].dtype == bool
+    assert table["detected"].dtype == bool
+
+    frame0 = table[table["frame_idx"] == 0]
+    assert len(frame0) == 2 * len(pm.JOINT_NAMES)
+    blocks = frame0.groupby("person_idx")
+    assert sorted(blocks.groups) == [0, 1]
+    for _, block in blocks:
+        assert len(block) == len(pm.JOINT_NAMES)
+        assert set(block["joint"]) == set(pm.JOINT_NAMES)
+        assert block["detected"].all()
+        assert not block[["x", "y", "z", "visibility", "presence"]].isna().any().any()
+
+    # People keep MediaPipe's order: person 0 is the athlete we scripted first.
+    assert np.allclose(blocks.get_group(0)["x"], (WIDTH - 1) * 0.25)
+    assert np.allclose(blocks.get_group(0)["y"], (HEIGHT - 1) * 0.30)
+    assert np.allclose(blocks.get_group(1)["x"], (WIDTH - 1) * 0.75)
+    assert np.allclose(blocks.get_group(1)["y"], (HEIGHT - 1) * 0.70)
+
+    # Every other frame has one person, so 33 rows and person_idx 0 only.
+    others = table[table["frame_idx"] > 0]
+    assert set(others["person_idx"]) == {0}
+    assert others.groupby("frame_idx").size().tolist() == [len(pm.JOINT_NAMES)] * (FRAME_COUNT - 1)
+    assert len(table) == len(pm.JOINT_NAMES) * (2 + FRAME_COUNT - 1)
+
+
+def test_multi_person_frame_without_anyone_keeps_one_nan_block(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A frame with nobody in it is still there: 33 NaN rows, person_idx -1."""
+    script = [
+        [upright_pose(), upright_pose()],  # frame 0: two people
+        None,  # frame 1: nobody at all
+        [make_pose(x=0.2), make_pose(x=0.4), make_pose(x=0.6)],  # frame 2: three
+    ]
+    script += [[upright_pose()] for _ in range(FRAME_COUNT - 3)]
+    factory, created, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, num_poses=3)
+
+    table = pd.read_parquet(report.parquet_path)
+    empty = table[table["frame_idx"] == 1]
+    assert len(empty) == len(pm.JOINT_NAMES)
+    assert set(empty["joint"]) == set(pm.JOINT_NAMES)
+    assert (empty["person_idx"] == pm.NO_PERSON_IDX).all()
+    assert not empty["detected"].any()
+    assert empty[["x", "y", "z", "visibility", "presence"]].isna().all().all()
+    # t_ms/rotated still describe the frame itself.
+    assert empty["t_ms"].nunique() == 1
+
+    # Three people in one frame: person_idx 0, 1 and 2, in script order.
+    three = table[table["frame_idx"] == 2]
+    assert sorted(three["person_idx"].unique()) == [0, 1, 2]
+    assert three.groupby("person_idx").size().tolist() == [len(pm.JOINT_NAMES)] * 3
+    assert np.allclose(
+        [block["x"].mean() for _, block in three.groupby("person_idx")],
+        [(WIDTH - 1) * 0.2, (WIDTH - 1) * 0.4, (WIDTH - 1) * 0.6],
+    )
+
+    assert report.frames_by_people == {2: 1, 0: 1, 3: 1, 1: FRAME_COUNT - 3}
+    assert report.people_summary == "0:1 1:17 2:1 3:1"
+    assert report.detected_frames == FRAME_COUNT - 1
+
+
+def test_multi_person_run_writes_to_the_multi_root_with_num_poses_in_the_sidecar(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    factory, _, _ = stub_factory(default_script())
+    report, out_dir = run(
+        synthetic_video, tmp_path, factory, rotate_mode="auto", num_poses=2, model_name="stub.task"
+    )
+    assert out_dir == tmp_path / "keypoints" / "mediapipe_multi" / "auto"
+    assert report.parquet_path == out_dir / "clip0000000001.parquet"
+    assert report.json_path == out_dir / "clip0000000001.json"
+    assert report.parquet_path.is_file()
+
+    sidecar = json.loads(report.json_path.read_text())
+    assert sidecar["num_poses"] == 2
+    assert sidecar["frames_by_people"] == {"0": 3, "1": FRAME_COUNT - 3}
+    assert sidecar["clip_id"] == "clip0000000001"
+    assert sidecar["model"] == "stub.task"
+    assert sidecar["rotate"] == "auto"
+    assert sidecar["display_width"] == WIDTH
+    assert sidecar["frame_count"] == FRAME_COUNT
+    assert sidecar["detected_frame_count"] == FRAME_COUNT - 3
+
+    # Nothing landed in the single-person root.
+    assert not (tmp_path / "keypoints" / "mediapipe").exists()
+
+
+def test_multi_person_run_leaves_the_single_person_output_untouched(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    single_factory, _, _ = stub_factory(default_script())
+    single, single_dir = run(synthetic_video, tmp_path, single_factory)
+    before = single.parquet_path.read_bytes()
+    sidecar_before = single.json_path.read_text()
+
+    multi_factory, _, _ = stub_factory(default_script())
+    multi, multi_dir = run(synthetic_video, tmp_path, multi_factory, num_poses=2)
+    assert single_dir != multi_dir
+    assert single.parquet_path.read_bytes() == before
+    assert single.json_path.read_text() == sidecar_before
+    assert multi.parquet_path.is_file()
+
+    # And the two schemas agree wherever they overlap: one person per frame,
+    # and the same -1 marker on the frames nobody was found in.
+    single_table = pd.read_parquet(single.parquet_path)
+    multi_table = pd.read_parquet(multi.parquet_path)
+    assert list(single_table.columns) == list(pm.PARQUET_COLUMNS)
+    assert list(multi_table.columns) == list(pm.PARQUET_COLUMNS_MULTI)
+    assert set(multi_table["person_idx"].unique()) == {pm.NO_PERSON_IDX, 0}
+    assert (multi_table.loc[multi_table["detected"], "person_idx"] == 0).all()
+    assert (multi_table.loc[~multi_table["detected"], "person_idx"] == pm.NO_PERSON_IDX).all()
+    assert multi_table.drop(columns=["person_idx"]).equals(single_table)
+
+
+#: SHA-256 of the parquet the runner wrote for :func:`single_person_script`
+#: *before* ``--num-poses`` existed (recorded at commit f8cbff1, so a change
+#: here means the single-person output changed and that has to be deliberate).
+#: Regenerate from a stub-video run of that script if the pandas/pyarrow
+#: versions pinned in ``uv.lock`` ever change.
+SINGLE_PARQUET_SHA256 = "94652ac49f143e0ded5c14739ade95e7c139006d1a2f4012be194a6e5a01a5e4"
+#: Same, for the sidecar with ``runtime_seconds`` removed.
+SINGLE_SIDECAR_SHA256 = "768ef63c668819e61f0aa55e272095b9876d9d05466c961d1c7cc5ba342b45b1"
+
+
+def single_person_script() -> list[list[list[StubLandmark]] | None]:
+    """One person per frame, frame 2 empty — the pre-``--num-poses`` behaviour."""
+    return [
+        [make_pose(0.25 + 0.1 * index, 0.75 - 0.05 * index)] if index != 2 else None
+        for index in range(STUB_VIDEO_FRAMES)
+    ]
+
+
+def test_single_person_output_is_byte_identical(
+    stub_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """``--num-poses 1`` must not move a single byte of the existing outputs."""
+    factory, _, _ = stub_factory(single_person_script())
+    report, out_dir = run(stub_video, tmp_path, factory, model_name="stub.task")
+
+    assert out_dir == tmp_path / "keypoints" / "mediapipe" / "none"
+    assert report.parquet_path == out_dir / "clip0000000001.parquet"
+    assert report.num_poses == 1
+    assert report.frames_by_people == {}
+    assert report.people_summary == ""
+    assert hashlib.sha256(report.parquet_path.read_bytes()).hexdigest() == SINGLE_PARQUET_SHA256
+
+    sidecar = json.loads(report.json_path.read_text())
+    assert "num_poses" not in sidecar
+    assert "frames_by_people" not in sidecar
+    sidecar.pop("runtime_seconds")
+    sidecar_text = json.dumps(sidecar, indent=2, sort_keys=True) + "\n"
+    assert hashlib.sha256(sidecar_text.encode()).hexdigest() == SINGLE_SIDECAR_SHA256
+
+
+def test_auto_mode_with_several_people_follows_the_lowest_wrist_person(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Rotation follows whoever has their hands lowest, not the first person.
+
+    Frame 0 has two people. Person 0 is on their hands but high up in the
+    frame (wrists at y=0.4), so person 1 — standing with arms hanging at
+    y=0.9, i.e. lower in the image — wins the "lowest wrists" rule and is
+    upright. Frame 1 must therefore NOT be rotated, even though the first
+    person MediaPipe returned looks like a handstand.
+    """
+    on_hands = handstand_pose(ankles_y=0.05, wrists_y=0.4, x=0.3)  # person 0, listed first
+    arms_down = handstand_pose(ankles_y=0.98, wrists_y=0.9, x=0.7)  # person 1, wrists lower
+    assert pm.is_inverted(landmark_array(on_hands)) is True
+    assert pm.is_inverted(landmark_array(arms_down)) is False
+    assert pm.mean_wrist_y(landmark_array(arms_down)) > pm.mean_wrist_y(landmark_array(on_hands))
+
+    script = people_script(
+        [on_hands, arms_down],
+        # Frame 1 is orientation-neutral, so it never asks for a rotation itself.
+        [make_pose(), make_pose()],
+    )
+    script += [[upright_pose(), upright_pose()] for _ in range(FRAME_COUNT - 2)]
+    factory, created, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="auto", num_poses=3)
+
+    table = pd.read_parquet(report.parquet_path)
+    rotated_by_frame = table.groupby("frame_idx")["rotated"].first().tolist()
+    assert rotated_by_frame == [False] * FRAME_COUNT
+    assert report.rotated_frames == 0
+    # Both people are still written out for frame 0.
+    assert len(table[table["frame_idx"] == 0]) == 2 * len(pm.JOINT_NAMES)
+
+
+def test_auto_mode_rotates_when_the_second_person_is_the_one_on_their_hands(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Same rule, other way round: the handstand person listed second wins."""
+    arms_down = handstand_pose(ankles_y=0.95, wrists_y=0.4, x=0.3)  # person 0
+    on_hands = handstand_pose(ankles_y=0.1, wrists_y=0.9, x=0.7)  # person 1, wrists lower
+    script = people_script(
+        [arms_down, on_hands],
+        [make_pose(), make_pose()],  # neutral: whatever happens next, no own opinion
+    )
+    script += [[make_pose(), make_pose()] for _ in range(FRAME_COUNT - 2)]
+    factory, created, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="auto", num_poses=2)
+
+    assert len(created) == 2  # upright tracker + rotated tracker, as in single-person auto
+    table = pd.read_parquet(report.parquet_path)
+    rotated_by_frame = table.groupby("frame_idx")["rotated"].first().tolist()
+    assert rotated_by_frame == [False, True] + [False] * (FRAME_COUNT - 2)
+    assert report.rotated_frames == 1
+    # Frame 1 was fed rotated pixels; its keypoints are back in display pixels.
+    frame1 = table[table["frame_idx"] == 1]
+    assert np.allclose(frame1["x"], 0.5 * (WIDTH - 1))
+    assert np.allclose(frame1["y"], 0.5 * (HEIGHT - 1))
+
+
+def test_auto_mode_keeps_every_person_of_a_frame_that_nobody_was_found_in(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A lost frame keeps the previous decision and still writes its NaN block."""
+    on_hands = handstand_pose(ankles_y=0.05, wrists_y=0.4, x=0.3)  # person 0
+    arms_down = handstand_pose(ankles_y=0.98, wrists_y=0.9, x=0.7)  # person 1 wins, upright
+    script = people_script(
+        [on_hands, arms_down],
+        None,  # nobody detected: the previous decision (upright) carries over
+        None,
+    )
+    script += [[upright_pose(), upright_pose()] for _ in range(FRAME_COUNT - 3)]
+    factory, _, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="auto", num_poses=2)
+
+    table = pd.read_parquet(report.parquet_path)
+    assert not table[table["frame_idx"].isin([1, 2])]["detected"].any()
+    assert (table[table["frame_idx"] == 1]["person_idx"] == pm.NO_PERSON_IDX).all()
+    assert report.detected_frames == FRAME_COUNT - 2
+    assert report.rotated_frames == 0
+
+
+@pytest.mark.parametrize("num_poses", [0, 6, -1])
+def test_run_clip_rejects_an_unsupported_number_of_poses(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path, num_poses: int
+) -> None:
+    factory, _, _ = stub_factory(default_script())
+    with pytest.raises(ValueError, match="num_poses"):
+        run(synthetic_video, tmp_path, factory, num_poses=num_poses)
+
+
+def test_make_landmarker_factory_passes_num_poses_to_the_model(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag has to reach ``PoseLandmarkerOptions`` or the model stays at 1."""
+    model = tmp_path / "pose.task"
+    model.write_bytes(b"stub model")
+    seen: dict[str, object] = {}
+
+    class FakeOptions:
+        def __init__(self, **kwargs: object) -> None:
+            seen["options"] = kwargs
+
+    class FakeLandmarker:
+        @staticmethod
+        def create_from_options(options: object) -> str:
+            seen["created_with"] = options
+            return "landmarker"
+
+    monkeypatch.setattr(pm.mp_vision, "PoseLandmarkerOptions", FakeOptions)
+    monkeypatch.setattr(pm.mp_vision, "PoseLandmarker", FakeLandmarker)
+
+    factory = pm.make_landmarker_factory(model, 3)
+    assert factory() == "landmarker"
+    options = seen["options"]
+    assert isinstance(options, dict)
+    assert options["num_poses"] == 3
+    assert options["running_mode"] == pm.mp_vision.RunningMode.VIDEO
+
+    pm.make_landmarker_factory(model)()  # default is still one person
+    assert isinstance(seen["options"], dict)
+    assert seen["options"]["num_poses"] == 1
+
+    for invalid in (0, 6):
+        with pytest.raises(ValueError, match="num_poses"):
+            pm.make_landmarker_factory(model, invalid)
+
+
+def test_make_landmarker_factory_reports_a_missing_model_when_used(tmp_path: pathlib.Path) -> None:
+    """Building the factory is cheap; only using it needs the model on disk."""
+    missing = tmp_path / "absent.task"
+    factory = pm.make_landmarker_factory(missing, 2)  # building it is fine
+    with pytest.raises(FileNotFoundError, match="pose model not found"):
+        factory()
 
 
 # --------------------------------------------------------------------------- #
@@ -547,21 +1059,75 @@ def test_cli_parser_defaults_and_choices() -> None:
     parser = pm.build_arg_parser()
     args = parser.parse_args([])
     assert args.rotate == "none"
+    assert args.num_poses == pm.DEFAULT_NUM_POSES == 1
     assert args.clips is None
     assert args.limit is None
     assert args.overwrite is False
     assert args.model == pm.DEFAULT_MODEL_PATH
 
     args = parser.parse_args(
-        ["--rotate", "auto", "--clips", "a.mp4", "b.mp4", "--limit", "3", "--overwrite"]
+        [
+            "--rotate",
+            "auto",
+            "--clips",
+            "a.mp4",
+            "b.mp4",
+            "--limit",
+            "3",
+            "--overwrite",
+            "--num-poses",
+            "3",
+        ]
     )
     assert args.rotate == "auto"
     assert args.clips == ["a.mp4", "b.mp4"]
     assert args.limit == 3
     assert args.overwrite is True
+    assert args.num_poses == 3
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--rotate", "sideways"])
+    for out_of_range in ("0", "6", "-2"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--num-poses", out_of_range])
+
+
+def test_cli_routes_each_num_poses_to_its_own_output_root(
+    synthetic_video: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--num-poses 1`` keeps the old root, ``--num-poses > 1`` gets its own."""
+    monkeypatch.setattr(pm, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(pm, "videos_dir", lambda: tmp_path)
+    requested: list[int] = []
+
+    def fake_factory(model_path: object, num_poses: int = 1) -> object:
+        requested.append(num_poses)
+        return stub_factory(default_script())[0]
+
+    monkeypatch.setattr(pm, "make_landmarker_factory", fake_factory)
+    clip_id = pm.sha1_clip_id(synthetic_video)
+    common = ["--clips", str(synthetic_video), "--model", "stub.task"]
+
+    assert pm.main(common) == 0
+    assert requested == [1]
+    single = tmp_path / "keypoints" / "mediapipe" / "none" / f"{clip_id}.parquet"
+    assert single.is_file()
+    assert list(pd.read_parquet(single).columns) == list(pm.PARQUET_COLUMNS)
+
+    assert pm.main(["--num-poses", "2", *common]) == 0
+    assert requested == [1, 2]
+    multi = tmp_path / "keypoints" / "mediapipe_multi" / "none" / f"{clip_id}.parquet"
+    assert multi.is_file()
+    table = pd.read_parquet(multi)
+    assert list(table.columns) == list(pm.PARQUET_COLUMNS_MULTI)
+    assert json.loads(multi.with_suffix(".json").read_text())["num_poses"] == 2
+
+    printed = capsys.readouterr().out
+    assert "num_poses=2" in printed
+    assert "people[0:3 1:17]" in printed
 
 
 def test_collect_clips_defaults_to_every_mp4(tmp_path: pathlib.Path) -> None:
