@@ -29,6 +29,7 @@ xcuserdata/
 *.mlmodel
 *.mlpackage/
 *.task
+pipeline/models/
 
 # OS / editor
 .DS_Store

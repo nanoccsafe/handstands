@@ -1,0 +1,41 @@
+[project]
+name = "handstand"
+version = "0.1.0"
+description = "Reference Python pipeline for handstand form analysis"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "coremltools>=9.0",
+    "matplotlib>=3.11.2",
+    "mediapipe>=1.0.1",
+    "numpy>=2.5.3",
+    "opencv-python>=5.0.0.93",
+    "pandas>=3.0.6",
+    "pyarrow>=25.0.1",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.27,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# Flat layout: the package lives at pipeline/handstand, not pipeline/src/handstand.
+module-root = ""
+module-name = "handstand"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
