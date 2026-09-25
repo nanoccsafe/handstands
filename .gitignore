@@ -1,0 +1,39 @@
+# Raw media and derived data never go in git (repo is public)
+videos/
+data/*
+!data/.gitkeep
+!data/splits.json
+*.mp4
+*.mov
+*.jpeg
+*.jpg
+*.npz
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Swift / Xcode
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# ML artifacts (published via releases if needed)
+*.mlmodel
+*.mlpackage/
+*.task
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local issue tracker (not synced; Mac reaches it over SSH)
+.chainlink/
