@@ -561,7 +561,6 @@ def run_clip(
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    table.to_parquet(parquet_path, index=False)
 
     runtime_seconds = time.perf_counter() - started
     sidecar = {
@@ -577,7 +576,17 @@ def run_clip(
         "mediapipe_version": mediapipe_version(),
         "runtime_seconds": round(runtime_seconds, 3),
     }
-    json_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+    # The parquet is written last and atomically: its existence is what marks a clip as done
+    # (see the skip check above), so an interrupted run must never leave a partial one behind.
+    json_tmp = json_path.with_name(f".{json_path.name}.tmp")
+    json_tmp.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+    json_tmp.replace(json_path)
+    parquet_tmp = parquet_path.with_name(f".{parquet_path.name}.tmp")
+    try:
+        table.to_parquet(parquet_tmp, index=False)
+        parquet_tmp.replace(parquet_path)
+    finally:
+        parquet_tmp.unlink(missing_ok=True)
 
     return ClipReport(
         clip_id=clip_id,
