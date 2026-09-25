@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # Spawn an OpenCode worker for one chainlink issue in its own worktree + tmux window.
-# Usage: tools/worker/spawn.sh <issue-id> <slug> <prompt-file> [model]
+#
+# Usage:
+#   tools/worker/spawn.sh <issue-id> <slug> --chainlink [model] [--rerun]
+#       Runs the opencode-loop-plugin single-issue loop: `/chainlink #<id> --no-close`. The plugin's worker
+#       and reviewer iterate until the reviewer approves; the issue stays open for the lead's review and the
+#       user's merge approval. The issue description is the spec, and issue comments carry review feedback.
+#   tools/worker/spawn.sh <issue-id> <slug> <prompt-file> [model] [--rerun]
+#       Plain one-shot worker with a prompt file (fallback when the plugin is unavailable).
+#
+# --rerun reuses the existing worktree and branch (after the lead's review asked for changes); it still refuses
+# if a window or process of that worker is alive.
 #
 # Uses `opencode run --standalone` so the worker has a private server that dies with the tmux window.
 # (Without --standalone the run lives in the shared background service and keeps going after the window
@@ -8,28 +18,46 @@
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
-issue="$1"; slug="$2"; prompt_file="$3"
+rerun=""
+args=()
+for a in "$@"; do [[ "$a" == "--rerun" ]] && rerun=1 || args+=("$a"); done
+set -- "${args[@]}"
+
+issue="$1"; slug="$2"; mode="$3"
 model="${4:-opencode/space-bunny-free}"
 name="i${issue}-${slug}"
 wt="$(wt_path "$name")"; log="$(log_path "$name")"; env="$(env_path "$name")"
 
-# Refuse to reuse anything left over from a previous worker with the same name.
 leftover=""
 window_exists "$name" && leftover+=" tmux-window"
-[[ -e "$wt" ]] && leftover+=" worktree"
-git -C "$REPO" show-ref --quiet "refs/heads/$name" && leftover+=" branch"
 [[ -n "$(pids_in_worktree "$name")" ]] && leftover+=" processes"
+if [[ -z "$rerun" ]]; then
+  [[ -e "$wt" ]] && leftover+=" worktree"
+  git -C "$REPO" show-ref --quiet "refs/heads/$name" && leftover+=" branch"
+fi
 if [[ -n "$leftover" ]]; then
-  echo "refusing: leftover$leftover for $name. Run: tools/worker/stop.sh $name --clean" >&2
+  echo "refusing: leftover$leftover for $name. Stop it (tools/worker/stop.sh $name [--clean]) or use --rerun." >&2
   exit 1
 fi
 
-git -C "$REPO" worktree add -q "$wt" -b "$name" main
-cp "$prompt_file" "$wt/.worker-prompt.md"
-: > "$log"
+if [[ -n "$rerun" ]]; then
+  [[ -d "$wt" ]] || { echo "--rerun: no worktree $wt" >&2; exit 1; }
+else
+  git -C "$REPO" worktree add -q "$wt" -b "$name" main
+fi
+
+if [[ "$mode" == "--chainlink" ]]; then
+  message="/chainlink #${issue} --no-close"
+  printf '%s\n' "$message" > "$wt/.worker-prompt.md"
+else
+  cp "$mode" "$wt/.worker-prompt.md"
+fi
+
+[[ -n "$rerun" ]] && echo "__RERUN__ $(date -Is)" >> "$log" || : > "$log"
 cat > "$env" <<EOF
 NAME=$name
 ISSUE=$issue
+MODE=$([[ "$mode" == "--chainlink" ]] && echo chainlink || echo prompt)
 MODEL=$model
 WORKTREE=$wt
 STARTED=$(date -Is)
@@ -37,7 +65,8 @@ EOF
 
 tmux has-session -t "$TMUX_SESSION" 2>/dev/null || tmux new-session -d -s "$TMUX_SESSION" -n idle
 tmux new-window -d -t "$TMUX_SESSION" -n "$name" -c "$wt" \
+  -e "CHAINLINK_DB=$REPO/.chainlink" \
   "opencode run --standalone --auto -m '$model' --title '$name' \"\$(cat .worker-prompt.md)\" 2>&1 | tee -a '$log';
    echo \"__DONE__ exit=\${PIPESTATUS[0]} \$(date -Is)\" >> '$log'"
 
-echo "spawned $name (model $model) in $wt, log $log"
+echo "spawned $name ($([[ "$mode" == "--chainlink" ]] && echo "chainlink loop" || echo "prompt file"), model $model) in $wt, log $log"

@@ -12,17 +12,25 @@ Workers follow `AGENTS.md`. The plan lives in chainlink (`.chainlink/`, local on
   small models: they need an exact spec, not a goal.
 
 ## Workers
-- Models: default `opencode/space-bunny-free`; alternative `opencode/mimo-v2.6-flash-free` or
-  `opencode-go/mimo-v2.6-flash`. Use a different model on retry if a worker fails.
-- Prompt file: write to `/tmp/prompt-<id>.md`, containing the issue title and description, acceptance
-  criteria, relevant existing files to read, and "Follow AGENTS.md." Copy it to `docs/prompts/` so prompts
-  survive reboots and can be reused on retry.
-- Spawn: `tools/worker/spawn.sh <id> <slug> /tmp/prompt-<id>.md [model]`
-  (worktree `../wt-i<id>-<slug>`, branch `i<id>-<slug>`, tmux window in session `workers`, state and log in
-  `/tmp/handstand-workers/<name>.{env,log}`). It runs `opencode run --standalone`, so each worker has a
-  private server that dies with its window; never drop `--standalone` (the shared service keeps runs going
-  after the client is gone). It refuses to start if any window, worktree, branch or process of that name is
-  left over. Then `chainlink issue comment <id> "worker: <branch>, <model>"`.
+The default flow is one issue at a time through the opencode-loop-plugin's single-issue Chainlink loop:
+1. Make the issue description the complete spec (paths, interfaces to reuse, API, CLI, tests, acceptance):
+   the plugin feeds the issue itself to its worker and reviewer, and they are small models.
+2. `tools/worker/spawn.sh <id> <slug> --chainlink [model]` runs `/chainlink #<id> --no-close` in the issue's
+   worktree (`CHAINLINK_DB` points at the main `.chainlink`). The plugin's worker and reviewer iterate until its
+   reviewer approves; the issue stays open.
+3. When the loop finishes, review it yourself (see below) against the spec. If it falls short, put the findings
+   in `chainlink issue comment <id> ...` and rerun: `spawn.sh <id> <slug> --chainlink --rerun` (same worktree).
+4. When it is good, summarize for the user and ask to merge. Merge only with `merge.sh` after approval.
+
+Fallback when the plugin is unavailable: `spawn.sh <id> <slug> <prompt-file> [model]` (one-shot worker; keep the
+prompt in `docs/prompts/`).
+
+- Models: default `opencode/space-bunny-free`; alternatives `opencode/mimo-v2.6-flash-free`,
+  `opencode-go/mimo-v2.6-flash`. Switch model on a rerun if a model keeps failing.
+- Every worker: worktree `../wt-i<id>-<slug>`, branch `i<id>-<slug>`, tmux window in session `workers`, state and
+  log in `/tmp/handstand-workers/<name>.{env,log}`. Runs use `opencode run --standalone`, so a worker has a private
+  server that dies with its window; never drop `--standalone` (the shared service keeps runs going after the
+  client is gone). Spawn refuses if a window, worktree, branch or process of that name is left over.
 - Status: `tools/worker/status.sh` shows RUNNING / DONE / STOPPED / ORPHANED, commits, uncommitted files and
   processes still inside the worktree. ORPHANED means it ended without a marker: run `stop.sh` on it.
   Watch live: `tmux attach -t workers`.
@@ -31,7 +39,7 @@ Workers follow `AGENTS.md`. The plan lives in chainlink (`.chainlink/`, local on
   and the worker's OpenCode sessions (only when its work is not wanted). `stop.sh --all [--clean]` for all.
 - Shutdown: before ending a lead session, or when the user says stop, run `tools/worker/stop.sh --all` and
   confirm `status.sh` shows no RUNNING workers and `procs_in_worktree=0`.
-- Run at most 2-3 workers at once, and only on issues that don't touch the same files.
+- One issue at a time (the user's choice).
 
 ## Review and merge
 - `git -C ../wt-<name> log --oneline main..` and `git -C ../wt-<name> diff main...`. Run the tests yourself
