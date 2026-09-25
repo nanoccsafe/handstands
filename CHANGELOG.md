@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Catalogue every handstand video with ffprobe into a CSV to annotate by hand
+  (`uv run python -m handstand.catalogue`), safe to re-run without losing
+  annotations (#8)
 
 ### Fixed
 
