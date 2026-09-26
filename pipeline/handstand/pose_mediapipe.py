@@ -41,9 +41,31 @@ People per frame (``--num-poses``):
     frame); a frame with nobody in it keeps a single NaN block with
     ``person_idx = -1`` and ``detected = false``, so every frame is still
     represented. Picking the athlete out of the people is a *later* step —
-    this module only keeps them all. In ``auto`` mode the rotation decision is
-    taken from the person whose wrists are lowest in the image (largest mean
-    wrist y), i.e. whoever is most likely the one on their hands.
+    this module only keeps them all (``handstand.athlete``). In ``auto`` mode
+    the rotation decision is taken from the person whose wrists are lowest in
+    the image (largest mean wrist y), i.e. whoever is most likely the one on
+    their hands.
+
+Detector settings (``--running-mode``, ``--min-detection``, ``--min-presence``,
+``--min-tracking``):
+
+``video`` (default)
+    MediaPipe's own default: one detector run, then tracking between frames.
+    It is fast and the best option for a single person, but the detector only
+    re-runs when tracking is lost, so a visible second body is usually not
+    reported at all.
+``image``
+    The detector runs on **every** frame and there are no timestamps. This is
+    what a multi-person run needs; the usual companion is lowering the
+    thresholds to ``0.2``, because the second body is often reported with a
+    much lower score::
+
+        uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \\
+            --running-mode image --min-detection 0.2 --min-presence 0.2
+
+    Every default is MediaPipe's own 0.5 / VIDEO, so a run without these flags
+    behaves — and writes byte-identical files — as it always did. The sidecar
+    records the four settings whenever they differ from that default.
 
 Coordinates written out are always **display-frame pixel indices** (origin top
 left, ``x`` right, ``y`` down, ``0 <= x <= width - 1``); rotated-frame
@@ -57,6 +79,8 @@ CLI::
     uv run python scripts/download_models.py
     uv run python -m handstand.pose_mediapipe --rotate auto --limit 3
     uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
+    uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \\
+        --running-mode image --min-detection 0.2 --min-presence 0.2
 """
 
 from __future__ import annotations
@@ -83,8 +107,13 @@ from handstand.paths import data_dir, videos_dir
 from handstand.rotation import inverse_rotate_points
 
 __all__ = [
+    "DEFAULT_MIN_DETECTION_CONFIDENCE",
+    "DEFAULT_MIN_PRESENCE_CONFIDENCE",
+    "DEFAULT_MIN_TRACKING_CONFIDENCE",
     "DEFAULT_MODEL_PATH",
     "DEFAULT_NUM_POSES",
+    "DEFAULT_RUNNING_MODE",
+    "RUNNING_MODES",
     "JOINT_NAMES",
     "MAX_NUM_POSES",
     "MODEL_FILENAME",
@@ -97,6 +126,7 @@ __all__ = [
     "ROTATE_MODES",
     "SINGLE_OUTPUT_DIRNAME",
     "ClipReport",
+    "DetectorSettings",
     "DisplayOrientation",
     "DisplayVideo",
     "FramePacket",
@@ -135,6 +165,19 @@ ROTATE_MODES: tuple[str, ...] = ("none", "180", "auto")
 DEFAULT_NUM_POSES = 1
 #: Upper bound of ``--num-poses``; MediaPipe's own PoseLandmarkerOptions max.
 MAX_NUM_POSES = 5
+
+#: ``--running-mode`` choices. ``video`` tracks between frames (MediaPipe's own
+#: default, only the detector needs a timestamp); ``image`` runs the detector on
+#: every frame, which is what a multi-person run needs.
+RUNNING_MODES: tuple[str, ...] = ("video", "image")
+#: The default running mode, unchanged from before the flag existed.
+DEFAULT_RUNNING_MODE = "video"
+
+#: Detector score thresholds, all at MediaPipe's own default of 0.5. Lowering
+#: ``min_detection``/``min_presence`` is how a second, weaker body gets reported.
+DEFAULT_MIN_DETECTION_CONFIDENCE = 0.5
+DEFAULT_MIN_PRESENCE_CONFIDENCE = 0.5
+DEFAULT_MIN_TRACKING_CONFIDENCE = 0.5
 
 #: Output roots under ``<data_dir>/keypoints/``. Single-person runs keep the
 #: historical root, so a multi-person run can never overwrite them.
@@ -209,15 +252,57 @@ NO_PERSON_IDX = -1
 _LANDMARK_FIELDS = 5
 
 
-class LandmarkerLike(Protocol):
-    """Structural type of ``mediapipe...PoseLandmarker`` in VIDEO mode.
+@dataclasses.dataclass(frozen=True)
+class DetectorSettings:
+    """How MediaPipe is run: ``--running-mode`` plus the three score thresholds.
 
-    Tests inject a fake with this shape, so the runner never needs the real
-    ``.task`` model.
+    ``DetectorSettings()`` is exactly what the runner did before these flags
+    existed — VIDEO mode with MediaPipe's own 0.5 everywhere — so a run that
+    does not change them writes byte-identical files. IMAGE mode runs the
+    detector on every frame and needs no timestamps, which is what finding a
+    second body in a trainer's presence takes.
+    """
+
+    running_mode: str = DEFAULT_RUNNING_MODE
+    min_detection: float = DEFAULT_MIN_DETECTION_CONFIDENCE
+    min_presence: float = DEFAULT_MIN_PRESENCE_CONFIDENCE
+    min_tracking: float = DEFAULT_MIN_TRACKING_CONFIDENCE
+
+    def validate(self) -> None:
+        """Raise :class:`ValueError` unless the model would accept these."""
+        if self.running_mode not in RUNNING_MODES:
+            raise ValueError(
+                f"running_mode must be one of {RUNNING_MODES}, got {self.running_mode!r}"
+            )
+        for name in ("min_detection", "min_presence", "min_tracking"):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1, got {getattr(self, name)}")
+
+    @property
+    def is_default(self) -> bool:
+        """Are these MediaPipe's own defaults, i.e. a run from before the flags?"""
+        return self == DEFAULT_DETECTOR_SETTINGS
+
+
+#: The settings a run gets when the CLI is used without the new flags.
+DEFAULT_DETECTOR_SETTINGS = DetectorSettings()
+
+
+class LandmarkerLike(Protocol):
+    """Structural type of ``mediapipe...PoseLandmarker``, in either running mode.
+
+    VIDEO mode calls :meth:`detect_for_video` with a timestamp, IMAGE mode calls
+    :meth:`detect` with the image alone. Tests inject a fake with this shape, so
+    the runner never needs the real ``.task`` model.
     """
 
     def detect_for_video(self, image: Any, timestamp_ms: int) -> Any:
-        """Return an object exposing ``pose_landmarks`` (list of poses)."""
+        """VIDEO mode: return an object exposing ``pose_landmarks`` (list of poses)."""
+        ...
+
+    def detect(self, image: Any) -> Any:
+        """IMAGE mode: same, for a single image and no timestamp."""
         ...
 
 
@@ -458,6 +543,7 @@ def _detect_pose(
     frame_bgr: np.ndarray,
     t_ms: int,
     source: pathlib.Path,
+    running_mode: str = DEFAULT_RUNNING_MODE,
 ) -> np.ndarray:
     """Run one frame; return **every** pose as ``(P, 33, 5)`` normalised.
 
@@ -465,10 +551,16 @@ def _detect_pose(
     "one person with no landmarks". People keep the order MediaPipe returned
     them in (most confident first); choosing the athlete among them is a later
     step, so nothing is filtered or re-sorted here.
+
+    ``running_mode`` picks the entry point: ``image`` runs the detector on this
+    single frame (``t_ms`` is then unused), anything else tracks a video.
     """
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
-    result = landmarker.detect_for_video(image, t_ms)
+    if running_mode == "image":
+        result = landmarker.detect(image)
+    else:
+        result = landmarker.detect_for_video(image, t_ms)
     poses = getattr(result, "pose_landmarks", None) or []
     if not poses:
         return np.empty((0, len(JOINT_NAMES), _LANDMARK_FIELDS), dtype=np.float64)
@@ -678,6 +770,7 @@ def run_clip(
     overwrite: bool = False,
     model_name: str = MODEL_FILENAME,
     num_poses: int = DEFAULT_NUM_POSES,
+    settings: DetectorSettings = DEFAULT_DETECTOR_SETTINGS,
 ) -> ClipReport:
     """Run the landmarker over one video and write its parquet + JSON.
 
@@ -689,7 +782,9 @@ def run_clip(
     ``landmarker_factory`` is called once per needed tracker: once for
     ``none``/``180``, twice for ``auto`` (upright tracker + rotated tracker).
     Tests pass a factory that returns a stub detector instead of loading the
-    model.
+    model. The factory is what actually builds the landmarker, so ``settings``
+    (running mode + score thresholds) is handed to it, not used here beyond
+    validation and the sidecar.
 
     ``num_poses`` is how many people per frame the landmarker was asked for.
     With ``1`` the output is exactly the single-person schema and the file
@@ -701,6 +796,7 @@ def run_clip(
         raise ValueError(f"unknown rotate mode {rotate_mode!r}; expected one of {ROTATE_MODES}")
     if not 1 <= num_poses <= MAX_NUM_POSES:
         raise ValueError(f"num_poses must be between 1 and {MAX_NUM_POSES}, got {num_poses}")
+    settings.validate()
     multi = num_poses > 1
 
     out_dir = pathlib.Path(out_root) / rotate_mode
@@ -753,7 +849,9 @@ def run_clip(
                 inference_frame = (
                     apply_display_rotation(packet.frame, 180) if rotated else packet.frame
                 )
-                pose_norm = _detect_pose(landmarker, inference_frame, packet.t_ms, video_path)
+                pose_norm = _detect_pose(
+                    landmarker, inference_frame, packet.t_ms, video_path, settings.running_mode
+                )
 
                 # (P, 33, 5): scale x/y to pixel indices of the frame the model
                 # saw, then map back into display pixels; z/visibility/
@@ -822,6 +920,11 @@ def run_clip(
         sidecar["frames_by_people"] = {
             str(people): count for people, count in frames_by_people.items()
         }
+    if not settings.is_default:
+        # Same reasoning: a run on MediaPipe's own defaults records nothing new,
+        # so the historical sidecar stays byte-identical. Anything the flags
+        # changed is written out, so a later reader can reproduce the run.
+        sidecar.update(dataclasses.asdict(settings))
     # The parquet is written last and atomically: its existence is what marks a clip as done
     # (see the skip check above), so an interrupted run must never leave a partial one behind.
     json_tmp = json_path.with_name(f".{json_path.name}.tmp")
@@ -924,12 +1027,18 @@ def output_dirname(num_poses: int = DEFAULT_NUM_POSES) -> str:
 def make_landmarker_factory(
     model_path: str | pathlib.Path,
     num_poses: int = DEFAULT_NUM_POSES,
+    settings: DetectorSettings = DEFAULT_DETECTOR_SETTINGS,
 ) -> Callable[[], LandmarkerLike]:
-    """Build a factory creating a VIDEO-mode ``PoseLandmarker`` per call.
+    """Build a factory creating a ``PoseLandmarker`` per call.
 
     ``num_poses`` is how many people per frame the model is allowed to report
     (1..5); a factory built for a multi-person run cannot write into the
     single-person root, see :func:`output_dirname`.
+
+    ``settings`` reaches ``PoseLandmarkerOptions`` as the running mode and the
+    three score thresholds: VIDEO mode with 0.5 everywhere is MediaPipe's own
+    default and reproduces the historical run exactly, while IMAGE mode with
+    lower thresholds is what finds a second body.
 
     The model file is only checked when the factory is actually used, so a run
     where every clip is skipped does not need the model present.
@@ -937,6 +1046,7 @@ def make_landmarker_factory(
     model_path = pathlib.Path(model_path)
     if not 1 <= num_poses <= MAX_NUM_POSES:
         raise ValueError(f"num_poses must be between 1 and {MAX_NUM_POSES}, got {num_poses}")
+    settings.validate()
 
     def factory() -> LandmarkerLike:
         if not model_path.is_file():
@@ -946,8 +1056,11 @@ def make_landmarker_factory(
             )
         options = mp_vision.PoseLandmarkerOptions(
             base_options=mp_base_options.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=mp_vision.RunningMode.VIDEO,
+            running_mode=mp_vision.RunningMode[settings.running_mode.upper()],
             num_poses=num_poses,
+            min_pose_detection_confidence=settings.min_detection,
+            min_pose_presence_confidence=settings.min_presence,
+            min_tracking_confidence=settings.min_tracking,
         )
         return mp_vision.PoseLandmarker.create_from_options(options)
 
@@ -998,6 +1111,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--running-mode",
+        choices=RUNNING_MODES,
+        default=DEFAULT_RUNNING_MODE,
+        help=(
+            "video tracks between frames (default, unchanged); image runs the "
+            "detector on every frame and needs no timestamps — use it to find "
+            "the trainer next to the athlete"
+        ),
+    )
+    parser.add_argument(
+        "--min-detection",
+        type=float,
+        default=DEFAULT_MIN_DETECTION_CONFIDENCE,
+        metavar="F",
+        help=f"minimum detection confidence, 0..1 (default: {DEFAULT_MIN_DETECTION_CONFIDENCE})",
+    )
+    parser.add_argument(
+        "--min-presence",
+        type=float,
+        default=DEFAULT_MIN_PRESENCE_CONFIDENCE,
+        metavar="F",
+        help=f"minimum presence confidence, 0..1 (default: {DEFAULT_MIN_PRESENCE_CONFIDENCE})",
+    )
+    parser.add_argument(
+        "--min-tracking",
+        type=float,
+        default=DEFAULT_MIN_TRACKING_CONFIDENCE,
+        metavar="F",
+        help=f"minimum tracking confidence, 0..1 (default: {DEFAULT_MIN_TRACKING_CONFIDENCE})",
+    )
+    parser.add_argument(
         "--clips",
         nargs="+",
         metavar="FILE",
@@ -1031,6 +1175,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.limit is not None and args.limit < 0:
         parser.error("--limit must be >= 0")
 
+    settings = DetectorSettings(
+        running_mode=args.running_mode,
+        min_detection=args.min_detection,
+        min_presence=args.min_presence,
+        min_tracking=args.min_tracking,
+    )
+    try:
+        settings.validate()
+    except ValueError as error:
+        parser.error(str(error))
+
     clips = collect_clips(args.clips, videos_dir())
     if args.limit is not None:
         clips = clips[: args.limit]
@@ -1039,11 +1194,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     catalogue = load_catalogue(data_dir() / "catalogue.csv")
-    landmarker_factory = make_landmarker_factory(args.model, args.num_poses)
+    landmarker_factory = make_landmarker_factory(args.model, args.num_poses, settings)
     out_root = data_dir() / "keypoints" / output_dirname(args.num_poses)
     model_name = pathlib.Path(args.model).name
     print(
-        f"rotate={args.rotate} num_poses={args.num_poses} model={model_name} "
+        f"rotate={args.rotate} num_poses={args.num_poses} running_mode={settings.running_mode} "
+        f"min_detection={settings.min_detection} min_presence={settings.min_presence} "
+        f"min_tracking={settings.min_tracking} model={model_name} "
         f"clips={len(clips)} out={out_root}"
     )
 
@@ -1060,6 +1217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 overwrite=args.overwrite,
                 model_name=model_name,
                 num_poses=args.num_poses,
+                settings=settings,
             )
         except Exception as error:  # one bad clip must not kill the whole batch
             failures += 1
