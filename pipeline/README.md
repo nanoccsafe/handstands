@@ -69,6 +69,28 @@ annotations, and rows whose file has disappeared are kept with `missing` set to
 true. The sheet is written atomically (temp file plus rename), so a failed or
 interrupted run never damages what you have typed.
 
+## Trainer report
+
+How much of the dataset the trainer is in: one row per catalogue clip, plus a
+summary of the whole dataset.
+
+```sh
+cd pipeline
+uv run python -m handstand.trainer_report                # report on existing keypoints
+uv run python -m handstand.trainer_report --generate     # generate what is missing, then report
+# -> $HANDSTAND_DATA/reports/trainer_report.csv, $HANDSTAND_DATA/reports/trainer_report.md
+```
+
+`--generate` runs the multi-person keypoints and the athlete selection for every
+catalogue clip that is missing them (skipping the ones that have them, so an
+interrupted run is resumed by running it again); without it the report is instant.
+Per clip it reports frames, fps, the share of frames a second person was in, the
+share flagged as trainer contact, the longest unbroken stretch of contact in
+seconds, whether a second person was there for at least half a second in total,
+the share of frames the selection dropped, and the catalogue's `notes`. The
+markdown summary turns that into the dataset-level answer. Both files are derived
+data and are never committed. See `docs/keypoint_schema.md` for every column.
+
 ## Paths
 
 `handstand.paths` resolves the shared workspace at call time (never at import

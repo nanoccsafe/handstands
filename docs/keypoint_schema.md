@@ -277,6 +277,62 @@ uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
 The source is part of the file name (only for a non-default source), so the
 plain `--source mediapipe` render of the same rotation mode is left alone.
 
+## Trainer report
+
+`handstand.trainer_report` turns the two frame-level columns above —
+`n_people` and `trainer_contact` — into the dataset-level question: **how much of
+the data is usable as it stands, how much has to go through the athlete-selection
+path, and how much is lost to trainer contact**. It reads every clip in
+`catalogue.csv` and writes two files:
+
+```
+<data_dir>/reports/trainer_report.csv   # one row per catalogue clip
+<data_dir>/reports/trainer_report.md    # the summary, in markdown
+```
+
+Neither is committed (both are under the git-ignored `data/`): they are a
+rendering of the parquets and are rebuilt by re-running the report.
+
+```sh
+cd pipeline
+uv run python -m handstand.trainer_report                 # report on what exists
+uv run python -m handstand.trainer_report --generate      # generate what is missing, then report
+uv run python -m handstand.trainer_report --limit 5       # a first look
+```
+
+`--generate` is separate because it is the expensive half (a multi-person run
+over the whole dataset takes tens of minutes) and because the report has to be
+re-runnable on its own. It runs exactly the two commands above over every
+catalogue clip, one clip at a time, skipping the clips whose parquet already
+exists, so an interrupted run is resumed by running it again. A clip whose
+keypoints were made with *other* detector settings is re-run rather than skipped:
+the default VIDEO-mode run reports one person per frame even with the trainer
+standing there, and would measure that clip as "no trainer, ever".
+
+| column | meaning |
+|---|---|
+| `frames`, `fps` | decoded frames (rows / 33), and the frame rate as the **median gap between the `t_ms` timestamps** — the clips are variable frame rate, so `1/fps_avg` is not it |
+| `second_person_frames`, `pct_frames_second_person` | frames with `n_people >= 2` (after dedup), and their share of the clip |
+| `second_person_seconds` | how long a second person was there **in total**, timed from the timestamps |
+| `trainer_present` | `second_person_seconds >= 0.5`. The threshold is what ignores a one-frame phantom detection, which happens in almost every clip; a trainer who walks past twice counts as one |
+| `contact_frames`, `pct_trainer_contact` | frames flagged `trainer_contact`, and their share of the clip |
+| `longest_contact_run_s` | the longest **unbroken** stretch of contact, in seconds — a quick spotter and a hands-on session have the same percentage and very different runs |
+| `athlete_frames`, `pct_athlete`, `dropped_frames`, `pct_dropped` | frames an athlete was attributed to, and the frames the selection left unattributed |
+| `contact_box_iou_frames`, `contact_mixed_skeleton_frames`, `contact_bone_length_frames` | the flagged frames per rule, so the report says *how* the trainer is in a clip |
+| `generate_seconds` | the runtimes the two stages recorded in their sidecars, added up |
+| `notes` | the catalogue's own `notes` column, carried through untouched, so the report can be lined up against the hand annotation of the same clips |
+| `error` | why a clip has no numbers (it failed to generate, or its parquet is unreadable). Every catalogue clip gets a row, and a failure never stops the run |
+
+The markdown summary answers the dataset question directly: how many clips have
+a trainer in them, the frame-level shares (second person, contact, dropped,
+scorable), the ten most affected clips, and a histogram of `pct_trainer_contact`
+per clip in 10 % buckets.
+
+```sh
+cd pipeline
+uv run python -m handstand.trainer_report | head -40
+```
+
 ## Joint names
 
 The 33 MediaPipe pose landmarks, snake_case, in model order (this is the
