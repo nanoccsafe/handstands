@@ -15,9 +15,12 @@ Workers follow `AGENTS.md`. The plan lives in chainlink (`.chainlink/`, local on
 The default flow is one issue at a time through the opencode-loop-plugin's single-issue Chainlink loop:
 1. Make the issue description the complete spec (paths, interfaces to reuse, API, CLI, tests, acceptance):
    the plugin feeds the issue itself to its worker and reviewer, and they are small models.
-2. `tools/worker/spawn.sh <id> <slug> --chainlink [model]` runs `/chainlink #<id> --no-close` in the issue's
-   worktree (`CHAINLINK_DB` points at the main `.chainlink`). The plugin's worker and reviewer iterate until its
-   reviewer approves; the issue stays open.
+2. `tools/worker/spawn.sh <id> <slug> --chainlink [model]` runs the plugin's deterministic
+   `chainlink-loop --task <id> --no-close` (installed at `~/.config/opencode/plugins/opencode-loop-plugin/bin/`)
+   in the issue's worktree (`CHAINLINK_DB` points at the main `.chainlink`). One-shot `opencode run` steps:
+   build-agent worker, plan-agent reviewer that cannot edit, findings fed back to the worker session, until the
+   reviewer approves; the issue stays open. Long batches: `LOOP_ARGS="--worker-timeout 10800"`. Don't comment on
+   an issue right before spawning (the loop treats comments as earlier work and reviews first).
 3. When the loop finishes, review it yourself (see below) against the spec. If it falls short, put the findings
    in `chainlink issue comment <id> ...` and rerun: `spawn.sh <id> <slug> --chainlink --rerun` (same worktree).
    The plugin is meant to work on its own: if the loop fails (no reviewer verdict, a timeout, the orchestrator
@@ -40,6 +43,10 @@ prompt in `docs/prompts/`).
 - Stop: `tools/worker/stop.sh <name>` closes the window, TERMs then KILLs the process tree and anything whose
   cwd is in the worktree, and verifies nothing is left. `--clean` also deletes the worktree, branch, state
   and the worker's OpenCode sessions (only when its work is not wanted). `stop.sh --all [--clean]` for all.
+- After a crash/reboot: `/tmp` is wiped (worker state, logs, tmux). Check `git worktree list`, worker commits,
+  and processes whose cwd is in a worktree. The shared OpenCode service can resume an interrupted worker session
+  on its own when any `opencode` starts; delete such orphan sessions (`opencode session delete <id>`) before
+  restarting the loop with `--rerun`, or two workers will edit the same worktree.
 - Shutdown: before ending a lead session, or when the user says stop, run `tools/worker/stop.sh --all` and
   confirm `status.sh` shows no RUNNING workers and `procs_in_worktree=0`.
 - One issue at a time (the user's choice).
