@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Overlay renderer: draw keypoints on a clip, single or side by side (#24)
 - MediaPipe Pose Landmarker (Full) runner with optional 180 deg rotation (#14)
 - Clip catalogue script (ffprobe metadata -> CSV with blank annotation columns) (#8)
 - Python pipeline environment (#4)
