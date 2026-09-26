@@ -7,7 +7,8 @@
 #       control path; one-shot `opencode run --standalone --auto` steps: build-agent worker, plan-agent reviewer
 #       that cannot edit, findings fed back to the same worker session). Existing work on the branch or issue
 #       comments are reviewed first. The issue stays open for the lead's review and the user's merge approval.
-#       The issue description is the spec. Env: CHAINLINK_LOOP (path to the CLI), REVIEWER_MODEL.
+#       The issue description is the spec. Env: CHAINLINK_LOOP (path to the CLI), REVIEWER_MODEL,
+#       LOOP_ARGS (extra chainlink-loop flags, e.g. "--worker-timeout 10800").
 #   tools/worker/spawn.sh <issue-id> <slug> <prompt-file> [model] [--rerun]
 #       Plain one-shot worker with a prompt file (fallback when the plugin is unavailable).
 #
@@ -52,7 +53,7 @@ loop_cli="${CHAINLINK_LOOP:-/tmp/opencode/opencode-loop-plugin/bin/chainlink-loo
 reviewer_model="${REVIEWER_MODEL:-opencode-go/mimo-v2.6-flash}"
 if [[ "$mode" == "--chainlink" ]]; then
   [[ -x "$loop_cli" ]] || { echo "chainlink-loop not found at $loop_cli (set CHAINLINK_LOOP)" >&2; exit 1; }
-  run_cmd="'$loop_cli' --task $issue --no-close --worker-model '$model' --reviewer-model '$reviewer_model'"
+  run_cmd="'$loop_cli' --task $issue --no-close --worker-model '$model' --reviewer-model '$reviewer_model' ${LOOP_ARGS:-}"
 else
   cp "$mode" "$wt/.worker-prompt.md"
   run_cmd="opencode run --standalone --auto -m '$model' --title '$name' \"\$(cat .worker-prompt.md)\""
