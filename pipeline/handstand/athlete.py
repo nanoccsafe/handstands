@@ -65,22 +65,26 @@ and only the frames after it say who the athlete is.
   percentile of the bone over the frames where both of its ends were seen — the
   length it is seen at when it lies in the picture plane — and a bone past
   :data:`BONE_LENGTH_TOLERANCE` beyond that belongs to somebody else. The two
-  sides of a limb are asked the same question of each other, against the longer
-  side as this clip shows it, so one leg at 1.5× the other is a stitch while a
-  leg pointing at the camera is not. That half only runs for a clip that has
-  shown :data:`ASYMMETRY_MIN_PEOPLE` people at least once, because otherwise
-  there is no second body for a bone to have been swapped with. Both halves
-  measure a bone against the rest of the clip, so neither runs on a clip with no
-  other frame to be long *compared with*.
+  sides of a limb are then asked of each other, either way round, so one leg at
+  1.5× the other is a stitch. That half only runs for a clip that has shown
+  :data:`ASYMMETRY_MIN_PEOPLE` people at least once, because otherwise there is
+  no second body for a bone to have been swapped with — and because a leg
+  pointing at the camera is indistinguishable from one that was never seen
+  whole.
 
-Both halves of rule c are **one-sided**, and that is the whole design.
+The two halves are **not** the same test, and the difference is the whole design.
   Foreshortening only ever makes a projected bone *shorter*: a leg swung out of
   the camera plane in a split, a stag or a straddle is reported shorter and the
-  model is right, so a solo handstand was losing 81–85 % of its frames to a
-  two-sided rule (a72f0c886e1c, a9153273dab1 — one person reported in every one
-  of their frames). Contamination by another body goes the other way: the limb
-  reaches to the trainer's foot, so it comes out *longer* than the athlete's
-  own. A bone that is short is the athlete's and is never flagged.
+  model is right. So the per-clip half — which compares a bone against its own
+  history, where a foreshortened leg is simply what this leg looked like — is
+  one-sided and never fires on a short bone, and that alone is what stopped a
+  solo split clip from losing 81–85 % of its frames (a72f0c886e1c,
+  a9153273dab1: one person reported in every one of their frames). The
+  left/right half cannot make that distinction — a straddle and a swapped leg
+  look the same to it — but a trainer standing *behind* the athlete shortens a
+  bone rather than lengthening it (5f71d966c49a), so it has to stay two-sided,
+  and :data:`ASYMMETRY_MIN_PEOPLE` is what keeps it off clips with nobody else
+  in them.
 
 Rules a and b need a *second* detection, so contamination inside one skeleton —
 the athlete's upper body with the trainer's foot on the floor, which is what
@@ -180,7 +184,6 @@ __all__ = [
     "WEIGHT_SUPPORT",
     "WEIGHT_VISIBILITY",
     "WRIST_IDX",
-    "ClipBones",
     "ClipReport",
     "FrameChoice",
     "FramePeople",
@@ -196,7 +199,7 @@ __all__ = [
     "bounding_box",
     "build_arg_parser",
     "choose_person",
-    "clip_bones",
+    "clip_bone_lengths",
     "contact_reason",
     "continuity_score",
     "counterpart_outlier",
@@ -293,14 +296,14 @@ REASON_MIXED_SKELETON = "mixed_skeleton"
 REASON_BONE_LENGTH = "bone_length"
 CONTACT_REASONS: tuple[str, ...] = (REASON_BOX_IOU, REASON_MIXED_SKELETON, REASON_BONE_LENGTH)
 
-#: A bone this far *longer* than this body ever showed it to be is not this
-#: person's bone: 35 % longer than :data:`BONE_LENGTH_PERCENTILE` of that same
-#: bone over the clip, and 35 % longer than the clip's longest-side median of
-#: the same limb. One-sided, and deliberately so: foreshortening — a leg swung
-#: out of the camera plane in a split, a stag or a straddle — can only make a
-#: projected bone *shorter*, while contamination by another body always makes it
-#: longer, the limb having been finished at the trainer's foot. A short bone is
-#: therefore the athlete's own and is never flagged.
+#: A bone this far from this body's own is not this person's bone. Against the
+#: clip's own :data:`BONE_LENGTH_PERCENTILE` of the same bone it is one-sided —
+#: 35 % *longer*, never shorter — because foreshortening (a leg swung out of the
+#: camera plane in a split, a stag or a straddle) can only make a projected bone
+#: shorter, while contamination by another body makes it longer, the limb having
+#: been finished at the trainer's foot. Between the two sides of the body it is
+#: 35 % either way round, because a trainer standing *behind* the athlete
+#: shortens a bone just as surely as one standing beside them lengthens it.
 BONE_LENGTH_TOLERANCE = 0.35
 #: The percentile of a bone's length over the clip that counts as that bone's
 #: full length: the frames in which it lies in the picture plane and is seen
@@ -314,10 +317,11 @@ BONE_LENGTH_PERCENTILE = 90.0
 #: clips where MediaPipe reported that many people in at least one frame. An
 #: athlete straddling their legs in a handstand — one leg pointing at the
 #: camera, the other away — is reported 35-50 % asymmetric for whole stretches
-#: of such a clip, and none of it is evidence of anything now that the rule only
-#: asks whether the *longer* side is longer than this body ever showed that limb
-#: to be. The per-clip reference is unaffected: it compares a bone against its
-#: own history, so it needs no second body either way.
+#: of such a clip, and that is indistinguishable from a trainer's leg replacing
+#: the athlete's, so the half that cannot tell them apart is not allowed to run
+#: where there is no second body to have been swapped in. The per-clip full
+#: length is unaffected: it compares a bone against its own history, so it
+#: needs no second body either way.
 ASYMMETRY_MIN_PEOPLE = 2
 #: The bones whose length is measured, as ``(bone, first joint, second joint)``:
 #: upper arm, forearm, thigh, shin and the side of the torso, left and right.
@@ -871,83 +875,65 @@ def leg_lengths(person: Person) -> dict[str, float]:
     return _leg_lengths(bone_lengths(person))
 
 
-@dataclasses.dataclass(frozen=True)
-class ClipBones:
-    """What this clip says the athlete's own bones and limbs look like.
+def _relative_gap(first: float, second: float) -> float:
+    """How much bigger one of two lengths is than the other: 0 when they match.
 
-    ``full_length`` is one entry per bone in :data:`BONES` — the
-    :data:`BONE_LENGTH_PERCENTILE` percentile of that bone's length, i.e. the
-    length it is seen at when it lies in the picture plane.
-    ``longest_side`` is one entry per mirror pair, under *both* of its names
-    (the bones and the legs of :data:`LEG_BONES`): the same number twice, being
-    the median of whichever side the clip shows longer, i.e. how long this body
-    ever showed that limb to be.
+    Measured against the *longer* of the two, so the number says "one of these is
+    this fraction longer than the other" and a short bone is never excused by a
+    long one next to it. NaN when either length is missing.
     """
+    if not (math.isfinite(first) and math.isfinite(second)):
+        return float("nan")
+    if first == second:
+        return 0.0
+    return abs(first - second) / max(first, second)
 
-    full_length: Mapping[str, float]
-    longest_side: Mapping[str, float]
 
+def clip_bone_lengths(choices: Sequence[FrameChoice]) -> dict[str, float]:
+    """How long each of this clip's athlete's bones is when it is at full length.
 
-def clip_bones(choices: Sequence[FrameChoice]) -> ClipBones:
-    """The two references :func:`bone_length_outlier` and
-    :func:`counterpart_outlier` measure this clip's athlete against.
+    The :data:`BONE_LENGTH_PERCENTILE` percentile of each bone's length over
+    every frame that got an athlete, using only the frames where both of that
+    bone's joints were seen at :data:`CONTACT_MIN_VISIBILITY` — and only the
+    athlete's own skeleton, never the trainer's.
 
-    Both are taken over the frames that got an athlete, per bone or per limb, and
-    both use only the frames in which both of that bone's ends were seen at
-    :data:`CONTACT_MIN_VISIBILITY` — and only the athlete's own skeleton, never
-    the trainer's.
-
-    * :attr:`ClipBones.full_length` is the :data:`BONE_LENGTH_PERCENTILE`
-      percentile rather than the median: 90 % of the frames sit below it, so the
-      few where the model stitched somebody's leg on cannot drag the yardstick,
-      while a bone that is foreshortened in most of the clip is still measured
-      against the frames where it is not.
-    * :attr:`ClipBones.longest_side` is the median of the *longer* of a mirror
-      pair's two sides, so the left/right rule can ask whether one side is
-      abnormally long instead of whether the two merely differ.
+    The percentile rather than the median: 90 % of the frames sit below it, so
+    the few where the model stitched somebody's leg on cannot drag the yardstick
+    the other frames are measured against, while a bone that is foreshortened in
+    most of a clip is still measured against the frames where it is not. It is
+    the bone's *full* length, the length it is seen at when it lies in the
+    picture plane.
     """
     collected: dict[str, list[float]] = {name: [] for name, _, _ in BONES}
-    legs: dict[str, list[float]] = {leg: [] for leg, _ in LEG_BONES}
     for choice in choices:
         if choice.person is None:
             continue
-        measured = bone_lengths(choice.person)
-        for name, value in measured.items():
+        for name, value in bone_lengths(choice.person).items():
             if math.isfinite(value):
                 collected[name].append(value)
-        for name, value in _leg_lengths(measured).items():
-            if math.isfinite(value):
-                legs[name].append(value)
-    full_length = {
+    return {
         name: float(np.percentile(values, BONE_LENGTH_PERCENTILE))
         for name, values in collected.items()
         if values
     }
-    every = {**collected, **legs}
-    longest_side: dict[str, float] = {}
-    for name, other in (*LEG_COUNTERPARTS.items(), *COUNTERPART_BONES.items()):
-        medians = [float(np.median(every[side])) for side in (name, other) if every.get(side)]
-        if not medians:
-            continue
-        longest_side[name] = max(medians)
-        longest_side[other] = max(medians)
-    return ClipBones(full_length=full_length, longest_side=longest_side)
 
 
-def bone_length_outlier(person: Person, bones: ClipBones | None) -> str | None:
+def bone_length_outlier(person: Person, full_lengths: Mapping[str, float] | None) -> str | None:
     """The first bone more than :data:`BONE_LENGTH_TOLERANCE` **longer** than the clip's.
 
     One-sided, because the evidence only runs one way: foreshortening — a leg
-    swung out of the camera plane — makes a projected bone *shorter* and is the
-    athlete's own business, while a trainer's foot on the floor makes the bone
-    that reaches it *longer* than the athlete's. So only "too long" is a stitch
-    and "too short" never is. A bone the clip never showed (no reference) is not
-    checked, and neither is any bone when there is no clip reference at all.
+    swung out of the camera plane in a split, a stag or a straddle — makes a
+    projected bone *shorter* and is the athlete's own business, while a trainer's
+    foot on the floor makes the bone that reaches it *longer* than the athlete's.
+    So only "too long" is a stitch and "too short" never is, which is what stops
+    a solo split clip from being flagged for its own legs. A bone the clip never
+    showed (no reference) is not checked, and neither is any bone when there is
+    no clip reference at all.
     """
-    if bones is None:
+    if full_lengths is None:
         return None
     for name, value in bone_lengths(person).items():
-        full = bones.full_length.get(name, float("nan"))
+        full = full_lengths.get(name, float("nan"))
         if not (math.isfinite(value) and math.isfinite(full) and full > 0.0):
             continue
         if value > full * (1.0 + BONE_LENGTH_TOLERANCE):
@@ -955,59 +941,52 @@ def bone_length_outlier(person: Person, bones: ClipBones | None) -> str | None:
     return None
 
 
-def counterpart_outlier(person: Person, bones: ClipBones | None) -> str | None:
-    """The first limb more than :data:`BONE_LENGTH_TOLERANCE` longer than the clip showed it.
+def counterpart_outlier(person: Person) -> str | None:
+    """The first leg or bone more than :data:`BONE_LENGTH_TOLERANCE` off its other side.
 
     The same skeleton measured against itself: the two legs as a whole first —
     thigh plus shin, which is the length a trainer's leg replaces — then each
     bone against its left/right mirror, for the arms, the torso and a leg where
-    only one of its two bones is wrong.
+    only one of its two bones is wrong. Either way round, unlike the per-clip
+    half: a trainer's leg can lengthen a bone or shorten it, and a trainer
+    standing *behind* the athlete is what shortens one (5f71d966c49a: the right
+    thigh and shin at roughly half the left ones in nearly every frame). It
+    needs no clip history, so it also judges a clip too short to have a
+    reference of its own, and it is scale free.
 
-    What is asked is not whether the two sides differ but whether the **longer**
-    of them is longer than this body ever showed that limb to be
-    (:attr:`ClipBones.longest_side`), so one leg at 1.5× the other is a stitch
-    while a straddling handstand — one leg at the camera, the other away — is
-    not. The name returned is the side that is too long, and the legs are asked
-    before their bones, so a leg is named rather than one of the two bones that
-    make it up.
+    What it cannot do is tell a straddle from a stitch — a leg pointing at the
+    camera looks exactly like a leg that was never seen whole — which is what
+    :data:`ASYMMETRY_MIN_PEOPLE` is for.
     """
-    if bones is None:
-        return None
-    measured = bone_lengths(person)
-    lengths: dict[str, float] = {**measured, **_leg_lengths(measured)}
+    bones = bone_lengths(person)
+    lengths: dict[str, float] = {**bones, **_leg_lengths(bones)}
     for name, other in (*LEG_COUNTERPARTS.items(), *COUNTERPART_BONES.items()):
-        first = lengths.get(name, float("nan"))
-        second = lengths.get(other, float("nan"))
-        full = bones.longest_side.get(name, float("nan"))
-        if not (
-            math.isfinite(first) and math.isfinite(second) and math.isfinite(full) and full > 0.0
-        ):
-            continue
-        if max(first, second) > full * (1.0 + BONE_LENGTH_TOLERANCE):
-            return name if first >= second else other
+        gap = _relative_gap(lengths.get(name, float("nan")), lengths.get(other, float("nan")))
+        if math.isfinite(gap) and gap > BONE_LENGTH_TOLERANCE:
+            return name
     return None
 
 
 def bone_length_mismatch(
-    person: Person, bones: ClipBones | None, *, compare_sides: bool = True
+    person: Person, full_lengths: Mapping[str, float] | None, *, compare_sides: bool = True
 ) -> str | None:
     """The bone that does not belong to this body, or ``None`` when they all do.
 
     The clip's own full lengths first, because they know what this body looks
     like; the left/right comparison second, for the frames a single bone's own
-    history cannot judge. Both are measurements against the rest of the clip, so
-    with no clip reference (``bones`` is ``None``) neither half runs and the
-    frame is not flagged — there is nothing to be long *compared with*.
+    history cannot judge. The first needs the clip's reference, so with none
+    (``full_lengths`` is ``None``) it does not run; the second does not need one
+    and always can.
 
     ``compare_sides`` is False for a clip that has never shown a second body:
     see :data:`ASYMMETRY_MIN_PEOPLE`.
     """
-    outlier = bone_length_outlier(person, bones)
+    outlier = bone_length_outlier(person, full_lengths)
     if outlier is not None:
         return outlier
     if not compare_sides:
         return None
-    return counterpart_outlier(person, bones)
+    return counterpart_outlier(person)
 
 
 def nearest_joint_distance(point: np.ndarray, other: Person) -> float:
@@ -1045,7 +1024,7 @@ def mixed_skeleton(athlete: Person, other: Person) -> bool:
 def contact_reason(
     athlete: Person,
     others: Sequence[Person],
-    bones: ClipBones | None = None,
+    full_lengths: Mapping[str, float] | None = None,
     *,
     compare_sides: bool = True,
 ) -> str:
@@ -1055,16 +1034,15 @@ def contact_reason(
     :data:`REASON_BOX_IOU` (somebody else's box overlaps the athlete's),
     :data:`REASON_MIXED_SKELETON` (the athlete's skeleton is stitched to
     somebody else's joints) and :data:`REASON_BONE_LENGTH` (one of the athlete's
-    own bones is longer than this clip ever shows it, or than this body ever
-    shows that limb to be). The first two compare against the other people
+    own bones is longer than this clip ever shows it, or is not the length of
+    its mirror image). The first two compare against the other people
     in the frame, so they cannot fire when the model reported a single body; the
     third is what covers that case, where the trainer's leg is inside the
     athlete's own skeleton.
 
-    ``bones`` is :func:`clip_bones` for the clip. It is what the bone-length rule
-    measures against, so without it that rule does not run at all: there is
-    nothing for a bone to be long compared with. Pass ``compare_sides=False``
-    for a clip that has never shown a second body (:data:`ASYMMETRY_MIN_PEOPLE`).
+    ``full_lengths`` is :func:`clip_bone_lengths` for the clip. Pass
+    ``compare_sides=False`` for a clip that has never shown a second body
+    (:data:`ASYMMETRY_MIN_PEOPLE`).
     """
     if any(
         athlete.box is not None
@@ -1075,7 +1053,7 @@ def contact_reason(
         return REASON_BOX_IOU
     if any(mixed_skeleton(athlete, other) for other in others):
         return REASON_MIXED_SKELETON
-    if bone_length_mismatch(athlete, bones, compare_sides=compare_sides) is not None:
+    if bone_length_mismatch(athlete, full_lengths, compare_sides=compare_sides) is not None:
         return REASON_BONE_LENGTH
     return REASON_NONE
 
@@ -1083,7 +1061,7 @@ def contact_reason(
 def trainer_contact(
     athlete: Person,
     others: Sequence[Person],
-    bones: ClipBones | None = None,
+    full_lengths: Mapping[str, float] | None = None,
     *,
     compare_sides: bool = True,
 ) -> bool:
@@ -1093,7 +1071,7 @@ def trainer_contact(
     question asked for the reason. A frame flagged here keeps the athlete's
     keypoints but must not be scored downstream.
     """
-    return contact_reason(athlete, others, bones, compare_sides=compare_sides) != REASON_NONE
+    return contact_reason(athlete, others, full_lengths, compare_sides=compare_sides) != REASON_NONE
 
 
 def reason_histogram(reasons: Sequence[str]) -> dict[str, int]:
@@ -1235,14 +1213,14 @@ def select_athlete(frames: Sequence[FramePeople]) -> list[FrameChoice]:
     # What the athlete's bones look like elsewhere in the clip, which is what a
     # single stitched skeleton has to be caught against, and whether the clip has
     # ever shown a second body for the left/right comparison to mean anything.
-    bones = clip_bones(winners)
+    full_lengths = clip_bone_lengths(winners)
     compare_sides = max(frame.n_people for frame in frames) >= ASYMMETRY_MIN_PEOPLE
     chosen: list[FrameChoice] = []
     for frame, best in zip(frames, winners, strict=True):
         others = [person for person in frame.people if person is not best.person]
         reason = REASON_NONE
         if best.person is not None:
-            reason = contact_reason(best.person, others, bones, compare_sides=compare_sides)
+            reason = contact_reason(best.person, others, full_lengths, compare_sides=compare_sides)
         chosen.append(dataclasses.replace(best, reason=reason))
     return chosen
 
