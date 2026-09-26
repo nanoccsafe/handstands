@@ -193,6 +193,7 @@ uv run python -m handstand.athlete --rotate auto --clips 6508f9b355bd
 | `athlete_score` | float64 | the winner's score, 0..1 (the weights below add up to 1); NaN when the frame is attributed to nobody |
 | `n_people` | int64 | how many people were in the frame **after** dedup |
 | `trainer_contact` | bool | the trainer overlaps or touches the athlete: the keypoints are the athlete's, but the frame must not be scored |
+| `contact_reason` | string | which rule set that flag: `""`, `"box_iou"`, `"mixed_skeleton"` or `"bone_length"` — the first one that fired. Downstream code filters on `trainer_contact`, this is for explaining a flag |
 
 The rules, applied to each frame in this order (the constants are
 `handstand.athlete`'s module-level ones; see its docstring for the code):
@@ -216,12 +217,36 @@ The rules, applied to each frame in this order (the constants are
    against the athlete *that* sweep chose in its previous frame, and the
    higher-scoring sweep wins per frame. That is what covers the kick-up before
    the first inverted frame, where nothing looks like a handstand yet.
-3. **Flag contact.** The chosen person is `trainer_contact` when another
-   person's bounding box (of its visible joints, visibility ≥ 0.5) overlaps the
-   athlete's by IoU > `0.3`, or when one of the athlete's limb joints is closer
-   to the other person's joints than to the athlete's own centre line (their
-   feet to their head). The second rule catches the frames where the two
-   skeletons overlap so much that the model stitched them into one.
+3. **Flag contact.** The chosen person is `trainer_contact`, with the reason in
+   `contact_reason`, when any of these fires:
+
+   | reason | what it means |
+   |---|---|
+   | `box_iou` | another person's bounding box (of its visible joints, visibility ≥ 0.5) overlaps the athlete's by IoU > `0.3` |
+   | `mixed_skeleton` | one of the athlete's limb joints is closer to the other person's joints than to the athlete's own centre line (their feet to their head) — the two skeletons overlap so much that the model stitched them into one |
+   | `bone_length` | one of the athlete's own bones is the wrong length: more than `BONE_LENGTH_TOLERANCE` (0.35) off the median of the same bone over the clip, or off the same bone on the other side of the body |
+
+   The first two need a *second detection*, so contamination inside a single
+   reported skeleton — the athlete's upper body with the trainer's foot on the
+   floor, which is what MediaPipe reports when the trainer stands right behind
+   them — slips past them. `bone_length` is what catches that: the bones are
+   measured over the five pairs of the athlete's own (upper arm, forearm,
+   thigh, shin, and the side of the torso, left and right), each pair's median
+   over the frames where both its joints were seen at visibility ≥ 0.5, and a
+   bone outside the ±35 % band is somebody else's limb.
+
+   The left/right half of that rule only runs for a clip in which MediaPipe
+   reported 2+ people in at least one frame (`ASYMMETRY_MIN_PEOPLE`). An athlete
+   straddling their legs in a handstand has one leg pointing at the camera and
+   one away, and MediaPipe reports that as a 35–50 % left/right difference for
+   whole stretches of a clip with nobody else in it — those frames are the
+   athlete's own and must stay scorable. The per-clip median needs no second
+   body, so it always runs.
+
+   What no rule can catch: contamination that *is* the clip's norm. In
+   6508f9b355bd the trainer's leg is stitched onto the athlete's left hip in
+   every frame the model reports one body, so the clip's own median is the
+   contaminated length and only the worst frames stand out (16 of 244).
 4. **Give up honestly.** A frame whose best score is below `0.35`, or where the
    two best candidates are within `0.05` of each other, is written as *not
    detected*: 33 NaN rows with `detected = false`, exactly as a frame the model
@@ -233,6 +258,8 @@ import pandas as pd
 
 df = pd.read_parquet(".../keypoints/mediapipe_athlete/auto/1a2b3c4d5e6f.parquet")
 scorable = df[df["detected"] & ~df["trainer_contact"]]
+# why a frame was dropped:
+print(df[df["trainer_contact"]]["contact_reason"].value_counts())
 ```
 
 ### Watching one
@@ -339,6 +366,7 @@ the selection instead:
 | `contact_frame_count` | of those, the frames flagged as trainer contact |
 | `dropped_frame_count` | frames written as not detected (`frame_count - athlete_frame_count`) |
 | `frames_by_people` | frames per number of people, **after** dedup |
+| `contact_frames_by_reason` | flagged frames per rule, e.g. `{"box_iou": 20, "mixed_skeleton": 1, "bone_length": 16}`; the three values add up to `contact_frame_count` |
 | `mean_athlete_score` | mean `athlete_score` over the attributed frames, or `null` when none was |
 | `runtime_seconds` | wall-clock seconds for the whole clip |
 

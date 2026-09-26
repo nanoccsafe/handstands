@@ -13,13 +13,15 @@ athlete's body only, so every later stage keeps working unchanged::
     <data_dir>/keypoints/mediapipe_athlete/<rotate>/<clip_id>.parquet
     <data_dir>/keypoints/mediapipe_athlete/<rotate>/<clip_id>.json
 
-and adds three frame-level columns to it:
+and adds four frame-level columns to it:
 
 * ``athlete_score`` (float64) — the winner's score, 0..1; NaN when the frame is
   attributed to nobody.
 * ``n_people`` (int64) — how many people were in the frame **after** dedup.
 * ``trainer_contact`` (bool) — the trainer overlaps or touches the athlete: keep
   the keypoints, but do not score the frame.
+* ``contact_reason`` (string) — which rule set that flag: ``""``,
+  ``"box_iou"``, ``"mixed_skeleton"`` or ``"bone_length"``.
 
 The rules, in the order they are applied to a frame:
 
@@ -50,12 +52,28 @@ the kick-up before the first inverted frame, where nothing looks like a handstan
 and only the frames after it say who the athlete is.
 
 **3. Flag contact** — the chosen person is flagged ``trainer_contact`` when
-another person's bounding box overlaps theirs by more than
-:data:`CONTACT_MIN_IOU`, or when one of the athlete's limb joints sits closer to
-the other person's joints than to the athlete's own centre line (their feet to
-their head, which every limb joint is a hand's width away from): the two
-skeletons overlap so much that the model stitched them into one. Such a frame is
-written with the athlete's keypoints but must not be scored.
+
+* **a.** another person's bounding box overlaps theirs by more than
+  :data:`CONTACT_MIN_IOU` (``"box_iou"``);
+* **b.** one of the athlete's limb joints sits closer to the other person's
+  joints than to the athlete's own centre line (their feet to their head, which
+  every limb joint is a hand's width away from) — the two skeletons overlap so
+  much that the model stitched them into one (``"mixed_skeleton"``);
+* **c.** or the skeleton is broken with nobody else reported in the frame at
+  all: a bone more than :data:`BONE_LENGTH_TOLERANCE` off its own length
+  elsewhere in the clip, or off the same bone on the other side of the body
+  (``"bone_length"``). The left/right half of that only runs for a clip that has
+  shown :data:`ASYMMETRY_MIN_PEOPLE` people at least once, because otherwise
+  there is no second body for a bone to have been swapped with.
+
+Rules a and b need a *second* detection, so contamination inside one skeleton —
+the athlete's upper body with the trainer's foot on the floor, which is what
+MediaPipe reports when the trainer stands right behind them — slips past them.
+The bones of the athlete themselves are what catches that: nobody else's body
+needs to be found for a leg to be the wrong length. The first rule that fires is
+the one written to ``contact_reason``; all three set ``trainer_contact``, so
+downstream code only ever filters on that boolean. A flagged frame is written
+with the athlete's keypoints but must not be scored.
 
 **4. Give up honestly** — a frame whose best score is below
 :data:`MIN_ATHLETE_SCORE`, or where the two best candidates are within
@@ -83,7 +101,7 @@ import json
 import math
 import pathlib
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -101,11 +119,17 @@ from handstand.pose_mediapipe import (
 __all__ = [
     "AMBIGUITY_MARGIN",
     "ANKLE_IDX",
+    "ASYMMETRY_MIN_PEOPLE",
     "ATHLETE_COLUMNS",
     "ATHLETE_OUTPUT_DIRNAME",
+    "BONES",
+    "BONE_LENGTH_TOLERANCE",
     "CONTACT_COLUMN",
     "CONTACT_MIN_IOU",
     "CONTACT_MIN_VISIBILITY",
+    "CONTACT_REASON_COLUMN",
+    "CONTACT_REASONS",
+    "COUNTERPART_BONES",
     "DEDUP_HIP_TOLERANCE",
     "DEDUP_JOINT_TOLERANCE",
     "DEDUP_MIN_SHARED_JOINTS",
@@ -116,6 +140,8 @@ __all__ = [
     "HEAD_JOINT_IDX",
     "HIP_IDX",
     "LANDMARK_FIELDS",
+    "LEG_BONES",
+    "LEG_COUNTERPARTS",
     "LIMB_JOINTS",
     "LIMB_JOINT_IDX",
     "MAIN_JOINTS",
@@ -124,6 +150,10 @@ __all__ = [
     "MIN_BODY_LENGTH_PIXELS",
     "MULTI_OUTPUT_DIRNAME",
     "N_PEOPLE_COLUMN",
+    "REASON_BONE_LENGTH",
+    "REASON_BOX_IOU",
+    "REASON_MIXED_SKELETON",
+    "REASON_NONE",
     "SCORE_COLUMN",
     "SHOULDER_IDX",
     "SUPPORT_JOINTS",
@@ -141,14 +171,21 @@ __all__ = [
     "available_clips",
     "body_centre_line",
     "body_length",
+    "bone_length_mismatch",
+    "bone_length_outlier",
+    "bone_lengths",
     "box_iou",
     "bounding_box",
     "build_arg_parser",
     "choose_person",
+    "clip_bone_medians",
+    "contact_reason",
     "continuity_score",
+    "counterpart_outlier",
     "deduplicate",
     "input_dirname",
     "is_inverted",
+    "leg_lengths",
     "load_frames",
     "main",
     "max_y",
@@ -162,6 +199,7 @@ __all__ = [
     "output_dirname",
     "person_score",
     "prepare_frame",
+    "reason_histogram",
     "run_clip",
     "same_body",
     "select_athlete",
@@ -188,13 +226,17 @@ ATHLETE_OUTPUT_DIRNAME = "mediapipe_athlete"
 SCORE_COLUMN = "athlete_score"
 N_PEOPLE_COLUMN = "n_people"
 CONTACT_COLUMN = "trainer_contact"
-#: :data:`handstand.pose_mediapipe.PARQUET_COLUMNS` plus the three above, in
+#: Which rule flagged the frame, so the flag can be explained rather than just
+#: trusted. Downstream code filters on :data:`CONTACT_COLUMN`, not on this.
+CONTACT_REASON_COLUMN = "contact_reason"
+#: :data:`handstand.pose_mediapipe.PARQUET_COLUMNS` plus the four above, in
 #: write order. Every frame contributes 33 rows, exactly as the runner writes.
 ATHLETE_COLUMNS: tuple[str, ...] = (
     *PARQUET_COLUMNS,
     SCORE_COLUMN,
     N_PEOPLE_COLUMN,
     CONTACT_COLUMN,
+    CONTACT_REASON_COLUMN,
 )
 
 #: Score weights; they add up to 1, so a score is 0..1.
@@ -222,8 +264,71 @@ DEDUP_MIN_SHARED_JOINTS = 4
 #: trainer contact.
 CONTACT_MIN_IOU = 0.3
 #: MediaPipe visibility at or above this counts as a visible joint: used for the
-#: bounding boxes and for the "which joints can we trust" question.
+#: bounding boxes, for the bones and for the "which joints can we trust" question.
 CONTACT_MIN_VISIBILITY = 0.5
+
+#: The values of :data:`CONTACT_REASON_COLUMN` other than "not in contact", in
+#: the order the rules are tried.
+REASON_NONE = ""
+REASON_BOX_IOU = "box_iou"
+REASON_MIXED_SKELETON = "mixed_skeleton"
+REASON_BONE_LENGTH = "bone_length"
+CONTACT_REASONS: tuple[str, ...] = (REASON_BOX_IOU, REASON_MIXED_SKELETON, REASON_BONE_LENGTH)
+
+#: A bone this far off its own length is not this person's bone. Both ways: 35 %
+#: longer *or* 35 % shorter than the median of the same bone over the clip, and
+#: 35 % off the same bone on the other side of the body. For a real skeleton a
+#: bent joint only ever *shortens* the bone it bends, so the generous end of the
+#: band is what leaves room for that; past it the joint belongs to somebody else.
+BONE_LENGTH_TOLERANCE = 0.35
+#: A left/right mismatch is only evidence of a stitch if the clip has shown a
+#: second body to stitch in, so the left/right half of the rule only runs for
+#: clips where MediaPipe reported that many people in at least one frame. An
+#: athlete straddling their legs in a handstand — one leg pointing at the
+#: camera, the other away — is reported 35-50 % asymmetric for whole stretches
+#: of such a clip (057c9e6c96af: one person in all 504 frames, 198 of them
+#: dropped for nothing), and dropping those is a loss, not a catch. The per-clip
+#: median is unaffected: it compares a bone against its own history, so it
+#: needs no second body either way.
+ASYMMETRY_MIN_PEOPLE = 2
+#: The bones whose length is measured, as ``(bone, first joint, second joint)``:
+#: upper arm, forearm, thigh, shin and the side of the torso, left and right.
+#: These are the bones a trainer's arm or leg gets stitched onto — the trunk is
+#: not, because a body only has one.
+BONES: tuple[tuple[str, str, str], ...] = (
+    ("upper_arm_l", "left_shoulder", "left_elbow"),
+    ("upper_arm_r", "right_shoulder", "right_elbow"),
+    ("forearm_l", "left_elbow", "left_wrist"),
+    ("forearm_r", "right_elbow", "right_wrist"),
+    ("thigh_l", "left_hip", "left_knee"),
+    ("thigh_r", "right_hip", "right_knee"),
+    ("shin_l", "left_knee", "left_ankle"),
+    ("shin_r", "right_knee", "right_ankle"),
+    ("torso_l", "left_shoulder", "left_hip"),
+    ("torso_r", "right_shoulder", "right_hip"),
+)
+#: Each bone's mirror image, for the left/right comparison of the same frame.
+COUNTERPART_BONES: dict[str, str] = {
+    "upper_arm_l": "upper_arm_r",
+    "upper_arm_r": "upper_arm_l",
+    "forearm_l": "forearm_r",
+    "forearm_r": "forearm_l",
+    "thigh_l": "thigh_r",
+    "thigh_r": "thigh_l",
+    "shin_l": "shin_r",
+    "shin_r": "shin_l",
+    "torso_l": "torso_r",
+    "torso_r": "torso_l",
+}
+#: The whole leg as one length, thigh + shin, as ``(leg, bones)``: a trainer's
+#: leg is longer than the athlete's as a whole, and comparing the two sums
+#: catches it even when the two bones swap the difference between them.
+LEG_BONES: tuple[tuple[str, tuple[str, str]], ...] = (
+    ("leg_l", ("thigh_l", "shin_l")),
+    ("leg_r", ("thigh_r", "shin_r")),
+)
+#: Each leg's mirror image, for the same left/right comparison.
+LEG_COUNTERPARTS: dict[str, str] = {"leg_l": "leg_r", "leg_r": "leg_l"}
 
 #: A body length is never below this many pixels, so normalising by it is safe.
 MIN_BODY_LENGTH_PIXELS = 1.0
@@ -691,7 +796,140 @@ def choose_person(
 
 # --------------------------------------------------------------------------- #
 # Rule 3: is the trainer on top of the athlete?
+#
+# Two of the three rules need somebody else in the frame to compare against.
+# The third does not: it looks at the athlete's own bones, which is what catches
+# the trainer's leg stitched into a skeleton the model reported once.
 # --------------------------------------------------------------------------- #
+
+
+def bone_length(person: Person, first: str, second: str) -> float:
+    """The length of one bone in pixels; NaN unless both its joints were seen.
+
+    Both ends have to be visible at :data:`CONTACT_MIN_VISIBILITY` (see
+    :func:`visible_mask`), because a length measured to a joint the model only
+    guessed says nothing about the bone.
+    """
+    start, end = JOINT_INDEX[first], JOINT_INDEX[second]
+    if start not in person.visible_joints or end not in person.visible_joints:
+        return float("nan")
+    return _distance(person.landmarks[start, :2], person.landmarks[end, :2])
+
+
+def bone_lengths(person: Person) -> dict[str, float]:
+    """Every bone in :data:`BONES`, by name; NaN where an end was not seen."""
+    return {name: bone_length(person, first, second) for name, first, second in BONES}
+
+
+def _leg_lengths(bone_length_by_name: Mapping[str, float]) -> dict[str, float]:
+    """The legs as one length each, from :func:`bone_lengths`'s measurements."""
+    legs: dict[str, float] = {}
+    for name, parts in LEG_BONES:
+        values = [bone_length_by_name.get(part, float("nan")) for part in parts]
+        if all(math.isfinite(value) for value in values):
+            legs[name] = float(sum(values))
+        else:
+            legs[name] = float("nan")
+    return legs
+
+
+def leg_lengths(person: Person) -> dict[str, float]:
+    """Each leg as one length, thigh + shin; NaN when either bone is missing.
+
+    The sum, not the straight hip-to-ankle line, so a bent knee does not shorten
+    it: what this measures is how long the leg is, not how much of it points at
+    the camera.
+    """
+    return _leg_lengths(bone_lengths(person))
+
+
+def _relative_gap(first: float, second: float) -> float:
+    """How much bigger one of two lengths is than the other: 0 when they match.
+
+    Measured against the *longer* of the two, so the number says "one of these is
+    this fraction longer than the other" and a short bone is never excused by a
+    long one next to it. NaN when either length is missing.
+    """
+    if not (math.isfinite(first) and math.isfinite(second)):
+        return float("nan")
+    if first == second:
+        return 0.0
+    return abs(first - second) / max(first, second)
+
+
+def clip_bone_medians(choices: Sequence[FrameChoice]) -> dict[str, float]:
+    """How long each bone is in this clip, for the athlete the selection chose.
+
+    The median over every frame that got an athlete, per bone, using only the
+    frames where both of that bone's joints were seen. The median rather than the
+    mean, so the few frames where the model stitched somebody's leg on cannot
+    move the yardstick the other frames are measured against — and only the
+    athlete's own bones go into it, never the trainer's.
+    """
+    collected: dict[str, list[float]] = {name: [] for name, _, _ in BONES}
+    for choice in choices:
+        if choice.person is None:
+            continue
+        for name, value in bone_lengths(choice.person).items():
+            if math.isfinite(value):
+                collected[name].append(value)
+    return {name: float(np.median(values)) for name, values in collected.items() if values}
+
+
+def bone_length_outlier(person: Person, medians: Mapping[str, float]) -> str | None:
+    """The first bone more than :data:`BONE_LENGTH_TOLERANCE` off its clip median.
+
+    Either way round — too long and too short both — because a trainer's foot on
+    the floor makes the shin *longer* than the athlete's and a trainer's bent leg
+    makes it *shorter*. A bone with no median (the clip never showed it properly)
+    is not checked.
+    """
+    for name, value in bone_lengths(person).items():
+        median = medians.get(name, float("nan"))
+        if not (math.isfinite(value) and math.isfinite(median) and median > 0.0):
+            continue
+        if abs(value - median) / median > BONE_LENGTH_TOLERANCE:
+            return name
+    return None
+
+
+def counterpart_outlier(person: Person) -> str | None:
+    """The first leg or bone more than :data:`BONE_LENGTH_TOLERANCE` off its other side.
+
+    The same skeleton measured against itself: the two legs as a whole first —
+    thigh plus shin, which is the length a trainer's leg replaces — then each
+    bone against its left/right mirror, for the arms, the torso and a leg where
+    only one of its two bones is wrong. This needs no clip history at all, so it
+    also works on a clip too short to have a median, and it is scale free.
+    """
+    bones = bone_lengths(person)
+    lengths: dict[str, float] = {**bones, **_leg_lengths(bones)}
+    for name, other in (*LEG_COUNTERPARTS.items(), *COUNTERPART_BONES.items()):
+        gap = _relative_gap(lengths.get(name, float("nan")), lengths.get(other, float("nan")))
+        if math.isfinite(gap) and gap > BONE_LENGTH_TOLERANCE:
+            return name
+    return None
+
+
+def bone_length_mismatch(
+    person: Person, medians: Mapping[str, float] | None, *, compare_sides: bool = True
+) -> str | None:
+    """The bone that does not belong to this body, or ``None`` when they all do.
+
+    The clip's own medians first, because they know what this body looks like;
+    the left/right comparison second, for the frames the medians cannot judge —
+    a one-frame clip, or a bone the model only ever reported once.
+
+    ``compare_sides`` is False for a clip that has never shown a second body:
+    see :data:`ASYMMETRY_MIN_PEOPLE`.
+    """
+    if medians:
+        outlier = bone_length_outlier(person, medians)
+        if outlier is not None:
+            return outlier
+    if not compare_sides:
+        return None
+    return counterpart_outlier(person)
 
 
 def nearest_joint_distance(point: np.ndarray, other: Person) -> float:
@@ -726,21 +964,72 @@ def mixed_skeleton(athlete: Person, other: Person) -> bool:
     return False
 
 
-def trainer_contact(athlete: Person, others: Sequence[Person]) -> bool:
+def contact_reason(
+    athlete: Person,
+    others: Sequence[Person],
+    medians: Mapping[str, float] | None = None,
+    *,
+    compare_sides: bool = True,
+) -> str:
+    """Which rule says the trainer is on top of the athlete here; ``""`` if none.
+
+    The rules in the order they are tried, first one that fires wins:
+    :data:`REASON_BOX_IOU` (somebody else's box overlaps the athlete's),
+    :data:`REASON_MIXED_SKELETON` (the athlete's skeleton is stitched to
+    somebody else's joints) and :data:`REASON_BONE_LENGTH` (one of the athlete's
+    own bones is not the length it is everywhere else in the clip, or not the
+    length of its mirror image). The first two compare against the other people
+    in the frame, so they cannot fire when the model reported a single body; the
+    third is what covers that case, where the trainer's leg is inside the
+    athlete's own skeleton.
+
+    ``medians`` is :func:`clip_bone_medians` for the clip; without it the
+    bone-length rule still runs, on the left/right comparison alone. Pass
+    ``compare_sides=False`` for a clip that has never shown a second body
+    (:data:`ASYMMETRY_MIN_PEOPLE`).
+    """
+    if any(
+        athlete.box is not None
+        and other.box is not None
+        and box_iou(athlete.box, other.box) > CONTACT_MIN_IOU
+        for other in others
+    ):
+        return REASON_BOX_IOU
+    if any(mixed_skeleton(athlete, other) for other in others):
+        return REASON_MIXED_SKELETON
+    if bone_length_mismatch(athlete, medians, compare_sides=compare_sides) is not None:
+        return REASON_BONE_LENGTH
+    return REASON_NONE
+
+
+def trainer_contact(
+    athlete: Person,
+    others: Sequence[Person],
+    medians: Mapping[str, float] | None = None,
+    *,
+    compare_sides: bool = True,
+) -> bool:
     """Does any other person in this frame overlap or touch the athlete?
 
-    Either their bounding boxes of visible joints overlap by more than
-    :data:`CONTACT_MIN_IOU`, or the athlete's skeleton looks stitched to theirs
-    (:func:`mixed_skeleton`). A frame flagged here keeps the athlete's keypoints
-    but must not be scored downstream.
+    The boolean every later stage filters on; :func:`contact_reason` is the same
+    question asked for the reason. A frame flagged here keeps the athlete's
+    keypoints but must not be scored downstream.
     """
-    for other in others:
-        if athlete.box is not None and other.box is not None:
-            if box_iou(athlete.box, other.box) > CONTACT_MIN_IOU:
-                return True
-        if mixed_skeleton(athlete, other):
-            return True
-    return False
+    return contact_reason(athlete, others, medians, compare_sides=compare_sides) != REASON_NONE
+
+
+def reason_histogram(reasons: Sequence[str]) -> dict[str, int]:
+    """Frames per contact rule, every rule in :data:`CONTACT_REASONS` at least.
+
+    The zeros are kept so the sidecar's shape does not depend on the clip, and a
+    reason this module does not know about is counted too rather than dropped.
+    """
+    histogram: dict[str, int] = {reason: 0 for reason in CONTACT_REASONS}
+    for reason in reasons:
+        if reason == REASON_NONE:
+            continue
+        histogram[reason] = histogram.get(reason, 0) + 1
+    return histogram
 
 
 # --------------------------------------------------------------------------- #
@@ -772,12 +1061,19 @@ class FrameChoice:
     person: Person | None
     score: float
     n_people: int
-    contact: bool = False
+    #: Which contact rule fired, :data:`CONTACT_REASONS` or ``""``. Kept as the
+    #: reason rather than the flag so the parquet can explain itself.
+    reason: str = REASON_NONE
 
     @property
     def chosen(self) -> bool:
         """Was a person attributed to this frame?"""
         return self.person is not None
+
+    @property
+    def contact(self) -> bool:
+        """Is the trainer on the athlete in this frame, whatever the reason?"""
+        return self.reason != REASON_NONE
 
 
 def prepare_frame(frame_idx: int, t_ms: int, rotated: bool, landmarks: np.ndarray) -> FramePeople:
@@ -848,20 +1144,28 @@ def select_athlete(frames: Sequence[FramePeople]) -> list[FrameChoice]:
     A forward and a backward sweep each follow the athlete through the clip by
     continuity, and the better-scoring sweep wins per frame: only the backward
     one reaches the kick-up *before* the first inverted frame, where nothing
-    looks like a handstand yet. The winner is then checked against everybody
-    else in its frame, and a frame where the trainer is on top of the athlete
-    comes back with ``contact = True``.
+    looks like a handstand yet. The winners are then checked against everybody
+    else in their frame, and finally against the bones of the clip itself, so a
+    frame where the trainer is on top of the athlete — even a frame the model
+    reported as a single body — comes back with a reason and ``contact = True``.
     """
     forward = sweep(frames, range(len(frames)))
     backward = sweep(frames, reversed(range(len(frames))))
-    chosen: list[FrameChoice] = []
     # Both sweeps already return one choice per frame in frame order, so the two
     # passes line up position for position.
-    for frame, front, back in zip(frames, forward, backward, strict=True):
-        best = _higher(front, back)
+    winners = [_higher(front, back) for front, back in zip(forward, backward, strict=True)]
+    # What the athlete's bones look like elsewhere in the clip, which is what a
+    # single stitched skeleton has to be caught against, and whether the clip has
+    # ever shown a second body for the left/right comparison to mean anything.
+    medians = clip_bone_medians(winners)
+    compare_sides = max(frame.n_people for frame in frames) >= ASYMMETRY_MIN_PEOPLE
+    chosen: list[FrameChoice] = []
+    for frame, best in zip(frames, winners, strict=True):
         others = [person for person in frame.people if person is not best.person]
-        contact = best.person is not None and trainer_contact(best.person, others)
-        chosen.append(dataclasses.replace(best, contact=contact))
+        reason = REASON_NONE
+        if best.person is not None:
+            reason = contact_reason(best.person, others, medians, compare_sides=compare_sides)
+        chosen.append(dataclasses.replace(best, reason=reason))
     return chosen
 
 
@@ -938,15 +1242,16 @@ def load_frames(parquet_path: str | pathlib.Path) -> list[FramePeople]:
 
 
 def athlete_table(frames: Sequence[FramePeople], choices: Sequence[FrameChoice]) -> pd.DataFrame:
-    """The single-person schema plus the three athlete columns, 33 rows per frame.
+    """The single-person schema plus the four athlete columns, 33 rows per frame.
 
     A frame with a chosen athlete carries that person's landmarks; a frame
     without one keeps the 33 NaN rows with ``detected = false`` the runner
     writes for a frame it missed, so a consumer can filter on ``detected``
     instead of re-indexing. ``athlete_score`` is NaN exactly when nobody was
     chosen, ``n_people`` is the count after dedup and ``trainer_contact`` is
-    false whenever there is no athlete to be in contact with. ``rotated`` and
-    ``t_ms`` describe the frame and are taken from the input unchanged.
+    false whenever there is no athlete to be in contact with — with
+    ``contact_reason`` saying which rule fired. ``rotated`` and ``t_ms``
+    describe the frame and are taken from the input unchanged.
     """
     if len(frames) != len(choices):
         raise ValueError(f"got {len(frames)} frames but {len(choices)} choices")
@@ -987,6 +1292,9 @@ def athlete_table(frames: Sequence[FramePeople], choices: Sequence[FrameChoice])
             CONTACT_COLUMN: np.repeat(
                 np.asarray([choice.contact for choice in choices], dtype=bool), per_frame
             ),
+            CONTACT_REASON_COLUMN: np.repeat(
+                np.asarray([choice.reason for choice in choices], dtype=object), per_frame
+            ),
         }
     )
 
@@ -1010,6 +1318,9 @@ class ClipReport:
     parquet_path: pathlib.Path
     json_path: pathlib.Path
     frames_by_people: dict[int, int] = dataclasses.field(default_factory=dict)
+    #: How many frames each contact rule flagged, keyed by
+    #: :data:`CONTACT_REASONS`; the counts add up to ``contact_frames``.
+    contact_by_reason: dict[str, int] = dataclasses.field(default_factory=dict)
     skipped: bool = False
 
     def _percent(self, count: int) -> float:
@@ -1038,6 +1349,15 @@ class ClipReport:
         """``"0:2 1:150 2:80"`` — frames per number of people, after dedup."""
         return " ".join(
             f"{people}:{self.frames_by_people[people]}" for people in sorted(self.frames_by_people)
+        )
+
+    @property
+    def reason_summary(self) -> str:
+        """``"box_iou:2 bone_length:5"`` — flagged frames per rule that fired."""
+        return " ".join(
+            f"{reason}:{self.contact_by_reason[reason]}"
+            for reason in CONTACT_REASONS
+            if self.contact_by_reason.get(reason)
         )
 
 
@@ -1113,6 +1433,7 @@ def run_clip(
     frames_by_people = people_histogram([frame.n_people for frame in frames])
     athlete_frames = sum(choice.chosen for choice in choices)
     contact_frames = sum(choice.contact for choice in choices)
+    contact_by_reason = reason_histogram([choice.reason for choice in choices])
     frame_count = len(frames)
     scores = [choice.score for choice in choices if math.isfinite(choice.score)]
     sidecar = {
@@ -1124,6 +1445,7 @@ def run_clip(
         "contact_frame_count": contact_frames,
         "dropped_frame_count": frame_count - athlete_frames,
         "frames_by_people": {str(people): count for people, count in frames_by_people.items()},
+        "contact_frames_by_reason": contact_by_reason,
         "mean_athlete_score": round(sum(scores) / len(scores), 4) if scores else None,
         "runtime_seconds": round(runtime_seconds, 3),
     }
@@ -1150,6 +1472,7 @@ def run_clip(
         parquet_path=parquet_path,
         json_path=json_path,
         frames_by_people=frames_by_people,
+        contact_by_reason=contact_by_reason,
     )
 
 
@@ -1262,7 +1585,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"clip  {clip_id} rotate={report.rotate} frames={report.frame_count} "
             f"people[{report.people_summary}] athlete={report.athlete_percent:.1f}% "
-            f"contact={report.contact_percent:.1f}% dropped={report.dropped_percent:.1f}% "
+            f"contact={report.contact_percent:.1f}% "
+            f"reasons[{report.reason_summary}] dropped={report.dropped_percent:.1f}% "
             f"runtime={report.runtime_seconds:.1f}s -> {report.parquet_path}"
         )
     return 1 if failures else 0
