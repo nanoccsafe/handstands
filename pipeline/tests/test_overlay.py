@@ -25,6 +25,10 @@ FRAME_COUNT = 20
 WIDTH = 128
 HEIGHT = 96
 FPS = 10
+#: The real clips' display size, used where the drawn line has to survive mp4v.
+PORTRAIT_WIDTH = 576
+PORTRAIT_HEIGHT = 1024
+PORTRAIT_FRAMES = 6
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +90,35 @@ def flat_video(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
     return path
 
 
+@pytest.fixture(scope="module")
+def portrait_video(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
+    """A 6-frame 576x1024 flat grey clip — the real clips' display size, so the
+    alert border is the six pixels it is in production, and grey so that the only
+    red anywhere in a frame is the border a test drew."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is not installed")
+    path = tmp_path_factory.mktemp("portrait") / "portrait.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=gray:s={PORTRAIT_WIDTH}x{PORTRAIT_HEIGHT}:r={FPS}",
+            "-frames:v",
+            str(PORTRAIT_FRAMES),
+            "-pix_fmt",
+            "yuv420p",
+            str(path),
+        ],
+        check=True,
+    )
+    return path
+
+
 def blank_frame(height: int = 240, width: int = 320) -> np.ndarray:
     """A black BGR frame."""
     return np.zeros((height, width, 3), dtype=np.uint8)
@@ -129,24 +162,26 @@ def keypoint_table(
     frame_indices: Iterable[int],
     poses: dict[int, dict[str, tuple[float, float]]] | None = None,
     visibility: float = 0.9,
+    contact_frames: Iterable[int] = (),
 ) -> pd.DataFrame:
     """A long-format keypoint table for ``frame_indices``, schema-compatible.
 
     Frames missing from ``poses`` get their 33 rows of NaN and ``detected``
     false, exactly as the runner writes a frame the model missed.
+    ``contact_frames`` adds the ``--source athlete`` column
+    (:data:`overlay.CONTACT_COLUMN`), flagging those frames as trainer contact.
     """
     poses = poses or {}
+    contact = set(contact_frames)
     rows = []
     for frame_idx in frame_indices:
         pose = poses.get(frame_idx)
         t_ms = int(frame_idx * 1000 / FPS)
         for name in JOINT_NAMES:
+            row: dict[str, object] = {"frame_idx": frame_idx, "t_ms": t_ms, "joint": name}
             if pose is None or name not in pose:
-                rows.append(
+                row.update(
                     {
-                        "frame_idx": frame_idx,
-                        "t_ms": t_ms,
-                        "joint": name,
                         "x": math.nan,
                         "y": math.nan,
                         "z": math.nan,
@@ -158,11 +193,8 @@ def keypoint_table(
                 )
             else:
                 x, y = pose[name]
-                rows.append(
+                row.update(
                     {
-                        "frame_idx": frame_idx,
-                        "t_ms": t_ms,
-                        "joint": name,
                         "x": x,
                         "y": y,
                         "z": 0.0,
@@ -172,6 +204,8 @@ def keypoint_table(
                         "detected": True,
                     }
                 )
+            row[overlay.CONTACT_COLUMN] = frame_idx in contact
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -419,8 +453,82 @@ def test_caption_metrics_scale_with_frame_height() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# draw_border
+# --------------------------------------------------------------------------- #
+
+
+def test_draw_border_frames_the_picture_without_touching_the_input() -> None:
+    frame = blank_frame(HEIGHT, WIDTH)
+    before = frame.copy()
+    drawn = overlay.draw_border(frame)
+
+    assert np.array_equal(frame, before)
+    changed = changed_pixels(frame, drawn)
+    # Just the frame's edge, all the way round: the middle is untouched.
+    assert changed[0, :].all()
+    assert changed[-1, :].all()
+    assert changed[:, 0].all()
+    assert changed[:, -1].all()
+    assert not changed[HEIGHT // 2 - 2 : HEIGHT // 2 + 2, WIDTH // 2 - 2 : WIDTH // 2 + 2].any()
+    # ... in the alert colour, drawn inside the edge.
+    assert tuple(int(value) for value in drawn[0, WIDTH // 2]) == overlay.COLOR_ALERT
+
+
+def test_draw_border_thickness_scales_with_the_frame() -> None:
+    small_frame = blank_frame(96, 160)
+    large_frame = blank_frame(720, 960)
+    small = changed_pixels(small_frame, overlay.draw_border(small_frame))
+    large = changed_pixels(large_frame, overlay.draw_border(large_frame))
+
+    # A one-pixel line at 96 rows of height, a seven-pixel one at 720: the line
+    # scales with the frame exactly like the bones do.
+    assert np.flatnonzero(small[:, 80]).tolist() == [0, 95]
+    assert np.flatnonzero(large[:, 480]).tolist() == [*range(7), *range(713, 720)]
+    assert not small[1, 8:-8].any()  # nothing painted inside the line
+    assert not large[10:700, 480].any()
+
+
+def is_alert(pixel: np.ndarray) -> bool:
+    """Is this BGR pixel the alert red? Loose, because the mp4v codec is lossy."""
+    blue, green, red = (int(value) for value in pixel)
+    return red > 120 and green < 100 and blue < 100
+
+
+def is_good(pixel: np.ndarray) -> bool:
+    """Is this BGR pixel a confidently seen joint (:data:`overlay.COLOR_GOOD`)?"""
+    blue, green, red = (int(value) for value in pixel)
+    return green > 120 and red < 100 and blue < 100
+
+
+def test_draw_border_of_a_too_small_frame_is_unchanged() -> None:
+    frame = blank_frame(height=1, width=1)
+    assert np.array_equal(overlay.draw_border(frame), frame)
+
+
+# --------------------------------------------------------------------------- #
 # load_panel
 # --------------------------------------------------------------------------- #
+
+
+def test_load_panel_reads_the_trainer_contact_flag(tmp_path: pathlib.Path) -> None:
+    table = keypoint_table(range(3), {index: line_pose() for index in range(3)}, contact_frames=[1])
+    path = tmp_path / "athlete.parquet"
+    table.to_parquet(path, index=False)
+
+    panel = overlay.load_panel("auto", path)
+
+    assert overlay.CONTACT_COLUMN == "trainer_contact"
+    assert [panel.frames[index].trainer_contact for index in range(3)] == [False, True, False]
+
+
+def test_load_panel_without_the_contact_column_is_never_in_contact(tmp_path: pathlib.Path) -> None:
+    table = keypoint_table(range(2), {0: line_pose()}).drop(columns=[overlay.CONTACT_COLUMN])
+    path = tmp_path / "plain.parquet"
+    table.to_parquet(path, index=False)
+
+    panel = overlay.load_panel("auto", path)
+
+    assert not any(frame.trainer_contact for frame in panel.frames.values())
 
 
 def test_load_panel_reads_the_documented_schema(tmp_path: pathlib.Path) -> None:
@@ -626,6 +734,52 @@ def test_render_overlay_rejects_a_negative_frame_budget(
         overlay.render_overlay(synthetic_video, [("auto", path)], tmp_path / "x.mp4", max_frames=-1)
 
 
+def test_render_overlay_marks_the_trainer_contact_frames(
+    portrait_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A flagged frame gets a red border and the caption; its neighbours do not."""
+    poses = every_frame(first=0)
+    poses = {index: line_pose(PORTRAIT_WIDTH * 0.01 * index) for index in range(PORTRAIT_FRAMES)}
+    table = keypoint_table(range(PORTRAIT_FRAMES), poses, contact_frames=[3])
+    (path,) = write_panels(tmp_path / "keypoints" / "mediapipe_athlete", [("auto", table)])
+    out_path = tmp_path / "overlays" / f"{CLIP_ID}_auto.mp4"
+
+    report = overlay.render_overlay(portrait_video, [("auto", path)], out_path)
+
+    assert report.contact_frames == (1,)
+    assert report.detected_frames == (PORTRAIT_FRAMES,)
+    frames = decoded_frames(out_path)
+    flagged, plain = frames[3], frames[4]
+    assert overlay.TRAINER_CONTACT_LABEL == "trainer contact"
+
+    # The edge of the flagged frame is the alert colour, all the way round; the
+    # next frame is not flagged and has no border at all.
+    for edge in (flagged[0], flagged[-1], flagged[:, 0], flagged[:, -1]):
+        assert sum(is_alert(pixel) for pixel in edge) > 0.9 * len(edge)
+    for edge in (plain[0], plain[-1], plain[:, 0], plain[:, -1]):
+        assert not any(is_alert(pixel) for pixel in edge)
+    # The skeleton is still drawn on a flagged frame; only the frame around it
+    # and the caption changed.
+    assert any(is_good(pixel) for pixel in flagged.reshape(-1, 3))
+    assert any(is_good(pixel) for pixel in plain.reshape(-1, 3))
+
+
+def test_render_overlay_leaves_a_plain_parquet_alone(
+    flat_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """No ``trainer_contact`` column means no borders, exactly as before."""
+    table = keypoint_table(range(FRAME_COUNT), every_frame()).drop(columns=[overlay.CONTACT_COLUMN])
+    (path,) = write_panels(tmp_path / "keypoints" / "mediapipe", [("auto", table)])
+    out_path = tmp_path / "overlays" / f"{CLIP_ID}_auto.mp4"
+
+    report = overlay.render_overlay(flat_video, [("auto", path)], out_path)
+
+    assert report.contact_frames == (0,)
+    frame = decoded_frames(out_path)[3]
+    assert not any(is_alert(pixel) for pixel in frame[0])
+    assert not any(is_alert(pixel) for pixel in frame[:, 0])
+
+
 # --------------------------------------------------------------------------- #
 # Names and locations
 # --------------------------------------------------------------------------- #
@@ -648,6 +802,16 @@ def test_overlay_filename_needs_a_label() -> None:
         overlay.overlay_filename(CLIP_ID, [])
 
 
+def test_athlete_overlays_do_not_overwrite_the_plain_ones() -> None:
+    """The two sources of one rotation mode need two different file names."""
+    assert overlay.overlay_filename(CLIP_ID, ["auto"]) == f"{CLIP_ID}_auto.mp4"
+    assert overlay.overlay_filename(CLIP_ID, ["auto"], "mediapipe") == f"{CLIP_ID}_auto.mp4"
+    assert overlay.overlay_filename(CLIP_ID, ["auto"], "athlete") == f"{CLIP_ID}_athlete_auto.mp4"
+    assert overlay.overlay_filename(CLIP_ID, ["none", "auto"], "athlete") == (
+        f"{CLIP_ID}_athlete_none-vs-auto.mp4"
+    )
+
+
 def test_output_locations_live_under_the_data_dir() -> None:
     assert overlay.keypoints_root("/data") == pathlib.Path("/data/keypoints/mediapipe")
     assert overlay.panel_parquet_path("abc", "auto", "/data") == pathlib.Path(
@@ -656,6 +820,22 @@ def test_output_locations_live_under_the_data_dir() -> None:
     assert overlay.overlays_dir("/data") == pathlib.Path("/data/overlays")
     # Without an argument both fall back to the shared workspace, read at call time.
     assert overlay.overlays_dir() == paths.data_dir() / "overlays"
+
+
+def test_the_athlete_source_reads_its_own_keypoints_root() -> None:
+    assert overlay.SOURCES == ("mediapipe", "athlete")
+    assert overlay.DEFAULT_SOURCE == "mediapipe"
+    assert overlay.source_dirname() == "mediapipe"
+    assert overlay.source_dirname("mediapipe") == "mediapipe"
+    assert overlay.source_dirname("athlete") == "mediapipe_athlete"
+    assert overlay.keypoints_root("/data", "athlete") == pathlib.Path(
+        "/data/keypoints/mediapipe_athlete"
+    )
+    assert overlay.panel_parquet_path("abc", "auto", "/data", "athlete") == pathlib.Path(
+        "/data/keypoints/mediapipe_athlete/auto/abc.parquet"
+    )
+    with pytest.raises(ValueError, match="unknown source"):
+        overlay.source_dirname("everything")
 
 
 def test_missing_parquet_error_names_the_command(tmp_path: pathlib.Path) -> None:
@@ -669,6 +849,20 @@ def test_missing_parquet_error_names_the_command(tmp_path: pathlib.Path) -> None
     message = str(excinfo.value)
     assert "python -m handstand.pose_mediapipe --rotate auto" in message
     assert str(video) in message
+    assert str(path) in message
+
+
+def test_missing_athlete_parquet_error_names_both_commands(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "keypoints" / "mediapipe_athlete" / "auto" / f"{CLIP_ID}.parquet"
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        overlay.require_parquet(CLIP_ID, "auto", tmp_path, source="athlete")
+
+    message = str(excinfo.value)
+    # The multi-person run first, then the selection that reads it.
+    assert "python -m handstand.pose_mediapipe --rotate auto --num-poses 3" in message
+    assert "--running-mode image" in message
+    assert f"python -m handstand.athlete --rotate auto --clips {CLIP_ID}" in message
     assert str(path) in message
 
 
@@ -812,7 +1006,56 @@ def test_cli_parser_rejects_an_unknown_mode() -> None:
     with pytest.raises(SystemExit):
         overlay.build_arg_parser().parse_args([])  # --clip is required
 
+
+def test_cli_renders_the_athlete_source(
+    portrait_video: pathlib.Path,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    videos = tmp_path / "videos"
+    data = tmp_path / "data"
+    videos.mkdir()
+    (data / "keypoints").mkdir(parents=True)
+    shutil.copy(portrait_video, videos / "clip.mp4")
+    (data / "catalogue.csv").write_text(f"clip_id,filename\n{CLIP_ID},clip.mp4\n")
+    poses = {index: line_pose(PORTRAIT_WIDTH * 0.01 * index) for index in range(PORTRAIT_FRAMES)}
+    write_panels(
+        data / "keypoints" / "mediapipe_athlete",
+        [("auto", keypoint_table(range(PORTRAIT_FRAMES), poses, contact_frames=[0, 1, 2]))],
+    )
+
+    exit_code = overlay.main(
+        [
+            "--clip",
+            CLIP_ID,
+            "--modes",
+            "auto",
+            "--source",
+            "athlete",
+            "--videos",
+            str(videos),
+            "--data",
+            str(data),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    out_path = data / "overlays" / f"{CLIP_ID}_athlete_auto.mp4"
+    assert exit_code == 0, captured.err
+    assert out_path.is_file()
+    assert "source=athlete" in captured.out
+    assert "contact=3" in captured.out
+    frame = decoded_frames(out_path)[1]
+    assert sum(is_alert(pixel) for pixel in frame[0]) > 0.9 * PORTRAIT_WIDTH
+    assert not any(is_alert(pixel) for pixel in decoded_frames(out_path)[4][0])
+
+
+def test_cli_rejects_an_unknown_source() -> None:
+    with pytest.raises(SystemExit):
+        overlay.build_arg_parser().parse_args(["--clip", CLIP_ID, "--source", "everything"])
+
     args = overlay.build_arg_parser().parse_args(["--clip", CLIP_ID])
+    assert args.source == "mediapipe"
     assert args.modes == ["auto"]
     assert args.max_frames is None
     assert args.videos is None

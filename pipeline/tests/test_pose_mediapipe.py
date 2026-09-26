@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import itertools
 import json
 import pathlib
@@ -119,7 +120,9 @@ class StubLandmarker:
 
     A scripted entry is either ``None`` (nobody detected) or a *list of people*,
     each one a list of 33 :class:`StubLandmark`. People come back in script
-    order, which is what a real ``num_poses > 1`` run does too.
+    order, which is what a real ``num_poses > 1`` run does too. Both entry
+    points — ``detect_for_video`` (VIDEO) and ``detect`` (IMAGE) — draw from the
+    same script, and each records how it was called.
     """
 
     def __init__(
@@ -132,16 +135,25 @@ class StubLandmarker:
         self._counter = counter
         self.fed_images = fed_images
         self.timestamps: list[int] = []
+        self.detect_calls = 0
         self.closed = False
 
-    def detect_for_video(self, image: object, timestamp_ms: int) -> SimpleNamespace:
-        self.timestamps.append(timestamp_ms)
-        self.fed_images.append(image.numpy_view().copy())
+    def _next(self) -> SimpleNamespace:
         index = next(self._counter)
         people = self._script[index] if index < len(self._script) else None
         if people is None:
             return SimpleNamespace(pose_landmarks=[])
         return SimpleNamespace(pose_landmarks=list(people))
+
+    def detect_for_video(self, image: object, timestamp_ms: int) -> SimpleNamespace:
+        self.timestamps.append(timestamp_ms)
+        self.fed_images.append(image.numpy_view().copy())
+        return self._next()
+
+    def detect(self, image: object) -> SimpleNamespace:
+        self.detect_calls += 1
+        self.fed_images.append(image.numpy_view().copy())
+        return self._next()
 
     def close(self) -> None:
         self.closed = True
@@ -1022,6 +1034,216 @@ def test_make_landmarker_factory_reports_a_missing_model_when_used(tmp_path: pat
 
 
 # --------------------------------------------------------------------------- #
+# Runner: running mode and score thresholds
+# --------------------------------------------------------------------------- #
+
+
+IMAGE_SETTINGS = pm.DetectorSettings(
+    running_mode="image", min_detection=0.2, min_presence=0.2, min_tracking=0.4
+)
+
+
+def test_detector_settings_default_to_media_pipes_own() -> None:
+    """No flags means VIDEO with 0.5 everywhere, i.e. the pre-flag behaviour."""
+    assert pm.DEFAULT_RUNNING_MODE == "video"
+    assert pm.RUNNING_MODES == ("video", "image")
+    assert pm.DEFAULT_DETECTOR_SETTINGS == pm.DetectorSettings()
+    assert pm.DEFAULT_DETECTOR_SETTINGS.is_default
+    assert pm.DEFAULT_MIN_DETECTION_CONFIDENCE == 0.5
+    assert pm.DEFAULT_MIN_PRESENCE_CONFIDENCE == 0.5
+    assert pm.DEFAULT_MIN_TRACKING_CONFIDENCE == 0.5
+    assert IMAGE_SETTINGS.running_mode == "image"
+    assert not IMAGE_SETTINGS.is_default
+
+
+def test_detector_settings_reject_what_the_model_would_not_take() -> None:
+    pm.DEFAULT_DETECTOR_SETTINGS.validate()
+    IMAGE_SETTINGS.validate()
+    for bad in (pm.DetectorSettings(running_mode="stream"), pm.DetectorSettings(running_mode="")):
+        with pytest.raises(ValueError, match="running_mode"):
+            bad.validate()
+    for name in ("min_detection", "min_presence", "min_tracking"):
+        for value in (-0.1, 1.1):
+            with pytest.raises(ValueError, match=name):
+                pm.DetectorSettings(**{name: value}).validate()
+
+
+def test_image_running_mode_detects_every_frame_without_a_timestamp(
+    stub_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """IMAGE mode goes through ``detect()``, so the detector runs on every frame."""
+    factory, created, fed = stub_factory(single_person_script())
+    report, _ = run(stub_video, tmp_path, factory, settings=IMAGE_SETTINGS)
+
+    assert [marker.detect_calls for marker in created] == [STUB_VIDEO_FRAMES]
+    assert all(marker.timestamps == [] for marker in created)  # no timestamps needed
+    assert report.frame_count == STUB_VIDEO_FRAMES
+    assert len(fed) == STUB_VIDEO_FRAMES
+    # The rows and the frames are the same as a video run of the same detections.
+    table = pd.read_parquet(report.parquet_path)
+    assert list(table.columns) == list(pm.PARQUET_COLUMNS)
+    assert table.groupby("frame_idx")["t_ms"].first().tolist() == [0, 100, 200, 300]
+    assert int(table["detected"].sum()) == 3 * len(pm.JOINT_NAMES)
+
+
+def test_video_running_mode_is_what_the_default_run_uses(
+    stub_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    factory, created, _ = stub_factory(single_person_script())
+    report, _ = run(stub_video, tmp_path, factory)
+
+    assert [marker.detect_calls for marker in created] == [0]
+    assert [marker.timestamps for marker in created] == [[0, 100, 200, 300]]
+
+
+def test_auto_mode_keeps_two_trackers_per_running_mode(
+    stub_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The rotation split is unchanged: upright tracker plus rotated tracker."""
+    factory, created, _ = stub_factory(single_person_script())
+    run(stub_video, tmp_path, factory, rotate_mode="auto", settings=IMAGE_SETTINGS)
+
+    assert len(created) == 2
+    assert sum(marker.detect_calls for marker in created) == STUB_VIDEO_FRAMES
+    assert all(marker.timestamps == [] for marker in created)
+
+
+def test_non_default_detector_settings_are_recorded_in_the_sidecar(
+    stub_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A run that changed the flags says so; a default run says nothing."""
+    factory, _, _ = stub_factory(single_person_script())
+    report, _ = run(stub_video, tmp_path, factory, settings=IMAGE_SETTINGS, num_poses=3)
+    sidecar = json.loads(report.json_path.read_text())
+    assert sidecar["running_mode"] == "image"
+    assert sidecar["min_detection"] == 0.2
+    assert sidecar["min_presence"] == 0.2
+    assert sidecar["min_tracking"] == 0.4
+
+    # A default multi-person run keeps the sidecar it has always had.
+    plain_factory, _, _ = stub_factory(single_person_script())
+    plain, _ = run(
+        stub_video,
+        tmp_path / "plain",
+        plain_factory,
+        clip_id="clip0000000002",
+        num_poses=3,
+    )
+    plain_sidecar = json.loads(plain.json_path.read_text())
+    assert "running_mode" not in plain_sidecar
+    assert "min_detection" not in plain_sidecar
+
+
+def test_run_clip_rejects_detector_settings_the_model_would_not_take(
+    stub_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    factory, _, _ = stub_factory(single_person_script())
+    with pytest.raises(ValueError, match="running_mode"):
+        run(stub_video, tmp_path, factory, settings=pm.DetectorSettings(running_mode="batch"))
+    with pytest.raises(ValueError, match="min_presence"):
+        run(stub_video, tmp_path, factory, settings=pm.DetectorSettings(min_presence=2.0))
+
+
+def test_detector_settings_reach_the_model_options(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The thresholds and the running mode have to reach ``PoseLandmarkerOptions``."""
+    model = tmp_path / "pose.task"
+    model.write_bytes(b"stub model")
+    seen: dict[str, object] = {}
+
+    class FakeOptions:
+        def __init__(self, **kwargs: object) -> None:
+            seen["options"] = kwargs
+
+    class FakeLandmarker:
+        @staticmethod
+        def create_from_options(options: object) -> str:
+            return "landmarker"
+
+    monkeypatch.setattr(pm.mp_vision, "PoseLandmarkerOptions", FakeOptions)
+    monkeypatch.setattr(pm.mp_vision, "PoseLandmarker", FakeLandmarker)
+
+    pm.make_landmarker_factory(model, 3, IMAGE_SETTINGS)()
+    options = seen["options"]
+    assert isinstance(options, dict)
+    assert options["num_poses"] == 3
+    assert options["running_mode"] == pm.mp_vision.RunningMode.IMAGE
+    assert options["min_pose_detection_confidence"] == 0.2
+    assert options["min_pose_presence_confidence"] == 0.2
+    assert options["min_tracking_confidence"] == 0.4
+
+    # The default factory still builds exactly MediaPipe's own configuration.
+    pm.make_landmarker_factory(model)()
+    assert isinstance(seen["options"], dict)
+    assert seen["options"]["running_mode"] == pm.mp_vision.RunningMode.VIDEO
+    assert seen["options"]["min_pose_detection_confidence"] == 0.5
+    assert seen["options"]["min_pose_presence_confidence"] == 0.5
+    assert seen["options"]["min_tracking_confidence"] == 0.5
+
+    with pytest.raises(ValueError, match="min_tracking"):
+        pm.make_landmarker_factory(model, 1, pm.DetectorSettings(min_tracking=-1.0))
+
+
+def test_the_option_names_are_the_ones_media_pipe_actually_has() -> None:
+    """The stub above accepts any keyword; the real ``PoseLandmarkerOptions`` does not."""
+    parameters = inspect.signature(pm.mp_vision.PoseLandmarkerOptions.__init__).parameters
+    assert {
+        "base_options",
+        "running_mode",
+        "num_poses",
+        "min_pose_detection_confidence",
+        "min_pose_presence_confidence",
+        "min_tracking_confidence",
+    } <= set(parameters)
+
+
+def test_cli_passes_the_detector_settings_on(
+    synthetic_video: pathlib.Path,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pm, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(pm, "videos_dir", lambda: tmp_path)
+    seen: list[tuple[int, pm.DetectorSettings]] = []
+
+    def fake_factory(
+        model_path: object,
+        num_poses: int = 1,
+        settings: pm.DetectorSettings = pm.DEFAULT_DETECTOR_SETTINGS,
+    ) -> object:
+        seen.append((num_poses, settings))
+        return stub_factory(default_script())[0]
+
+    monkeypatch.setattr(pm, "make_landmarker_factory", fake_factory)
+    common = ["--clips", str(synthetic_video), "--model", "stub.task"]
+
+    assert (
+        pm.main(
+            [
+                "--num-poses",
+                "3",
+                "--running-mode",
+                "image",
+                "--min-detection",
+                "0.2",
+                "--min-presence",
+                "0.15",
+                *common,
+            ]
+        )
+        == 0
+    )
+    assert seen == [
+        (3, pm.DetectorSettings(running_mode="image", min_detection=0.2, min_presence=0.15))
+    ]
+
+    # A threshold the model would refuse is a usage error, not a crash.
+    with pytest.raises(SystemExit):
+        pm.main(["--min-tracking", "1.5", *common])
+
+
+# --------------------------------------------------------------------------- #
 # Runner: bookkeeping
 # --------------------------------------------------------------------------- #
 
@@ -1060,6 +1282,10 @@ def test_cli_parser_defaults_and_choices() -> None:
     args = parser.parse_args([])
     assert args.rotate == "none"
     assert args.num_poses == pm.DEFAULT_NUM_POSES == 1
+    assert args.running_mode == pm.DEFAULT_RUNNING_MODE == "video"
+    assert args.min_detection == pm.DEFAULT_MIN_DETECTION_CONFIDENCE
+    assert args.min_presence == pm.DEFAULT_MIN_PRESENCE_CONFIDENCE
+    assert args.min_tracking == pm.DEFAULT_MIN_TRACKING_CONFIDENCE
     assert args.clips is None
     assert args.limit is None
     assert args.overwrite is False
@@ -1077,6 +1303,10 @@ def test_cli_parser_defaults_and_choices() -> None:
             "--overwrite",
             "--num-poses",
             "3",
+            "--running-mode",
+            "image",
+            "--min-detection",
+            "0.2",
         ]
     )
     assert args.rotate == "auto"
@@ -1084,9 +1314,13 @@ def test_cli_parser_defaults_and_choices() -> None:
     assert args.limit == 3
     assert args.overwrite is True
     assert args.num_poses == 3
+    assert args.running_mode == "image"
+    assert args.min_detection == 0.2
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--rotate", "sideways"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--running-mode", "stream"])
     for out_of_range in ("0", "6", "-2"):
         with pytest.raises(SystemExit):
             parser.parse_args(["--num-poses", out_of_range])
@@ -1102,9 +1336,15 @@ def test_cli_routes_each_num_poses_to_its_own_output_root(
     monkeypatch.setattr(pm, "data_dir", lambda: tmp_path)
     monkeypatch.setattr(pm, "videos_dir", lambda: tmp_path)
     requested: list[int] = []
+    requested_settings: list[pm.DetectorSettings] = []
 
-    def fake_factory(model_path: object, num_poses: int = 1) -> object:
+    def fake_factory(
+        model_path: object,
+        num_poses: int = 1,
+        settings: pm.DetectorSettings = pm.DEFAULT_DETECTOR_SETTINGS,
+    ) -> object:
         requested.append(num_poses)
+        requested_settings.append(settings)
         return stub_factory(default_script())[0]
 
     monkeypatch.setattr(pm, "make_landmarker_factory", fake_factory)
@@ -1113,6 +1353,7 @@ def test_cli_routes_each_num_poses_to_its_own_output_root(
 
     assert pm.main(common) == 0
     assert requested == [1]
+    assert requested_settings == [pm.DEFAULT_DETECTOR_SETTINGS]
     single = tmp_path / "keypoints" / "mediapipe" / "none" / f"{clip_id}.parquet"
     assert single.is_file()
     assert list(pd.read_parquet(single).columns) == list(pm.PARQUET_COLUMNS)

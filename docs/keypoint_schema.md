@@ -11,6 +11,8 @@ same columns, same types, same coordinate conventions.
 <data_dir>/keypoints/mediapipe/<rotate>/<clip_id>.json             # sidecar metadata
 <data_dir>/keypoints/mediapipe_multi/<rotate>/<clip_id>.parquet    # --num-poses > 1
 <data_dir>/keypoints/mediapipe_multi/<rotate>/<clip_id>.json        # sidecar metadata
+<data_dir>/keypoints/mediapipe_athlete/<rotate>/<clip_id>.parquet  # athlete selection
+<data_dir>/keypoints/mediapipe_athlete/<rotate>/<clip_id>.json      # sidecar metadata
 ```
 
 * `<data_dir>` = `handstand.paths.data_dir()` (default
@@ -21,6 +23,9 @@ same columns, same types, same coordinate conventions.
 * `mediapipe_multi` only exists for `--num-poses > 1`. A multi-person run
   writes to its own root, so it can never overwrite the single-person
   parquets the other stages read.
+* `mediapipe_athlete` is the athlete selection
+  ([below](#athlete-selection--trainer-contact)) — the single-person schema
+  again, holding only the athlete's body.
 * `<clip_id>` = the `clip_id` column of `<data_dir>/catalogue.csv`
   (`clip_id,filename`) when that file exists, otherwise the first 12 hex
   characters of the SHA-1 of the video file's bytes (same definition as the
@@ -34,6 +39,12 @@ cd pipeline
 uv run python -m handstand.pose_mediapipe --rotate none --limit 3
 uv run python -m handstand.pose_mediapipe --rotate auto --limit 3
 uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
+
+# the recommended multi-person setting, then the athlete selection on top of it
+uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \
+    --running-mode image --min-detection 0.2 --min-presence 0.2
+uv run python -m handstand.athlete --rotate auto
+uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
 ```
 
 ## Parquet: one row per (frame, joint)
@@ -141,6 +152,131 @@ for person_idx, block in people[people["frame_idx"] == 0].groupby("person_idx"):
     print(person_idx, block.set_index("joint").loc["nose", ["x", "y"]])
 ```
 
+## Detector settings (`--running-mode`, `--min-*`)
+
+MediaPipe's own default is VIDEO mode (the detector only re-runs when tracking
+is lost) with every score threshold at `0.5`. That is the default here too, so a
+run without these flags is byte-identical to what the runner has always written.
+
+| flag | default | meaning |
+|---|---|---|
+| `--running-mode {video,image}` | `video` | `video` tracks between frames and needs timestamps; `image` runs the detector on **every** frame and needs none |
+| `--min-detection` | `0.5` | `min_pose_detection_confidence`: a detection below this is dropped |
+| `--min-presence` | `0.5` | `min_pose_presence_confidence`: a landmark below this is not "present" |
+| `--min-tracking` | `0.5` | `min_tracking_confidence`: how well a landmark has to follow the previous frame to be associated with it |
+
+VIDEO mode with `0.5` reports **one** person in 98–100 % of frames even when a
+trainer is standing right there, because the second detection is suppressed.
+IMAGE mode with `--min-detection 0.2 --min-presence 0.2` is therefore the
+recommended multi-person setting: the detector sees the trainer on every frame.
+Going below `0.2` (e.g. `0.05`) only adds phantom people.
+
+The four settings are recorded in the sidecar whenever they differ from the
+default, so a later reader can reproduce the run (see
+[Sidecar JSON](#sidecar-json)).
+
+## Athlete selection + trainer contact
+
+`handstand.athlete` reads `keypoints/mediapipe_multi/<rotate>/<clip_id>.parquet`
+and writes `keypoints/mediapipe_athlete/<rotate>/<clip_id>.parquet`: the
+**single-person schema** above, holding the athlete's body only, so every later
+stage keeps working unchanged.
+
+```sh
+cd pipeline
+uv run python -m handstand.athlete --rotate auto
+uv run python -m handstand.athlete --rotate auto --clips 6508f9b355bd
+```
+
+| column | type | meaning |
+|---|---|---|
+| `athlete_score` | float64 | the winner's score, 0..1 (the weights below add up to 1); NaN when the frame is attributed to nobody |
+| `n_people` | int64 | how many people were in the frame **after** dedup |
+| `trainer_contact` | bool | the trainer overlaps or touches the athlete: the keypoints are the athlete's, but the frame must not be scored |
+| `contact_reason` | string | which rule set that flag: `""`, `"box_iou"`, `"mixed_skeleton"` or `"bone_length"` — the first one that fired. Downstream code filters on `trainer_contact`, this is for explaining a flag |
+
+The rules, applied to each frame in this order (the constants are
+`handstand.athlete`'s module-level ones; see its docstring for the code):
+
+1. **Deduplicate.** Two detections of one body are one person: hip midpoints
+   within `0.15` body lengths *and* a median joint-to-joint distance below `0.1`
+   body lengths (over at least 4 joints both reported). The more visible one
+   survives. A *body length* is the person's own shoulder-midpoint to
+   ankle-midpoint span, so every distance below is scale-free.
+2. **Score and choose.** Each remaining person is scored 0..1 from
+   * **inversion (0.4)** — mean wrist y greater than mean ankle y, i.e. on their
+     hands;
+   * **support (0.2)** — wrists near the lowest wrist/foot point in the frame
+     (the mat), measured in that person's own shoulder-to-ankle lengths;
+   * **continuity (0.3)** — hip midpoint close to the previously chosen athlete,
+     in that person's own body lengths;
+   * **visibility (0.1)** — mean visibility of the 12 main joints (shoulders,
+     elbows, wrists, hips, knees, ankles).
+
+   The clip is swept **forward and backward**, each sweep measuring continuity
+   against the athlete *that* sweep chose in its previous frame, and the
+   higher-scoring sweep wins per frame. That is what covers the kick-up before
+   the first inverted frame, where nothing looks like a handstand yet.
+3. **Flag contact.** The chosen person is `trainer_contact`, with the reason in
+   `contact_reason`, when any of these fires:
+
+   | reason | what it means |
+   |---|---|
+   | `box_iou` | another person's bounding box (of its visible joints, visibility ≥ 0.5) overlaps the athlete's by IoU > `0.3` |
+   | `mixed_skeleton` | one of the athlete's limb joints is closer to the other person's joints than to the athlete's own centre line (their feet to their head) — the two skeletons overlap so much that the model stitched them into one |
+   | `bone_length` | one of the athlete's own bones is the wrong length: more than `BONE_LENGTH_TOLERANCE` (0.35) off the median of the same bone over the clip, or off the same bone on the other side of the body |
+
+   The first two need a *second detection*, so contamination inside a single
+   reported skeleton — the athlete's upper body with the trainer's foot on the
+   floor, which is what MediaPipe reports when the trainer stands right behind
+   them — slips past them. `bone_length` is what catches that: the bones are
+   measured over the five pairs of the athlete's own (upper arm, forearm,
+   thigh, shin, and the side of the torso, left and right), each pair's median
+   over the frames where both its joints were seen at visibility ≥ 0.5, and a
+   bone outside the ±35 % band is somebody else's limb.
+
+   The left/right half of that rule only runs for a clip in which MediaPipe
+   reported 2+ people in at least one frame (`ASYMMETRY_MIN_PEOPLE`). An athlete
+   straddling their legs in a handstand has one leg pointing at the camera and
+   one away, and MediaPipe reports that as a 35–50 % left/right difference for
+   whole stretches of a clip with nobody else in it — those frames are the
+   athlete's own and must stay scorable. The per-clip median needs no second
+   body, so it always runs.
+
+   What no rule can catch: contamination that *is* the clip's norm. In
+   6508f9b355bd the trainer's leg is stitched onto the athlete's left hip in
+   every frame the model reports one body, so the clip's own median is the
+   contaminated length and only the worst frames stand out (16 of 244).
+4. **Give up honestly.** A frame whose best score is below `0.35`, or where the
+   two best candidates are within `0.05` of each other, is written as *not
+   detected*: 33 NaN rows with `detected = false`, exactly as a frame the model
+   missed. `rotated` and `t_ms` still describe the frame, and `n_people` still
+   says how many people were in it.
+
+```python
+import pandas as pd
+
+df = pd.read_parquet(".../keypoints/mediapipe_athlete/auto/1a2b3c4d5e6f.parquet")
+scorable = df[df["detected"] & ~df["trainer_contact"]]
+# why a frame was dropped:
+print(df[df["trainer_contact"]]["contact_reason"].value_counts())
+```
+
+### Watching one
+
+`handstand.overlay --source athlete` draws these keypoints and marks every
+flagged frame with a red border and the caption `trainer contact`, so the frames
+that must not be scored are obvious while watching:
+
+```sh
+cd pipeline
+uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
+# -> <data_dir>/overlays/6508f9b355bd_athlete_auto.mp4
+```
+
+The source is part of the file name (only for a non-default source), so the
+plain `--source mediapipe` render of the same rotation mode is left alone.
+
 ## Joint names
 
 The 33 MediaPipe pose landmarks, snake_case, in model order (this is the
@@ -204,6 +340,35 @@ A sidecar under `mediapipe_multi` (i.e. `--num-poses > 1`) adds two keys:
 
 A single-person sidecar does **not** carry them, so `--num-poses 1` output is
 unchanged.
+
+Any run whose detector settings differ from MediaPipe's own defaults (see
+[Detector settings](#detector-settings---running-mode---min-)) adds four more:
+
+| key | meaning |
+|---|---|
+| `running_mode` | `video` or `image` |
+| `min_detection` | `--min-detection` |
+| `min_presence` | `--min-presence` |
+| `min_tracking` | `--min-tracking` |
+
+A run on the defaults records none of them, so a historical sidecar stays
+byte-identical.
+
+A sidecar under `mediapipe_athlete` (written by `handstand.athlete`) describes
+the selection instead:
+
+| key | meaning |
+|---|---|
+| `clip_id`, `rotate` | as above |
+| `source_parquet` | the multi-person parquet it read, e.g. `mediapipe_multi/auto/1a2b3c4d5e6f.parquet` |
+| `frame_count` | frames in the clip (rows / 33) |
+| `athlete_frame_count` | frames a person was attributed to |
+| `contact_frame_count` | of those, the frames flagged as trainer contact |
+| `dropped_frame_count` | frames written as not detected (`frame_count - athlete_frame_count`) |
+| `frames_by_people` | frames per number of people, **after** dedup |
+| `contact_frames_by_reason` | flagged frames per rule, e.g. `{"box_iou": 20, "mixed_skeleton": 1, "bone_length": 16}`; the three values add up to `contact_frame_count` |
+| `mean_athlete_score` | mean `athlete_score` over the attributed frames, or `null` when none was |
+| `runtime_seconds` | wall-clock seconds for the whole clip |
 
 ## Rotation modes
 
