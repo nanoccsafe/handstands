@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Athlete selection + trainer-contact flag (per-frame multi-person detection) (#68)
 - Multi-person keypoints: run MediaPipe with up to 3 poses per frame (#67)
 - Overlay renderer: draw keypoints on a clip, single or side by side (#24)
 - MediaPipe Pose Landmarker (Full) runner with optional 180 deg rotation (#14)
