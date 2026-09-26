@@ -304,19 +304,31 @@ def longest_run(flags: Sequence[bool]) -> int:
 
 
 def longest_run_seconds(flags: Sequence[bool], durations_ms: Sequence[float]) -> float:
-    """The longest stretch of consecutive true flags, in seconds.
+    """The stretch of consecutive true flags that lasted longest, in seconds.
 
-    The length of the run in frames, timed with the clip's own frame durations —
-    so a run is "how long the trainer was on the athlete on screen", not "how many
-    frames divided by a nominal rate". A run of nothing is 0.0 s, not 0 frames.
+    The run is the one that covers the most *time*, not the one with the most
+    frames: these clips are variable frame rate, so a run of four 10 ms frames is
+    shorter on screen than a run of one 100 ms frame, and a column measured in
+    seconds that reported the first as "the longest run" would understate the
+    trainer's longest touch. On an evenly spaced clip the two agree, and both
+    agree with :func:`longest_run`'s frame count.
+
+    A run of nothing is 0.0 s, not 0 frames. Fewer durations than flags cannot be
+    timed at all, so it falls back to counting the frames as a millisecond each;
+    more durations than flags is harmless, the first one per frame being the one
+    that counts.
     """
-    start, length = _longest_run_span(flags)
-    if not length:
-        return 0.0
     durations = np.asarray(list(durations_ms), dtype=np.float64)
-    if durations.size < length:  # a caller without timestamps: fall back to a count
-        return float(length) / 1000.0
-    return float(durations[start : start + length].sum()) / 1000.0
+    if durations.size < len(flags):
+        return longest_run(flags) / 1000.0
+    best = current = 0.0
+    for flag, duration in zip(flags, durations[: len(flags)], strict=True):
+        if flag:
+            current += duration
+            best = max(best, current)
+        else:
+            current = 0.0
+    return best / 1000.0
 
 
 def flagged_seconds(flags: Sequence[bool], durations_ms: Sequence[float]) -> float:
@@ -871,13 +883,21 @@ def _write_atomic(path: pathlib.Path, text: str) -> None:
 
 
 def write_report(
-    metrics: Sequence[ClipMetrics], *, data: str | pathlib.Path, elapsed_seconds: float = 0.0
+    metrics: Sequence[ClipMetrics],
+    *,
+    data: str | pathlib.Path,
+    generate_seconds: float = 0.0,
+    report_seconds: float = 0.0,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Write ``trainer_report.csv`` and ``trainer_report.md`` under ``<data_dir>/reports``.
 
     Returns the two paths, in that order. Neither is committed: both are a
     rendering of the parquets and are rebuilt by re-running the report.
-    ``elapsed_seconds`` is how long the run took, and goes into the summary.
+    ``generate_seconds`` and ``report_seconds`` are the two halves of this run's
+    runtime, timed separately so the summary can say which is which — they are
+    different by four orders of magnitude, and calling the whole of a
+    ``--generate`` run "this report" would read as though reading the parquets
+    took as long as detecting poses in them.
     """
     out_dir = reports_dir(data)
     csv_path = out_dir / CSV_FILENAME
@@ -885,7 +905,10 @@ def write_report(
     buffer = io.StringIO()
     metrics_table(metrics).to_csv(buffer, index=False, lineterminator="\n")
     _write_atomic(csv_path, buffer.getvalue())
-    _write_atomic(markdown_path, summarise(metrics, elapsed_seconds=elapsed_seconds))
+    _write_atomic(
+        markdown_path,
+        summarise(metrics, generate_seconds=generate_seconds, report_seconds=report_seconds),
+    )
     return csv_path, markdown_path
 
 
@@ -969,14 +992,18 @@ def _markdown_table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str
     return "\n".join(lines)
 
 
-def summarise(metrics: Sequence[ClipMetrics], *, elapsed_seconds: float = 0.0) -> str:
+def summarise(
+    metrics: Sequence[ClipMetrics], *, generate_seconds: float = 0.0, report_seconds: float = 0.0
+) -> str:
     """The markdown summary: the headline numbers, the worst clips, the histogram.
 
-    ``elapsed_seconds`` is how long the run took; the generation runtime is the sum
-    of the runtimes the sidecars recorded, i.e. what the keypoints cost however
-    many batches they were produced in. Clips that failed carry no numbers, so
-    they are listed rather than counted into any percentage — every share below is
-    "of the clips that were measured".
+    The runtimes are three different numbers and are kept apart: what the
+    keypoints cost, summed from the runtimes the sidecars recorded however many
+    batches produced them; what *this* run spent in ``--generate`` (nothing, on a
+    report-only run); and what this run spent reading the parquets and writing
+    the two files. Their sum is the total for the run. Clips that failed carry no
+    numbers, so they are listed rather than counted into any percentage — every
+    share below is "of the clips that were measured".
     """
     usable = [clip for clip in metrics if not clip.error]
     failed = [clip for clip in metrics if clip.error]
@@ -988,7 +1015,7 @@ def summarise(metrics: Sequence[ClipMetrics], *, elapsed_seconds: float = 0.0) -
     dropped = sum(clip.dropped_frames for clip in usable)
     scorable = sum(clip.scorable_frames for clip in usable)
     video_s = sum(clip.seconds for clip in usable)
-    generate_s = sum(clip.generate_seconds for clip in usable)
+    keypoints_s = sum(clip.generate_seconds for clip in usable)
     reasons = {
         reason: sum(clip.reason_counts[reason] for clip in usable)
         for reason in athlete.CONTACT_REASONS
@@ -1127,8 +1154,14 @@ def summarise(metrics: Sequence[ClipMetrics], *, elapsed_seconds: float = 0.0) -
         "## Runtime",
         "",
         f"- keypoints and athlete selection, as recorded in the sidecars: "
-        f"{_fmt_duration(generate_s)}",
-        f"- this report: {_fmt_duration(elapsed_seconds)}",
+        f"{_fmt_duration(keypoints_s)}",
+    ]
+    if generate_seconds > 0.0:
+        out.append(f"- generation in this run: {_fmt_duration(generate_seconds)}")
+    out += [
+        f"- this report, reading the parquets and writing these two files: "
+        f"{_fmt_duration(report_seconds)}",
+        f"- total for this run: {_fmt_duration(generate_seconds + report_seconds)}",
         "",
         "## Failures",
         "",
@@ -1282,7 +1315,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     data = (args.data or data_dir()).expanduser()
     videos = (args.videos or videos_dir()).expanduser()
-    started = time.perf_counter()
     try:
         entries = read_catalogue(data / CATALOGUE_FILENAME)
     except FileNotFoundError as error:
@@ -1302,7 +1334,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     failures: dict[str, str] = {}
+    generate_seconds = 0.0
     if args.generate:
+        started = time.perf_counter()
         failures = generate_batch(
             entries,
             keypoints_root=data / "keypoints",
@@ -1311,18 +1345,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_path=args.model,
             overwrite=args.overwrite,
         )
+        generate_seconds = time.perf_counter() - started
         print(
             f"generated {len(entries) - len(failures)} of {len(entries)} clips, "
-            f"{len(failures)} failed",
+            f"{len(failures)} failed, {_fmt_duration(generate_seconds)}",
             flush=True,
         )
 
+    report_started = time.perf_counter()
     metrics = _measure(entries, data=data, rotate=args.rotate)
-    elapsed = time.perf_counter() - started
-    csv_path, markdown_path = write_report(metrics, data=data, elapsed_seconds=elapsed)
+    csv_path, markdown_path = write_report(
+        metrics, data=data, generate_seconds=generate_seconds, report_seconds=0.0
+    )
+    report_seconds = time.perf_counter() - report_started
+    # The summary quotes the runtimes, so the clock has to have stopped before it
+    # can be rendered: it is written once more with the numbers in it. Only the
+    # markdown quotes them, so the CSV is left as ``write_report`` wrote it.
+    _write_atomic(
+        markdown_path,
+        summarise(metrics, generate_seconds=generate_seconds, report_seconds=report_seconds),
+    )
     print(f"wrote {csv_path}")
     print(f"wrote {markdown_path}")
-    print(summarise(metrics, elapsed_seconds=elapsed).rstrip("\n"))
+    print(
+        summarise(metrics, generate_seconds=generate_seconds, report_seconds=report_seconds)
+        .rstrip("\n")
+    )
     return 1 if failures or any(clip.error for clip in metrics) else 0
 
 

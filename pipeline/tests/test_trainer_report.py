@@ -158,6 +158,24 @@ def test_longest_run_in_seconds_times_the_clip_s_own_frames() -> None:
     assert tr.longest_run_seconds([True, True], []) == pytest.approx(0.002)
 
 
+def test_the_longest_run_is_the_one_that_lasted_longest() -> None:
+    # Four 10 ms frames of contact, then a single 100 ms one. The run with the
+    # most frames is not the run that lasted longest, and the column is in
+    # seconds: reporting the first as "the longest run" would understate it.
+    flags = [True] * 4 + [False] + [True] + [False] * 4
+    durations = [10.0] * 4 + [40.0] + [100.0] + [10.0] * 4
+
+    assert tr.longest_run(flags) == 4  # the frame count is a different question
+    assert tr.longest_run_seconds(flags, durations) == pytest.approx(0.1)
+    # An evenly spaced clip cannot tell the two apart, which is why this only
+    # shows up on the variable-frame-rate ones.
+    assert tr.longest_run_seconds(flags, [40.0] * len(flags)) == pytest.approx(0.16)
+    # Two separate runs: each is measured on its own, never summed.
+    assert tr.longest_run_seconds([True, True, False, True], [10.0, 10.0, 5.0, 90.0]) == (
+        pytest.approx(0.09)
+    )
+
+
 def test_flagged_seconds_counts_every_flagged_frame() -> None:
     durations = tr.frame_durations_ms([0, 40, 80, 120])
     assert tr.flagged_seconds([True, False, True, True], durations) == pytest.approx(0.12)
@@ -677,7 +695,7 @@ def test_write_report_writes_both_files(tmp_path: pathlib.Path) -> None:
         tr.ClipMetrics.failed("bbb", "RuntimeError: boom", filename="b.mp4"),
     ]
 
-    csv_path, markdown_path = tr.write_report(metrics, data=tmp_path, elapsed_seconds=1.5)
+    csv_path, markdown_path = tr.write_report(metrics, data=tmp_path, report_seconds=1.5)
 
     assert csv_path == tmp_path / "reports" / "trainer_report.csv"
     assert markdown_path == tmp_path / "reports" / "trainer_report.md"
@@ -733,7 +751,7 @@ def test_the_summary_reports_the_headline_numbers() -> None:
     )
     failed = tr.ClipMetrics.failed("ccc", "RuntimeError: boom", filename="c.mp4")
 
-    text = tr.summarise([clean, busy, failed], elapsed_seconds=2.0)
+    text = tr.summarise([clean, busy, failed], report_seconds=2.0)
 
     assert "Measured 2 of 3 catalogue clips" in text
     assert "160 frames" in text
@@ -749,7 +767,7 @@ def test_the_summary_reports_the_headline_numbers() -> None:
     assert "## The 10 most affected clips" in text
     assert "`bbb`" in text and "hands-on" in text
     assert "`ccc`: RuntimeError: boom" in text
-    assert "- this report: 2.0 s" in text
+    assert "- this report, reading the parquets and writing these two files: 2.0 s" in text
     assert "could not be measured" in text
 
 
@@ -775,6 +793,26 @@ def test_the_most_affected_clips_are_ranked_by_contact_then_by_run() -> None:
     assert ranked[0].longest_contact_run_s == pytest.approx(1.2)
     assert ranked[1].longest_contact_run_s == pytest.approx(0.04)
     assert len(tr._most_affected([tr.ClipMetrics.failed("x", "boom")])) == 0
+
+
+def test_the_runtimes_are_reported_apart() -> None:
+    metrics = [tr.clip_metrics(athlete_table((alone(10), 40)), clip_id="aaa")]
+
+    # A report-only run generated nothing, so it says nothing about generating:
+    # only the keypoints the sidecars recorded, and its own two seconds.
+    text = tr.summarise(metrics, report_seconds=2.0)
+    assert "generation in this run" not in text
+    assert "this report, reading the parquets and writing these two files: 2.0 s" in text
+    assert "total for this run: 2.0 s" in text
+
+    # A --generate run says how long it spent generating, and totals it up. The
+    # two are four orders of magnitude apart, so a single "this report" number
+    # for the whole run would read as though reading the parquets took as long
+    # as detecting poses in them.
+    text = tr.summarise(metrics, generate_seconds=600.0, report_seconds=2.0)
+    assert "generation in this run: 10.0 min" in text
+    assert "this report, reading the parquets and writing these two files: 2.0 s" in text
+    assert "total for this run: 10.0 min" in text
 
 
 def test_the_summary_of_nothing_says_so() -> None:
@@ -839,6 +877,10 @@ def test_the_cli_reports_on_existing_outputs(
     assert rows[1]["error"].startswith("FileNotFoundError")
     assert "re-run with --generate" in rows[1]["error"]
     assert "FileNotFoundError" in printed  # the summary lists it too
+    # A report-only run generated nothing, so its summary must not claim to have.
+    markdown = (data / "reports" / "trainer_report.md").read_text(encoding="utf-8")
+    assert "generation in this run" not in markdown
+    assert "total for this run: " in markdown
 
 
 def test_the_cli_reports_a_missing_catalogue(
@@ -888,6 +930,11 @@ def test_the_cli_generates_before_reporting(
     assert generated == ["clip00000001", "clip00000002"]
     assert "generate=yes" in printed
     assert "generated 2 of 2 clips, 0 failed" in printed
+    # The generation it did and the report it wrote are timed apart, so the
+    # summary does not bill reading 180 parquets for the time spent detecting.
+    markdown = (data / "reports" / "trainer_report.md").read_text(encoding="utf-8")
+    assert "generation in this run: " in markdown
+    assert "this report, reading the parquets" in markdown
 
 
 def test_the_cli_arguments_are_the_documented_ones() -> None:

@@ -326,7 +326,10 @@ standing there, and would measure that clip as "no trainer, ever".
 The markdown summary answers the dataset question directly: how many clips have
 a trainer in them, the frame-level shares (second person, contact, dropped,
 scorable), the ten most affected clips, and a histogram of `pct_trainer_contact`
-per clip in 10 % buckets.
+per clip in 10 % buckets. Its runtime section keeps the two halves of a run
+apart — what the keypoints cost (as recorded in the sidecars, however many
+batches produced them), what *this* run spent in `--generate`, and what reading
+the parquets took, which is under a second for the whole dataset.
 
 ```sh
 cd pipeline
