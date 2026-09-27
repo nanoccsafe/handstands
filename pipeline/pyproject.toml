@@ -11,6 +11,7 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pandas>=3.0.6",
     "pyarrow>=25.0.1",
+    "rtmlib>=0.0.16",
     "scikit-learn>=1.5,<1.6",
     "scipy>=1.18.1",
 ]

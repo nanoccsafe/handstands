@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Agent pre-labels for the sampled frames: `uv run python -m handstand.prelabel`
+  runs RTMPose (via `rtmlib`, deliberately a model outside the bake-off) over
+  every frame in the labelling manifest, upright and rotated, and writes
+  `data/label_studio_prelabels.json` (Label Studio tasks carrying a `predictions`
+  entry) plus `data/labels/review_queue.csv`, which sorts the frames whose
+  pre-labels most likely need correcting to the top with the reason for each
+  (#77). The athlete is picked by **keypoint** agreement with the MediaPipe
+  athlete, not bounding-box overlap: a crouching trainer's box can overlap the
+  athlete's more than the athlete's own inverted skeleton does, which pre-labelled
+  the trainer on 20 of 300 frames. Keypoint matching plus writing no pre-label at
+  all where the reference rejects every detection brings that to 0/300, and those
+  19 no-pre-label frames lead the review queue instead of sinking to the bottom —
+  they are identifiable inside the specified columns by `low_score_joints`
+  listing all 15 joints (#77)
 - Athlete selection for the Apple Vision keypoints: `handstand.athlete --source
   vision` runs the same athlete and trainer-contact rules over `vision_multi/`
   and writes `vision_athlete/` in the same schema, so the bake-off compares the
@@ -26,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Agent pre-labels for the labelling sample (RTMPose, not a bake-off model) (#77)
 - Apple Developer account decision (#6)
 - Data storage and sync strategy for videos (#5)
 - Check WhatsApp compression impact; recover originals if possible (#9)
