@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Athlete selection for the Apple Vision keypoints: `handstand.athlete --source
+  vision` runs the same athlete and trainer-contact rules over `vision_multi/`
+  and writes `vision_athlete/` in the same schema, so the bake-off compares the
+  two models after the same selection; `handstand.overlay --source
+  vision_athlete` draws it (#76)
 - Apple Vision body-pose keypoints as a second pose model: a Swift CLI that runs
   on the Mac mini in the same schema as MediaPipe, a script that drives it from
   the workstation, and a CSV -> parquet import (`tools/mac/run_vision.sh`, then
@@ -21,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Athlete selection over the Apple Vision keypoints (`--source vision`, unchanged output for `mediapipe`) (#76)
 - Apple Vision body-pose runner (Swift CLI on the Mac mini) + import to keypoint schema (#15)
 - Frame sampler + keypoint labeling setup (Label Studio) (#65)
 - Refine bone-length contact rule: flag lengthened bones only (#70)

@@ -4,6 +4,10 @@ Nothing here touches the real handstand videos: the input is a hand-built
 multi-person parquet with synthetic ``(33, 5)`` landmark blocks, laid out like
 the real clips (576x1024 display pixels) — a standing trainer, the same body
 upside down, a third person standing on top of the athlete, and so on.
+
+The Apple Vision half (``--source vision``) is built the same way from the *same*
+geometry: a ``(19, 5)`` block in Vision's own joint order, with no feet, no
+hands and no mouth, so the rules are measured on the joints Vision has.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from handstand import athlete
+from handstand import athlete, vision_import
 from handstand import pose_mediapipe as pm
 
 #: Where the synthetic people stand in the 576x1024 frame.
@@ -54,12 +58,12 @@ def face(x: float, y: float) -> dict[str, tuple[float, float]]:
     }
 
 
-def standing(
-    x: float, visibility: float = 0.9, wrist_y: float = 480.0, hip_y: float = 500.0
-) -> np.ndarray:
+def standing_points(
+    x: float, wrist_y: float = 480.0, hip_y: float = 500.0
+) -> dict[str, tuple[float, float]]:
     """A person on their feet: hands by their sides at ``wrist_y``, feet on the mat."""
     shift = hip_y - 500.0
-    points = {
+    return {
         **face(x, 250.0 + shift),
         "left_shoulder": (x - 15, 300.0 + shift),
         "right_shoulder": (x + 15, 300.0 + shift),
@@ -78,12 +82,11 @@ def standing(
         "left_foot_index": (x - 20, MAT_Y),
         "right_foot_index": (x + 20, MAT_Y),
     }
-    return landmarks(points, visibility=visibility)
 
 
-def handstand(x: float, visibility: float = 0.9, wrist_y: float = 900.0) -> np.ndarray:
+def handstand_points(x: float, wrist_y: float = 900.0) -> dict[str, tuple[float, float]]:
     """The same body upside down: hands on the mat, feet in the air."""
-    points = {
+    return {
         **face(x, 830.0),
         "left_shoulder": (x - 15, 700.0),
         "right_shoulder": (x + 15, 700.0),
@@ -102,7 +105,98 @@ def handstand(x: float, visibility: float = 0.9, wrist_y: float = 900.0) -> np.n
         "left_foot_index": (x - 20, 170.0),
         "right_foot_index": (x + 20, 170.0),
     }
-    return landmarks(points, visibility=visibility)
+
+
+def standing(
+    x: float, visibility: float = 0.9, wrist_y: float = 480.0, hip_y: float = 500.0
+) -> np.ndarray:
+    """A person on their feet: hands by their sides at ``wrist_y``, feet on the mat."""
+    return landmarks(standing_points(x, wrist_y=wrist_y, hip_y=hip_y), visibility=visibility)
+
+
+def handstand(x: float, visibility: float = 0.9, wrist_y: float = 900.0) -> np.ndarray:
+    """The same body upside down: hands on the mat, feet in the air."""
+    return landmarks(handstand_points(x, wrist_y=wrist_y), visibility=visibility)
+
+
+# --------------------------------------------------------------------------- #
+# The same bodies as Apple Vision reports them
+#
+# Vision has 19 joints, not 33: no fingers, no mouth, no heel and no toe, plus a
+# ``neck`` and a ``root`` MediaPipe has no name for. These builders put the
+# *same* geometry into a ``(19, 5)`` block in Vision's own joint order — the
+# shape ``handstand.vision_import`` writes and ``handstand.athlete --source
+# vision`` reads.
+# --------------------------------------------------------------------------- #
+
+
+def vision_pose(points: dict[str, tuple[float, float]], visibility: float = 0.9) -> np.ndarray:
+    """A ``(19, 5)`` block in Vision's joint order, with ``z`` and ``presence`` NaN.
+
+    Takes the same MediaPipe-shaped point dict the other builders do and keeps
+    only the joints Vision has a name for, so the two models are built from one
+    geometry: the mouth, the fingers and the foot landmarks are simply not in
+    the block. A joint left out of ``points`` comes out NaN.
+    """
+    block = np.full((len(vision_import.JOINT_NAMES), athlete.LANDMARK_FIELDS), np.nan)
+    order = {name: index for index, name in enumerate(vision_import.JOINT_NAMES)}
+    for name, (x, y) in points.items():
+        if name in order:
+            block[order[name]] = (x, y, np.nan, visibility, np.nan)
+    return block
+
+
+def vision_shared(points: dict[str, tuple[float, float]], visibility: float = 0.9) -> np.ndarray:
+    """The joints of ``points`` Vision reports, as a ``(33, 5)`` block.
+
+    The 16 MediaPipe landmarks Vision has no name for are NaN, which is exactly
+    what :func:`handstand.athlete.load_frames` pads a Vision block with, so the
+    rules can be measured on a Vision person without a Vision parquet.
+    """
+    block = np.full((len(pm.JOINT_NAMES), athlete.LANDMARK_FIELDS), np.nan)
+    for name, (x, y) in points.items():
+        if name in athlete.SHARED_JOINTS:
+            block[pm.JOINT_INDEX[name]] = (x, y, np.nan, visibility, np.nan)
+    return block
+
+
+def vision_standing(
+    x: float, visibility: float = 0.9, wrist_y: float = 480.0, hip_y: float = 500.0
+) -> np.ndarray:
+    """Vision's view of :func:`standing`."""
+    return vision_shared(standing_points(x, wrist_y=wrist_y, hip_y=hip_y), visibility)
+
+
+def vision_handstand(x: float, visibility: float = 0.9, wrist_y: float = 900.0) -> np.ndarray:
+    """Vision's view of :func:`handstand`."""
+    return vision_shared(handstand_points(x, wrist_y=wrist_y), visibility)
+
+
+def scaled_vision_bone(pose: np.ndarray, first: str, second: str, scale: float) -> np.ndarray:
+    """:func:`scaled_bone` for a Vision person: one joint pushed out along its bone."""
+    moved = np.array(pose, copy=True)
+    near, far = (pm.JOINT_INDEX[first], pm.JOINT_INDEX[second])
+    moved[far, :2] = moved[near, :2] + scale * (moved[far, :2] - moved[near, :2])
+    return moved
+
+
+def vision_scaled_leg(pose: np.ndarray, scale: float, side: str = "left") -> np.ndarray:
+    """:func:`scaled_leg` for a Vision person: hip, knee and ankle all moved."""
+    knee, ankle = pm.JOINT_INDEX[f"{side}_knee"], pm.JOINT_INDEX[f"{side}_ankle"]
+    hip_point = pose[pm.JOINT_INDEX[f"{side}_hip"], :2]
+    stretched = np.array(pose, copy=True)
+    stretched[knee, :2] = hip_point + scale * (pose[knee, :2] - hip_point)
+    stretched[ankle, :2] = stretched[knee, :2] + scale * (pose[ankle, :2] - pose[knee, :2])
+    return stretched
+
+
+def scaled_vision_block(block: np.ndarray, first: str, second: str, scale: float) -> np.ndarray:
+    """:func:`scaled_vision_bone` on a ``(19, 5)`` block, addressed by joint name."""
+    moved = np.array(block, copy=True)
+    near = vision_import.JOINT_NAMES.index(first)
+    far = vision_import.JOINT_NAMES.index(second)
+    moved[far, :2] = moved[near, :2] + scale * (moved[far, :2] - moved[near, :2])
+    return moved
 
 
 def scaled_bone(pose: np.ndarray, first: str, second: str, scale: float) -> np.ndarray:
@@ -204,6 +298,53 @@ def write_multi(
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{clip_id}.parquet"
     multi_table(frames).to_parquet(path, index=False)
+    return path
+
+
+def vision_multi_table(
+    frames: Sequence[Sequence[np.ndarray]], *, rotated: bool = False, t_ms_step: int = 40
+) -> pd.DataFrame:
+    """The same long table as :func:`multi_table`, in Vision's 19 joints.
+
+    Blocks are ``(19, 5)`` in :data:`vision_import.JOINT_NAMES` order, ``z`` and
+    ``presence`` are NaN (Vision reports neither), the confidence lands in
+    ``visibility``, and a frame with nobody in it keeps the all-NaN block with
+    ``person_idx = -1`` — exactly what ``handstand.vision_import`` writes.
+    """
+    rows: list[dict[str, object]] = []
+    for frame_idx, people in enumerate(frames):
+        t_ms = frame_idx * t_ms_step
+        blocks = list(people) or [np.full((len(vision_import.JOINT_NAMES), 5), np.nan)]
+        for person_idx, pose in enumerate(blocks):
+            detected = bool(people)
+            person_idx_written = person_idx if people else pm.NO_PERSON_IDX
+            for joint_index, joint in enumerate(vision_import.JOINT_NAMES):
+                x, y, _, confidence, _ = pose[joint_index]
+                rows.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "t_ms": t_ms,
+                        "joint": joint,
+                        "x": x,
+                        "y": y,
+                        "z": np.nan,
+                        "visibility": confidence,
+                        "presence": np.nan,
+                        "rotated": rotated,
+                        "detected": detected,
+                        pm.PERSON_COLUMN: person_idx_written,
+                    }
+                )
+    return pd.DataFrame(rows, columns=list(pm.PARQUET_COLUMNS_MULTI))
+
+
+def write_vision_multi(
+    directory: pathlib.Path, frames: Sequence[Sequence[np.ndarray]], clip_id: str = "clip00000001"
+) -> pathlib.Path:
+    """Write ``<directory>/<clip_id>.parquet`` in Vision's multi-person schema."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{clip_id}.parquet"
+    vision_multi_table(frames).to_parquet(path, index=False)
     return path
 
 
@@ -1203,6 +1344,8 @@ def test_cli_selects_clips_and_honours_the_limit_and_overwrite(
         athlete.main(["--limit", "-1", *common])
     with pytest.raises(SystemExit):
         athlete.main(["--rotate", "sideways", "--data", str(data)])
+    with pytest.raises(SystemExit):
+        athlete.main(["--source", "mediapipe_multi", "--data", str(data)])
 
 
 def test_cli_reports_a_missing_input_directory(
@@ -1212,3 +1355,584 @@ def test_cli_reports_a_missing_input_directory(
     captured = capsys.readouterr().out
     assert "no multi-person keypoints" in captured
     assert "--running-mode image" in captured
+
+
+# --------------------------------------------------------------------------- #
+# Apple Vision: the same rules on a 19-joint skeleton
+#
+# The point of `--source vision` is that the bake-off (#16) compares the two
+# models *after* the same selection, so the tests below are the rules above, run
+# on bodies with no feet, no hands and no mouth — the joints Vision has.
+# --------------------------------------------------------------------------- #
+
+
+def padded_joints() -> set[str]:
+    """The MediaPipe landmarks a Vision block cannot hold."""
+    return set(pm.JOINT_NAMES) - set(athlete.SHARED_JOINTS)
+
+
+def vision_frame_of(frame_idx: int, *people: np.ndarray) -> athlete.FramePeople:
+    """A :class:`athlete.FramePeople` of Vision people, one frame."""
+    return frame_of(frame_idx, *people)
+
+
+def vision_clip(poses: Sequence[np.ndarray], *, trainer: bool = True) -> list[athlete.FramePeople]:
+    """:data:`CLIP_FRAMES` frames of one person per pose, a trainer standing clear.
+
+    ``trainer=False`` gives a clip that has never shown a second body, which is
+    what turns the left/right half of the bone-length rule off.
+    """
+    others = (vision_standing(TRAINER_X),) if trainer else ()
+    return [frame_of(index, *others, pose) for index, pose in enumerate(poses)]
+
+
+def test_each_source_names_its_own_pair_of_directories() -> None:
+    assert athlete.SOURCES == ("mediapipe", "vision")
+    assert athlete.DEFAULT_SOURCE == "mediapipe"
+    assert athlete.SOURCE_DIRNAMES == {
+        "mediapipe": ("mediapipe_multi", "mediapipe_athlete"),
+        "vision": ("vision_multi", "vision_athlete"),
+    }
+    assert athlete.VISION_ATHLETE_OUTPUT_DIRNAME == "vision_athlete"
+    # The default is the plain MediaPipe run, unchanged.
+    assert athlete.input_dirname() == "mediapipe_multi"
+    assert athlete.output_dirname() == "mediapipe_athlete"
+    assert athlete.input_dirname("vision") == "vision_multi"
+    assert athlete.output_dirname("vision") == "vision_athlete"
+    assert athlete.joints_for_source() == pm.JOINT_NAMES
+    assert athlete.joints_for_source("vision") == vision_import.JOINT_NAMES
+    for bad in ("everything", "", "athlete"):
+        with pytest.raises(ValueError, match="unknown source"):
+            athlete.joints_for_source(bad)
+        with pytest.raises(ValueError, match="unknown source"):
+            athlete.input_dirname(bad)
+        with pytest.raises(ValueError, match="unknown source"):
+            athlete.output_dirname(bad)
+
+
+def test_every_rule_reads_only_joints_both_models_report() -> None:
+    """The contract that makes one implementation serve two models.
+
+    The joints a rule *needs* — the visibility term, and every bone the
+    bone-length rule measures — are joints Vision has, so both models are
+    measured from the same joints by the same code. The rest of a rule's joints
+    degrade: the ones Vision has no name for come out of the loader as NaN and
+    are skipped, which is what the leftovers below pin down.
+    """
+    shared = set(athlete.SHARED_JOINTS)
+    assert shared == set(vision_import.MEDIAPIPE_SHARED_JOINTS)
+    assert len(shared) == 17
+    assert shared <= set(pm.JOINT_NAMES)
+    # The 16 MediaPipe landmarks Vision has no name for: the loader pads a Vision
+    # person with exactly these, so they are never usable joints.
+    padded = padded_joints()
+    assert len(padded) == 16
+    assert {"left_heel", "right_heel", "left_foot_index", "right_foot_index"} <= padded
+    assert {"left_pinky", "right_thumb", "mouth_left", "left_eye_inner"} <= padded
+    # Vision's own two joints are dropped on the way in, so no rule can index them.
+    assert set(vision_import.VISION_ONLY_JOINTS) == {"neck", "root"}
+    assert not shared & set(vision_import.VISION_ONLY_JOINTS)
+
+    bone_joints = {joint for _, first, second in athlete.BONES for joint in (first, second)}
+    assert bone_joints <= shared  # so all ten bones are measurable for Vision
+    assert set(athlete.MAIN_JOINTS) <= shared  # and so is the visibility term
+    assert set(pm.WRIST_JOINTS) | set(pm.ANKLE_JOINTS) <= shared  # inversion, body length
+    assert len(athlete.MAIN_JOINTS) == 12 and len(athlete.BONES) == 10
+
+    feet_only = {"left_heel", "right_heel", "left_foot_index", "right_foot_index"}
+    assert set(athlete.SUPPORT_JOINTS) - shared == feet_only  # the mat is read at the ankle
+    assert set(athlete.FEET_JOINTS) - shared == feet_only  # so is the centre line's foot
+    assert set(athlete.LIMB_JOINTS) - shared == feet_only  # and so is the stitch check
+    assert set(athlete.HEAD_JOINTS) - shared == {"mouth_left", "mouth_right"}
+
+
+def test_a_vision_person_is_measured_from_the_joints_it_has() -> None:
+    """The same body and the same numbers, minus the 16 joints Vision cannot hold."""
+    full = athlete.measure_person(handstand(ATHLETE_X))
+    person = athlete.measure_person(vision_handstand(ATHLETE_X))
+
+    # Body length — the unit every distance in here is in — is the shoulder-to-
+    # ankle span either way, and both models have shoulders and ankles.
+    assert person.length == pytest.approx(full.length) == pytest.approx(500.0)
+    assert person.inverted is full.inverted
+    assert person.wrist_y == pytest.approx(full.wrist_y)
+    assert person.hip == pytest.approx(full.hip)
+    assert person.visibility == pytest.approx(full.visibility)
+
+    # Only the 17 joints it reported are usable; the other 16 rows are NaN.
+    assert len(person.visible_joints) == len(athlete.SHARED_JOINTS)
+    assert not {pm.JOINT_INDEX[name] for name in padded_joints()} & set(person.visible_joints)
+    # The box stops at the ankle rather than at a toe that is not there...
+    assert person.box == pytest.approx((325.0, 200.0, 375.0, 900.0))
+    assert full.box == pytest.approx((325.0, 170.0, 375.0, 900.0))
+    # ... and so does the mat line: Vision's lowest hand or foot is its lowest
+    # wrist or ankle, MediaPipe's is its lowest wrist or toe.
+    assert person.support_y == pytest.approx(full.support_y) == pytest.approx(900.0)
+    assert athlete.measure_person(vision_standing(TRAINER_X)).support_y == pytest.approx(890.0)
+
+    # The centre line runs from the ankles to the face: no toe below, no mouth above.
+    assert person.centre_line is not None
+    feet, head = person.centre_line
+    assert feet == pytest.approx((ATHLETE_X, 200.0))
+    assert head[1] == pytest.approx(824.4, abs=0.1)
+    standing_line = athlete.measure_person(vision_standing(TRAINER_X)).centre_line
+    assert standing_line is not None
+    assert standing_line[0][1] == pytest.approx(890.0)
+
+
+def test_every_bone_is_measurable_on_a_vision_skeleton() -> None:
+    """All ten bones of :data:`athlete.BONES`, off the joints both models have."""
+    reference = athlete.bone_lengths(athlete.measure_person(handstand(ATHLETE_X)))
+    lengths = athlete.bone_lengths(athlete.measure_person(vision_handstand(ATHLETE_X)))
+    assert set(lengths) == {name for name, _, _ in athlete.BONES}
+    assert lengths == pytest.approx(reference)
+    assert lengths["shin_l"] == pytest.approx(150.0, abs=0.1)
+    assert lengths["torso_r"] == pytest.approx(200.1, abs=0.1)
+    person = athlete.measure_person(vision_handstand(ATHLETE_X))
+    assert athlete.leg_lengths(person)["leg_l"] == pytest.approx(300.0, abs=0.2)
+    assert athlete.counterpart_outlier(person) is None
+
+
+def test_a_vision_rule_skips_a_joint_it_does_not_have() -> None:
+    """Missing feet are not a failure, and a half-seen bone is not a length."""
+    # No visible face: the head end of the centre line falls back to the shoulders.
+    face_off = vision_handstand(ATHLETE_X)
+    for name in athlete.HEAD_JOINTS:
+        face_off[pm.JOINT_INDEX[name], 3] = 0.1
+    person = athlete.measure_person(face_off)
+    assert person.centre_line is not None
+    assert person.centre_line[1] == pytest.approx((ATHLETE_X, 700.0))
+
+    # No visible ankles either: there is no line to place, so the rule that needs
+    # one is skipped rather than guessed at, and no bone is measurable at all.
+    blind = athlete.measure_person(vision_handstand(ATHLETE_X, visibility=0.0))
+    trainer = athlete.measure_person(standing(TRAINER_X))
+    assert blind.centre_line is None
+    assert athlete.mixed_skeleton(blind, trainer) is False
+    assert athlete.contact_reason(blind, [trainer]) == ""
+    assert all(math.isnan(value) for value in athlete.bone_lengths(blind).values())
+
+    # One unseen hip takes the thigh and the whole leg with it, as it does for
+    # MediaPipe, while the other leg is still measurable.
+    one_leg = vision_handstand(ATHLETE_X)
+    one_leg[pm.JOINT_INDEX["left_hip"], 3] = 0.1
+    half = athlete.measure_person(one_leg)
+    assert math.isnan(athlete.bone_lengths(half)["thigh_l"])
+    assert math.isfinite(athlete.bone_lengths(half)["shin_l"])
+    assert math.isnan(athlete.leg_lengths(half)["leg_l"])
+    assert math.isfinite(athlete.leg_lengths(half)["leg_r"])
+
+
+def test_a_vision_handstand_outscores_a_vision_trainer() -> None:
+    """Rule 2, unchanged: the same weights, the same threshold, the same winner."""
+    frame = vision_frame_of(0, vision_standing(TRAINER_X), vision_handstand(ATHLETE_X))
+    trainer, body = frame.people
+    assert trainer.inverted is False
+    assert body.inverted is True
+    # Both models put the mat where their own lowest hand or foot is, and Vision
+    # has no toe, so its line is the wrist rather than MediaPipe's toe.
+    assert frame.support_line == pytest.approx(900.0)
+    # 0.4 inverted + 0.2 support (wrists on that line) + 0.3 continuity + 0.1 seen.
+    assert athlete.person_score(body, frame.support_line, None) == pytest.approx(0.99)
+    # With no toe on the mat the line is 25 px lower than MediaPipe's, so a
+    # *standing* body is a little closer to it and scores a little above the
+    # give-up threshold on its own. The inversion term is what still decides.
+    trainer_score = athlete.person_score(trainer, frame.support_line, None)
+    assert 0.35 < trainer_score < 0.5
+    assert athlete.person_score(body, frame.support_line, None) - trainer_score > (
+        athlete.AMBIGUITY_MARGIN
+    )
+
+    chosen, score = athlete.choose_person(frame.people, frame.support_line, None)
+    assert chosen is not None
+    assert chosen.landmarks[pm.JOINT_INDEX["nose"], 0] == pytest.approx(ATHLETE_X)
+    assert score == pytest.approx(0.99)
+    assert frame.n_people == 2
+
+
+def test_a_vision_kick_up_is_covered_by_the_backward_sweep() -> None:
+    frames = [
+        vision_frame_of(index, vision_standing(TRAINER_X), vision_standing(ATHLETE_X))
+        for index in range(3)
+    ]
+    frames += [
+        vision_frame_of(index, vision_standing(TRAINER_X), vision_handstand(ATHLETE_X))
+        for index in range(3, 6)
+    ]
+    forward = athlete.sweep(frames, range(len(frames)))
+    backward = athlete.sweep(frames, reversed(range(len(frames))))
+    # Nobody looks like a handstand yet, so only the backward sweep can tell them.
+    assert [choice.chosen for choice in forward] == [False, False, False, True, True, True]
+    assert [choice.chosen for choice in backward] == [True] * FRAME_COUNT
+
+    chosen = athlete.select_athlete(frames)
+    assert [choice.chosen for choice in chosen] == [True] * FRAME_COUNT
+    assert [chosen_x(choice) for choice in chosen] == [pytest.approx(ATHLETE_X)] * FRAME_COUNT
+    assert all(choice.n_people == 2 for choice in chosen)
+
+
+def test_two_vision_detections_of_one_body_are_still_one_person() -> None:
+    people = [
+        athlete.measure_person(vision_handstand(ATHLETE_X, visibility=0.90)),
+        athlete.measure_person(vision_standing(TRAINER_X)),
+        athlete.measure_person(vision_handstand(ATHLETE_X + 4.0, visibility=0.95)),
+    ]
+    kept = athlete.deduplicate(people)
+    assert len(kept) == 2
+    assert kept[0].landmarks[0, 0] == pytest.approx(ATHLETE_X + 4.0)
+    assert kept[1].landmarks[0, 0] == pytest.approx(TRAINER_X)
+    # Two bodies nowhere near each other are still two bodies.
+    assert not athlete.same_body(
+        athlete.measure_person(vision_standing(TRAINER_X)),
+        athlete.measure_person(vision_handstand(ATHLETE_X)),
+    )
+
+
+def test_vision_contact_rule_a_is_a_box_over_the_athlete() -> None:
+    """Same outline 20 px to the side: the boxes overlap, so the frame is flagged."""
+    frame = vision_frame_of(0, vision_standing(ATHLETE_X + 20.0), vision_handstand(ATHLETE_X))
+    assert athlete.box_iou(frame.people[0].box, frame.people[1].box) > athlete.CONTACT_MIN_IOU
+    assert athlete.trainer_contact(frame.people[1], [frame.people[0]]) is True
+    assert athlete.contact_reason(frame.people[1], [frame.people[0]]) == "box_iou"
+    # A trainer standing well clear is not contact, box or not.
+    apart = vision_frame_of(0, vision_standing(TRAINER_X), vision_handstand(ATHLETE_X))
+    assert athlete.contact_reason(apart.people[1], [apart.people[0]]) == ""
+    assert athlete.trainer_contact(apart.people[1], [apart.people[0]]) is False
+
+
+def test_vision_contact_rule_b_is_a_stitched_leg() -> None:
+    """The athlete's shoulders and the trainer's leg, in one 19-joint skeleton."""
+    stitched = vision_handstand(ATHLETE_X)
+    for name in ("left_ankle", "right_ankle"):
+        stitched[pm.JOINT_INDEX[name], :2] = (488.0, 700.0)
+    trainer = athlete.measure_person(vision_standing(500.0, hip_y=650.0))
+    body = athlete.measure_person(stitched)
+    # The boxes are nowhere near each other, so this is the mixed-skeleton rule.
+    assert athlete.box_iou(body.box, trainer.box) < athlete.CONTACT_MIN_IOU
+    ankle = body.landmarks[pm.JOINT_INDEX["left_ankle"], :2]
+    assert athlete.nearest_joint_distance(ankle, trainer) == pytest.approx(0.0)
+    assert athlete.mixed_skeleton(body, trainer) is True
+    assert athlete.contact_reason(body, [trainer]) == "mixed_skeleton"
+    # Without the stitch the same two people are a handstand next to a trainer.
+    clean = athlete.measure_person(vision_handstand(ATHLETE_X))
+    assert athlete.mixed_skeleton(clean, trainer) is False
+    assert athlete.contact_reason(clean, [trainer]) == ""
+
+
+def test_vision_contact_rule_c_is_the_athletes_own_bones() -> None:
+    """Nobody else in the frame at all: a shin 50 % longer than the clip's own."""
+    good = vision_handstand(ATHLETE_X)
+    long_shin = scaled_vision_bone(good, "left_knee", "left_ankle", 1.5)
+    poses = [good] * CLIP_FRAMES
+    poses[ODD_FRAME] = long_shin
+    expected = [""] * CLIP_FRAMES
+    expected[ODD_FRAME] = "bone_length"
+
+    chosen = athlete.select_athlete(vision_clip(poses))
+    assert [choice.reason for choice in chosen] == expected
+    assert chosen[ODD_FRAME].contact is True
+    # The frame keeps the athlete: the flag takes it out of scoring, not the clip.
+    assert all(choice.chosen for choice in chosen)
+    assert chosen_x(chosen[ODD_FRAME]) == pytest.approx(ATHLETE_X)
+    full_lengths = athlete.clip_bone_lengths(chosen)
+    assert full_lengths["shin_l"] == pytest.approx(150.0, abs=0.1)
+    assert athlete.bone_length_outlier(chosen[ODD_FRAME].person, full_lengths) == "shin_l"
+    assert athlete.bone_length_outlier(chosen[0].person, full_lengths) is None
+
+    # A whole leg the wrong length is caught the same way it is for MediaPipe.
+    long_leg = vision_scaled_leg(good, 1.5)
+    person = athlete.measure_person(long_leg)
+    assert athlete.bone_lengths(person)["thigh_l"] == pytest.approx(225.0, abs=0.3)
+    assert athlete.leg_lengths(person)["leg_l"] == pytest.approx(450.0, abs=0.4)
+    assert athlete.leg_lengths(person)["leg_r"] == pytest.approx(300.0, abs=0.2)
+    poses[ODD_FRAME] = long_leg
+    assert [choice.reason for choice in athlete.select_athlete(vision_clip(poses))] == expected
+
+
+def test_a_vision_foreshortened_leg_is_the_athletes_own() -> None:
+    """The same one-sided rule: a leg pointing at the camera is not a stitch."""
+    good = vision_handstand(ATHLETE_X)
+    split = vision_scaled_leg(good, 0.6)
+    assert athlete.leg_lengths(athlete.measure_person(split))["leg_l"] == pytest.approx(
+        180.0, abs=0.3
+    )
+    poses = [good] * CLIP_FRAMES
+    poses[ODD_FRAME] = split
+    # A solo clip, so the left/right half is off and only the per-clip half could
+    # fire — and it is one-sided, so a short bone never does.
+    alone = athlete.select_athlete(vision_clip(poses, trainer=False))
+    assert [choice.reason for choice in alone] == [""] * CLIP_FRAMES
+    person = athlete.measure_person(split)
+    short = {"thigh_l": 90.0, "shin_l": 90.0}
+    assert athlete.bone_length_outlier(person, short) is None
+    assert athlete.bone_length_mismatch(person, short, compare_sides=False) is None
+
+
+def test_load_frames_reads_a_vision_parquet(tmp_path: pathlib.Path) -> None:
+    path = write_vision_multi(
+        tmp_path,
+        [
+            [vision_pose(standing_points(TRAINER_X)), vision_pose(handstand_points(ATHLETE_X))],
+            [],
+            [vision_pose(standing_points(TRAINER_X, wrist_y=100.0))],
+        ],
+    )
+    frames = athlete.load_frames(path, athlete.SOURCE_VISION)
+
+    assert [frame.frame_idx for frame in frames] == [0, 1, 2]
+    assert [frame.n_people for frame in frames] == [2, 0, 1]
+    assert frames[0].t_ms == 0 and frames[2].t_ms == 80
+    assert frames[0].rotated is False
+    # 19 rows of one person come back as the 33-row block the rules are written
+    # against, with the 16 landmarks Vision cannot hold left NaN.
+    person = frames[0].people[1]
+    assert person.landmarks.shape == (len(pm.JOINT_NAMES), athlete.LANDMARK_FIELDS)
+    assert person.landmarks[pm.JOINT_INDEX["left_wrist"], 0] == pytest.approx(ATHLETE_X - 25.0)
+    assert person.landmarks[pm.JOINT_INDEX["left_ankle"], 1] == pytest.approx(200.0)
+    for name in padded_joints():
+        assert math.isnan(person.landmarks[pm.JOINT_INDEX[name], 0])
+    # Vision's two own joints are not MediaPipe rows, so they never arrive.
+    assert {"neck", "root"} <= set(vision_import.JOINT_NAMES)
+    assert len(person.landmarks) == len(pm.JOINT_NAMES)
+    # ``z`` and ``presence`` never survive the crossing; the confidence is the score.
+    assert np.isnan(person.landmarks[:, 2]).all()
+    assert np.isnan(person.landmarks[:, 4]).all()
+    assert person.visibility == pytest.approx(0.9)
+    # A frame with nobody in it is the placeholder block, not a person.
+    assert frames[1].people == ()
+    assert math.isnan(frames[1].support_line)
+
+
+def test_load_frames_rejects_a_parquet_it_cannot_trust(tmp_path: pathlib.Path) -> None:
+    path = write_vision_multi(tmp_path, [[vision_pose(handstand_points(ATHLETE_X))]])
+
+    # Read as the other model: those joints are not part of that schema at all.
+    with pytest.raises(ValueError, match="not part of the mediapipe keypoint schema"):
+        athlete.load_frames(path, athlete.SOURCE_MEDIAPIPE)
+    mediapipe_path = write_multi(tmp_path / "mp", [[handstand(ATHLETE_X)]])
+    with pytest.raises(ValueError, match="not part of the vision keypoint schema"):
+        athlete.load_frames(mediapipe_path, athlete.SOURCE_VISION)
+
+    # A block of 18 rows is not a whole number of 19-joint blocks.
+    truncated = tmp_path / "truncated.parquet"
+    vision_multi_table([[vision_pose(handstand_points(ATHLETE_X))]]).iloc[:-1].to_parquet(
+        truncated, index=False
+    )
+    with pytest.raises(ValueError, match="whole number of 19-landmark blocks"):
+        athlete.load_frames(truncated, athlete.SOURCE_VISION)
+
+    # A joint of the other model inside an otherwise complete block is caught by
+    # the schema check rather than by the block check...
+    swapped = tmp_path / "swapped.parquet"
+    table = vision_multi_table([[vision_pose(handstand_points(ATHLETE_X))]])
+    table.loc[0, "joint"] = "left_thumb"
+    table.to_parquet(swapped, index=False)
+    with pytest.raises(ValueError, match=r"joint\(s\) \['left_thumb'\]"):
+        athlete.load_frames(swapped, athlete.SOURCE_VISION)
+
+    # ... and a block that is 19 rows but not the 19 joints, once each, is caught
+    # by the block check.
+    duplicated = tmp_path / "duplicated.parquet"
+    table = vision_multi_table([[vision_pose(handstand_points(ATHLETE_X))]])
+    table.loc[1, "joint"] = "nose"
+    table.to_parquet(duplicated, index=False)
+    with pytest.raises(ValueError, match="the 19 landmarks once per person"):
+        athlete.load_frames(duplicated, athlete.SOURCE_VISION)
+
+
+def test_run_clip_writes_the_vision_athlete_schema(tmp_path: pathlib.Path) -> None:
+    in_root = tmp_path / "keypoints" / "vision_multi"
+    out_root = tmp_path / "keypoints" / "vision_athlete"
+    good = vision_pose(handstand_points(ATHLETE_X))
+    # Enough plain frames that the one frame with a long shin is past the clip's
+    # 90th percentile rather than on it, so the bone-length rule can see it.
+    write_vision_multi(
+        in_root / "auto",
+        [
+            [vision_pose(standing_points(TRAINER_X)), good],
+            [vision_pose(standing_points(ATHLETE_X + 20.0)), good],  # trainer on top
+            [
+                vision_pose(standing_points(TRAINER_X)),
+                scaled_vision_block(good, "left_knee", "left_ankle", 1.5),
+            ],
+            *[[vision_pose(standing_points(TRAINER_X)), good]] * CLIP_FRAMES,
+            [],
+        ],
+        clip_id="clip00000001",
+    )
+
+    report = athlete.run_clip(
+        "clip00000001",
+        rotate_mode="auto",
+        in_root=in_root,
+        out_root=out_root,
+        source=athlete.SOURCE_VISION,
+    )
+
+    assert report.parquet_path == out_root / "auto" / "clip00000001.parquet"
+    assert report.json_path.is_file()
+    # Three frames of scene, CLIP_FRAMES plain ones, and a frame with nobody in it.
+    assert report.frame_count == CLIP_FRAMES + 4
+    assert report.athlete_frames == CLIP_FRAMES + 3
+    assert report.dropped_frames == 1
+    assert report.contact_frames == 2
+    assert report.contact_by_reason == {"box_iou": 1, "mixed_skeleton": 0, "bone_length": 1}
+    assert report.reason_summary == "box_iou:1 bone_length:1"
+
+    sidecar = json.loads(report.json_path.read_text())
+    assert sidecar["clip_id"] == "clip00000001"
+    assert sidecar["rotate"] == "auto"
+    assert sidecar["source_parquet"] == "vision_multi/auto/clip00000001.parquet"
+    assert sidecar["frame_count"] == CLIP_FRAMES + 4
+    assert sidecar["contact_frames_by_reason"] == report.contact_by_reason
+
+    written = pd.read_parquet(report.parquet_path)
+    assert list(written.columns) == list(athlete.ATHLETE_COLUMNS)
+    # The same 33 rows per frame as a MediaPipe athlete file, joint for joint.
+    assert len(written) == (CLIP_FRAMES + 4) * len(pm.JOINT_NAMES)
+    by_frame = written.groupby("frame_idx").first()
+    assert by_frame["contact_reason"].tolist()[1:3] == ["box_iou", "bone_length"]
+    assert by_frame["trainer_contact"].tolist()[1:3] == [True, True]
+    assert by_frame["detected"].tolist()[-1] is False
+    assert by_frame["n_people"].tolist()[-1] == 0
+    # A Vision athlete's landmarks, in MediaPipe's row order, with the 16
+    # landmarks Vision has no name for still NaN and its own two joints absent.
+    first = written[(written["frame_idx"] == 0) & written["detected"]].set_index("joint")
+    assert first.loc["left_wrist", "x"] == pytest.approx(ATHLETE_X - 25.0)
+    assert math.isnan(first.loc["left_foot_index", "x"])
+    assert math.isnan(first.loc["left_pinky", "x"])
+    assert first["z"].isna().all() and first["presence"].isna().all()
+
+
+def test_the_two_athlete_files_of_one_clip_join_row_for_row(tmp_path: pathlib.Path) -> None:
+    """What the bake-off (#16) needs: same columns, same rows, same joint order."""
+    data = tmp_path / "keypoints"
+    write_multi(
+        data / "mediapipe_multi" / "auto",
+        [[standing(TRAINER_X), handstand(ATHLETE_X)], []],
+    )
+    write_vision_multi(
+        data / "vision_multi" / "auto",
+        [
+            [vision_pose(standing_points(TRAINER_X)), vision_pose(handstand_points(ATHLETE_X))],
+            [],
+        ],
+    )
+    common = ["--rotate", "auto", "--data", str(tmp_path), "--clips", "clip00000001"]
+    assert athlete.main(common) == 0
+    assert athlete.main([*common, "--source", "vision"]) == 0
+
+    tables = []
+    for source in ("mediapipe_athlete", "vision_athlete"):
+        table = pd.read_parquet(data / source / "auto" / "clip00000001.parquet")
+        assert list(table.columns) == list(athlete.ATHLETE_COLUMNS)
+        assert sorted(set(table["frame_idx"])) == [0, 1]
+        for frame_idx in (0, 1):
+            block = table[table["frame_idx"] == frame_idx]
+            assert block["joint"].tolist() == list(pm.JOINT_NAMES)
+        tables.append(table)
+    mediapipe, vision = tables
+
+    keys = ["frame_idx", "joint"]
+    common_joints = set(pm.JOINT_NAMES) - padded_joints()
+    left = mediapipe[mediapipe["joint"].isin(common_joints)].set_index(keys)
+    right = vision[vision["joint"].isin(common_joints)].set_index(keys)
+    assert list(left.index) == list(right.index)
+    both = left.join(right, lsuffix="_mp", rsuffix="_vi")
+    # The same synthetic body, so the two models' selections agree about it:
+    # one row per shared joint per frame, the first frame's athlete and the
+    # second frame's nobody.
+    shared_rows = len(common_joints) * 2
+    assert len(both) == shared_rows
+    assert both["detected_mp"].tolist() == both["detected_vi"].tolist()
+    found = [True] * len(common_joints) + [False] * len(common_joints)
+    assert both["detected_mp"].tolist() == found
+    assert not any(both["trainer_contact_mp"]) and not any(both["trainer_contact_vi"])
+    np.testing.assert_allclose(both["x_mp"], both["x_vi"], equal_nan=True)
+    np.testing.assert_allclose(both["y_mp"], both["y_vi"], equal_nan=True)
+
+
+def test_the_cli_writes_vision_athlete_and_names_the_source(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for clip_id in ("clip00000001", "clip00000002"):
+        write_vision_multi(
+            tmp_path / "keypoints" / "vision_multi" / "auto",
+            [
+                [vision_pose(standing_points(TRAINER_X)), vision_pose(handstand_points(ATHLETE_X))],
+                [],
+            ],
+            clip_id=clip_id,
+        )
+
+    assert athlete.main(["--source", "vision", "--rotate", "auto", "--data", str(tmp_path)]) == 0
+
+    printed = capsys.readouterr().out
+    assert "source=vision rotate=auto clips=2" in printed
+    assert "athlete=50.0%" in printed
+    assert "people[0:1 2:1]" in printed
+    written = tmp_path / "keypoints" / "vision_athlete" / "auto"
+    assert sorted(path.name for path in written.glob("*.parquet")) == [
+        "clip00000001.parquet",
+        "clip00000002.parquet",
+    ]
+    assert (written / "clip00000001.json").is_file()
+    # The MediaPipe directories are untouched, so the two runs cannot collide.
+    assert not (tmp_path / "keypoints" / "mediapipe_athlete").exists()
+
+
+def test_the_cli_default_source_is_media_pipe_and_unchanged(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = cli_workspace(tmp_path, ("clip00000001",))
+
+    assert athlete.main(["--rotate", "auto", "--data", str(data)]) == 0
+
+    assert "source=mediapipe rotate=auto clips=1" in capsys.readouterr().out
+    assert (data / "keypoints" / "mediapipe_athlete" / "auto" / "clip00000001.parquet").is_file()
+    assert not (data / "keypoints" / "vision_athlete").exists()
+    # The sidecar names the multi-person parquet it read, which is how the output
+    # says which model it came from. Its keys are exactly the ones it always had.
+    sidecar = json.loads(
+        (data / "keypoints" / "mediapipe_athlete" / "auto" / "clip00000001.json").read_text()
+    )
+    assert sidecar["source_parquet"] == "mediapipe_multi/auto/clip00000001.parquet"
+    assert set(sidecar) == {
+        "clip_id",
+        "rotate",
+        "source_parquet",
+        "frame_count",
+        "athlete_frame_count",
+        "contact_frame_count",
+        "dropped_frame_count",
+        "frames_by_people",
+        "contact_frames_by_reason",
+        "mean_athlete_score",
+        "runtime_seconds",
+    }
+
+
+def test_the_vision_missing_input_names_the_import(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(FileNotFoundError, match="handstand.vision_import"):
+        athlete.run_clip(
+            "clip00000001",
+            rotate_mode="auto",
+            in_root=tmp_path / "in",
+            out_root=tmp_path / "out",
+            source=athlete.SOURCE_VISION,
+        )
+    with pytest.raises(ValueError, match="unknown source"):
+        athlete.run_clip(
+            "clip00000001",
+            rotate_mode="auto",
+            in_root=tmp_path / "in",
+            out_root=tmp_path / "out",
+            source="vision_multi",
+        )
+
+    assert athlete.main(["--source", "vision", "--data", str(tmp_path / "empty")]) == 2
+    captured = capsys.readouterr().out
+    assert "no multi-person keypoints" in captured
+    assert "uv run python -m handstand.vision_import --rotate auto" in captured

@@ -1,4 +1,4 @@
-"""Pick the athlete out of the people MediaPipe reports, and flag trainer contact.
+"""Pick the athlete out of the people a pose model reports, and flag trainer contact.
 
 A multi-person run of the pose runner
 (:mod:`handstand.pose_mediapipe --num-poses 3 --running-mode image
@@ -106,11 +106,58 @@ or ankles are missing), so a long and a short body are judged on the same terms.
 Joints count as visible at MediaPipe visibility
 :data:`CONTACT_MIN_VISIBILITY` and above.
 
+**Which model** — ``--source {mediapipe,vision}`` (default ``mediapipe``) picks
+the pair of directories to work on and nothing else: the same rules, the same
+constants, the same four extra columns. ``vision`` reads the multi-person
+parquet :mod:`handstand.vision_import` writes::
+
+    <data_dir>/keypoints/vision_multi/<rotate>/<clip_id>.parquet
+
+and writes the same single-person schema one directory over::
+
+    <data_dir>/keypoints/vision_athlete/<rotate>/<clip_id>.parquet
+    <data_dir>/keypoints/vision_athlete/<rotate>/<clip_id>.json
+
+so the bake-off (chainlink #16) compares the two models *after* the same
+selection rather than one of them before it.
+
+Vision's body-pose model reports 19 joints, not MediaPipe's 33, so a Vision
+person's block is padded back to the 33-row layout on the way in, with NaN for
+the 16 MediaPipe joints it has no name for — the same NaN a frame the model
+missed carries, which every rule here already drops (see :func:`visible_mask`).
+Two Vision-only joints, ``neck`` and ``root``, are left out for the reason
+:mod:`handstand.vision_import` gives: a stage that indexes joints by MediaPipe's
+names has no row for them. That leaves every rule either reading joints both
+models have, or skipping joints that are not there:
+
+* :data:`MAIN_JOINTS` (the visibility term) and every bone in :data:`BONES` are
+  shoulders, elbows, wrists, hips, knees and ankles and nothing else, so both
+  models are measured by the same code from the same joints;
+* :data:`SUPPORT_JOINTS` and :data:`FEET_JOINTS` lose the heels and toes, so
+  Vision's mat line and centre-line foot are the ankle — Vision stops at the
+  ankle by construction, see ``docs/keypoint_schema.md``;
+* :data:`LIMB_JOINTS` loses them too, so the mixed-skeleton check asks about the
+  eight joints a Vision skeleton really has;
+* :data:`HEAD_JOINTS` loses the two mouth landmarks, so Vision's head end of the
+  centre line is the mean of the face joints it did report, and falls back to
+  the shoulders when it reported none of them.
+
+One thing does not carry over, and it is a number rather than a rule: a Vision
+parquet's ``visibility`` column is the model's per-joint **confidence**
+(:mod:`handstand.vision_import`), which runs lower than MediaPipe's visibility,
+and :data:`CONTACT_MIN_VISIBILITY` is still MediaPipe's 0.5. So a Vision bone is
+only measurable when both of its ends clear 0.5 and is skipped otherwise, which
+leaves the bone-length rule able to see less of a Vision clip than of a
+MediaPipe one. The *selection* does not read that threshold — only the mean of
+the 12 main scores does, as a score and not as a filter — so the rules below
+decide the same way for both models whatever it is.
+
 CLI::
 
     cd pipeline
     uv run python -m handstand.athlete --rotate auto
     uv run python -m handstand.athlete --rotate auto --clips 6508f9b355bd
+    uv run python -m handstand.athlete --source vision --rotate auto
 """
 
 from __future__ import annotations
@@ -126,6 +173,7 @@ from collections.abc import Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from handstand import vision_import
 from handstand.paths import data_dir
 from handstand.pose_mediapipe import (
     JOINT_INDEX,
@@ -155,6 +203,7 @@ __all__ = [
     "DEDUP_JOINT_TOLERANCE",
     "DEDUP_MIN_SHARED_JOINTS",
     "DEFAULT_ROTATE",
+    "DEFAULT_SOURCE",
     "FEET_JOINTS",
     "FEET_JOINT_IDX",
     "HEAD_JOINTS",
@@ -176,9 +225,16 @@ __all__ = [
     "REASON_MIXED_SKELETON",
     "REASON_NONE",
     "SCORE_COLUMN",
+    "SHARED_JOINTS",
     "SHOULDER_IDX",
+    "SOURCES",
+    "SOURCE_DIRNAMES",
+    "SOURCE_JOINT_NAMES",
+    "SOURCE_MEDIAPIPE",
+    "SOURCE_VISION",
     "SUPPORT_JOINTS",
     "SUPPORT_JOINT_IDX",
+    "VISION_ATHLETE_OUTPUT_DIRNAME",
     "WEIGHT_CONTINUITY",
     "WEIGHT_INVERSION",
     "WEIGHT_SUPPORT",
@@ -206,6 +262,7 @@ __all__ = [
     "deduplicate",
     "input_dirname",
     "is_inverted",
+    "joints_for_source",
     "leg_lengths",
     "load_frames",
     "main",
@@ -242,6 +299,40 @@ MULTI_OUTPUT_DIRNAME = "mediapipe_multi"
 #: single-person schema is what later stages read from ``mediapipe/`` and those
 #: files must stay exactly as the plain runner wrote them.
 ATHLETE_OUTPUT_DIRNAME = "mediapipe_athlete"
+#: The same output root for the Apple Vision source: the bake-off's ``vision/``
+#: holds the lowest-wrist person (:mod:`handstand.vision_import`) and this is
+#: that file's athlete selection, so the two models are compared *after* the
+#: same rules rather than one of them before them.
+VISION_ATHLETE_OUTPUT_DIRNAME = "vision_athlete"
+
+#: ``--source`` values, in the order the flag lists them.
+SOURCE_MEDIAPIPE = "mediapipe"
+SOURCE_VISION = "vision"
+SOURCES: tuple[str, ...] = (SOURCE_MEDIAPIPE, SOURCE_VISION)
+#: The plain MediaPipe multi-person run, unchanged from before the flag existed.
+DEFAULT_SOURCE = SOURCE_MEDIAPIPE
+#: ``--source`` -> ``(input root, output root)`` under ``<data_dir>/keypoints/``.
+SOURCE_DIRNAMES: dict[str, tuple[str, str]] = {
+    SOURCE_MEDIAPIPE: (MULTI_OUTPUT_DIRNAME, ATHLETE_OUTPUT_DIRNAME),
+    SOURCE_VISION: (vision_import.MULTI_OUTPUT_DIRNAME, VISION_ATHLETE_OUTPUT_DIRNAME),
+}
+#: ``--source`` -> the joints that source's parquet carries, in its own row order:
+#: the 33 MediaPipe landmarks for ``mediapipe``, Vision's 19 for ``vision`` (two
+#: of which no MediaPipe row has a name for).
+SOURCE_JOINT_NAMES: dict[str, tuple[str, ...]] = {
+    SOURCE_MEDIAPIPE: JOINT_NAMES,
+    SOURCE_VISION: vision_import.JOINT_NAMES,
+}
+#: The joints **both** models report: the 19 Vision names minus ``neck`` and
+#: ``root``, i.e. the face plus shoulders, elbows, wrists, hips, knees and ankles.
+#: Every rule below either reads joints from this set, or reads a set that
+#: degrades to it — the 16 MediaPipe joints Vision has no name for come out of
+#: the loader as NaN, and :func:`visible_mask`, :func:`max_y` and
+#: :func:`visible_midpoint` skip a joint that is not there, so a rule that needed
+#: one reports "cannot tell" rather than guessing. :data:`BONES` and
+#: :data:`MAIN_JOINTS` are inside this set outright, which is what keeps the
+#: bone-length and visibility terms comparable between the two models.
+SHARED_JOINTS: tuple[str, ...] = vision_import.MEDIAPIPE_SHARED_JOINTS
 
 #: Frame-level columns this module adds to the single-person schema.
 SCORE_COLUMN = "athlete_score"
@@ -326,7 +417,10 @@ ASYMMETRY_MIN_PEOPLE = 2
 #: The bones whose length is measured, as ``(bone, first joint, second joint)``:
 #: upper arm, forearm, thigh, shin and the side of the torso, left and right.
 #: These are the bones a trainer's arm or leg gets stitched onto — the trunk is
-#: not, because a body only has one.
+#: not, because a body only has one. Every joint named here is in
+#: :data:`SHARED_JOINTS`, so all ten are measurable for MediaPipe and for Vision
+#: alike, which is what lets the bake-off compare the two models' bone-length
+#: verdicts frame by frame.
 BONES: tuple[tuple[str, str, str], ...] = (
     ("upper_arm_l", "left_shoulder", "left_elbow"),
     ("upper_arm_r", "right_shoulder", "right_elbow"),
@@ -366,7 +460,9 @@ LEG_COUNTERPARTS: dict[str, str] = {"leg_l": "leg_r", "leg_r": "leg_l"}
 MIN_BODY_LENGTH_PIXELS = 1.0
 
 #: The 12 main joints: shoulders, elbows, wrists, hips, knees, ankles. Used for
-#: the visibility term, so no face or finger score can carry a bad body.
+#: the visibility term, so no face or finger score can carry a bad body. Every
+#: one of them is in :data:`SHARED_JOINTS`, so the term is the same measurement
+#: for MediaPipe and for Vision.
 MAIN_JOINTS: tuple[str, ...] = (
     "left_shoulder",
     "right_shoulder",
@@ -382,7 +478,9 @@ MAIN_JOINTS: tuple[str, ...] = (
     "right_ankle",
 )
 #: Joints that may be swapped for another body's when two people overlap: the
-#: ends of the limbs, i.e. everything a bone hangs off except the trunk.
+#: ends of the limbs, i.e. everything a bone hangs off except the trunk. The
+#: four heel and toe entries are MediaPipe-only; a Vision skeleton has the eight
+#: above them and the rule asks about those.
 LIMB_JOINTS: tuple[str, ...] = (
     "left_elbow",
     "right_elbow",
@@ -398,7 +496,8 @@ LIMB_JOINTS: tuple[str, ...] = (
     "right_foot_index",
 )
 #: Wrists and feet, whichever is lowest: where a handstand's hands and a
-#: standing person's feet meet the floor.
+#: standing person's feet meet the floor. Vision reports no heel or toe, so its
+#: mat line is the lowest wrist or ankle — the ankle *is* the end of its leg.
 SUPPORT_JOINTS: tuple[str, ...] = (
     "left_wrist",
     "right_wrist",
@@ -411,7 +510,8 @@ SUPPORT_JOINTS: tuple[str, ...] = (
 )
 #: The ends of a person's centre line: the feet below, the head above. A
 #: handstand's feet are up in the air, which does not matter — the line is the
-#: body's own axis either way.
+#: body's own axis either way. As with :data:`SUPPORT_JOINTS`, a Vision body's
+#: lower end is its ankles.
 FEET_JOINTS: tuple[str, ...] = (
     "left_ankle",
     "right_ankle",
@@ -420,6 +520,9 @@ FEET_JOINTS: tuple[str, ...] = (
     "left_foot_index",
     "right_foot_index",
 )
+#: The face landmarks, which is the head end of the centre line. Vision reports
+#: the nose and both eyes and ears but no mouth, so its head end is the mean of
+#: the five it has — and the shoulders when it has none of them.
 HEAD_JOINTS: tuple[str, ...] = (
     "nose",
     "left_eye",
@@ -1226,21 +1329,73 @@ def select_athlete(frames: Sequence[FramePeople]) -> list[FrameChoice]:
 
 
 # --------------------------------------------------------------------------- #
+# Which model's keypoints
+# --------------------------------------------------------------------------- #
+
+
+def joints_for_source(source: str = DEFAULT_SOURCE) -> tuple[str, ...]:
+    """The joints a ``--source`` value's parquet carries, in that source's row order.
+
+    Raises :class:`ValueError` for a source that does not exist, rather than
+    reading a directory the flag never named.
+    """
+    try:
+        return SOURCE_JOINT_NAMES[source]
+    except KeyError:
+        raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}") from None
+
+
+def _expansion_order(source: str) -> np.ndarray:
+    """Where each of MediaPipe's 33 rows sits in ``source``'s own joint order.
+
+    ``-1`` where that source has no joint of that name — which is every one of
+    the 16 finger, mouth and foot landmarks for Vision. A source whose order *is*
+    MediaPipe's maps onto itself and costs nothing to skip.
+    """
+    order = {name: index for index, name in enumerate(joints_for_source(source))}
+    return np.array([order.get(name, -1) for name in JOINT_NAMES], dtype=np.int64)
+
+
+def _expand_to_media_pipe(poses: np.ndarray, expansion: np.ndarray) -> np.ndarray:
+    """``(P, J, 5)`` in a source's own joint order -> ``(P, 33, 5)`` in MediaPipe's.
+
+    The joints the source has no name for are left NaN, which is exactly how the
+    schema spells "the model did not report this joint" — so every rule that
+    reads them skips them (see :func:`visible_mask`) and the file written further
+    down is the same 33-row block per frame as MediaPipe's, joint for joint.
+    """
+    full = np.full((poses.shape[0], len(JOINT_NAMES), LANDMARK_FIELDS), np.nan)
+    known = expansion >= 0
+    full[:, known, :] = poses[:, expansion[known], :]
+    return full
+
+
+# --------------------------------------------------------------------------- #
 # Reading the multi-person parquet
 # --------------------------------------------------------------------------- #
 
 
-def load_frames(parquet_path: str | pathlib.Path) -> list[FramePeople]:
+def load_frames(
+    parquet_path: str | pathlib.Path, source: str = DEFAULT_SOURCE
+) -> list[FramePeople]:
     """Read one multi-person parquet into measured :class:`FramePeople`, in order.
 
     The runner writes rows ordered by ``frame_idx``, then ``person_idx``, then
     landmark, but the loader does not trust that: it groups by ``frame_idx`` and
     sorts every block into model order itself, raising if a block is not a
-    complete set of the 33 landmarks. A frame with nobody in it is the runner's
-    ``person_idx = -1`` placeholder block; that is not a person, so the frame
-    simply has no people.
+    complete set of the source's own joints. A frame with nobody in it is the
+    runner's ``person_idx = -1`` placeholder block; that is not a person, so the
+    frame simply has no people.
+
+    ``source`` is the ``--source`` value the file was written by, and it decides
+    two things: which joint names are expected, and how many rows make a block
+    (33 for MediaPipe, 19 for Vision). Every block comes back as the 33-row
+    layout the rules are written against — Vision's is padded with NaN rows for
+    the landmarks it has no name for — so nothing downstream has to know which
+    model the clip came from.
     """
     path = pathlib.Path(parquet_path)
+    joint_names = joints_for_source(source)
     table = pd.read_parquet(path)
     required = (*PARQUET_COLUMNS, PERSON_COLUMN)
     missing = [column for column in required if column not in table.columns]
@@ -1252,32 +1407,43 @@ def load_frames(parquet_path: str | pathlib.Path) -> list[FramePeople]:
 
     person_indices = table[PERSON_COLUMN].to_numpy(dtype=np.int64)
     values = table[["x", "y", "z", "visibility", "presence"]].to_numpy(dtype=np.float64)
-    joints = np.array([JOINT_INDEX.get(str(name), -1) for name in table["joint"]])
-    model_order = np.arange(len(JOINT_NAMES))
+    row_of = {name: index for index, name in enumerate(joint_names)}
+    unknown = sorted({str(name) for name in table["joint"] if str(name) not in row_of})
+    if unknown:
+        # Reading a directory with the other --source, almost always.
+        raise ValueError(
+            f"{path}: joint(s) {unknown} are not part of the {source} keypoint schema; "
+            "check --source, see docs/keypoint_schema.md"
+        )
+    joints = np.array([row_of[str(name)] for name in table["joint"]])
+    model_order = np.arange(len(joint_names))
+    expansion = None if len(joint_names) == len(JOINT_NAMES) else _expansion_order(source)
 
     frames: list[FramePeople] = []
     grouped = table.groupby("frame_idx", sort=True).indices
     for frame_idx in sorted(grouped):
         rows = np.asarray(grouped[frame_idx], dtype=np.int64)
         people_rows = rows[person_indices[rows] >= 0]
-        # person-major, then model order, so one reshape() gives (P, 33, 5).
+        # person-major, then model order, so one reshape() gives (P, J, 5).
         order = np.lexsort((joints[people_rows], person_indices[people_rows]))
         block = values[people_rows][order]
         if block.size == 0:
             poses = np.empty((0, len(JOINT_NAMES), LANDMARK_FIELDS), dtype=np.float64)
         else:
-            if block.shape[0] % len(JOINT_NAMES):
+            if block.shape[0] % len(joint_names):
                 raise ValueError(
                     f"{path}: frame {frame_idx} has {block.shape[0]} rows, "
-                    f"not a whole number of {len(JOINT_NAMES)}-landmark blocks"
+                    f"not a whole number of {len(joint_names)}-landmark blocks"
                 )
-            poses = block.reshape(-1, len(JOINT_NAMES), LANDMARK_FIELDS)
-            found = joints[people_rows][order].reshape(-1, len(JOINT_NAMES))
+            poses = block.reshape(-1, len(joint_names), LANDMARK_FIELDS)
+            found = joints[people_rows][order].reshape(-1, len(joint_names))
             if not np.array_equal(found, np.tile(model_order, (poses.shape[0], 1))):
                 raise ValueError(
-                    f"{path}: frame {frame_idx} does not hold the 33 landmarks "
-                    "once per person; re-run the keypoint extraction"
+                    f"{path}: frame {frame_idx} does not hold the {len(joint_names)} "
+                    f"landmarks once per person; re-run the keypoint extraction"
                 )
+            if expansion is not None:
+                poses = _expand_to_media_pipe(poses, expansion)
         first = rows[0]
         frames.append(
             prepare_frame(
@@ -1308,6 +1474,12 @@ def athlete_table(frames: Sequence[FramePeople], choices: Sequence[FrameChoice])
     false whenever there is no athlete to be in contact with — with
     ``contact_reason`` saying which rule fired. ``rotated`` and ``t_ms``
     describe the frame and are taken from the input unchanged.
+
+    The 33 rows are MediaPipe's row order whichever model the clip came from, so
+    a ``vision_athlete`` file and a ``mediapipe_athlete`` file of the same clip
+    join on ``(frame_idx, joint)`` row for row. The 16 rows Vision has no name
+    for are NaN in a Vision file and filled in a MediaPipe one — the schema's
+    own way of saying "this model did not report this joint".
     """
     if len(frames) != len(choices):
         raise ValueError(f"got {len(frames)} frames but {len(choices)} choices")
@@ -1417,24 +1589,44 @@ class ClipReport:
         )
 
 
-def output_dirname() -> str:
+def output_dirname(source: str = DEFAULT_SOURCE) -> str:
     """Which directory under ``<data_dir>/keypoints/`` this module writes to."""
-    return ATHLETE_OUTPUT_DIRNAME
+    return _source_dirnames(source)[1]
 
 
-def input_dirname() -> str:
+def input_dirname(source: str = DEFAULT_SOURCE) -> str:
     """Which directory under ``<data_dir>/keypoints/`` this module reads from."""
-    return MULTI_OUTPUT_DIRNAME
+    return _source_dirnames(source)[0]
 
 
-def missing_input_message(rotate_mode: str, path: str | pathlib.Path) -> str:
-    """The error shown when the multi-person keypoints have not been generated yet."""
+def _source_dirnames(source: str) -> tuple[str, str]:
+    """The ``(input root, output root)`` of a ``--source`` value, checked."""
+    try:
+        return SOURCE_DIRNAMES[source]
+    except KeyError:
+        raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}") from None
+
+
+def missing_input_message(
+    rotate_mode: str, path: str | pathlib.Path, source: str = DEFAULT_SOURCE
+) -> str:
+    """The error shown when the multi-person keypoints have not been generated yet.
+
+    The command named is the one that produces *this* source's multi-person
+    parquets: the MediaPipe multi-person run, or the Vision import that turns the
+    Mac's CSVs into the same two schemas.
+    """
+    if source == SOURCE_VISION:
+        command = f"uv run python -m handstand.vision_import --rotate {rotate_mode}"
+    else:
+        command = (
+            f"uv run python -m handstand.pose_mediapipe --rotate {rotate_mode} --num-poses 3 "
+            "--running-mode image --min-detection 0.2 --min-presence 0.2"
+        )
     return (
         f"no multi-person keypoints for rotate mode {rotate_mode!r}: {path}\n"
         "generate them first with:\n"
-        "  cd pipeline && uv run python -m handstand.pose_mediapipe "
-        f"--rotate {rotate_mode} --num-poses 3 --running-mode image "
-        "--min-detection 0.2 --min-presence 0.2"
+        f"  cd pipeline && {command}"
     )
 
 
@@ -1445,12 +1637,16 @@ def run_clip(
     in_root: str | pathlib.Path,
     out_root: str | pathlib.Path,
     overwrite: bool = False,
+    source: str = DEFAULT_SOURCE,
 ) -> ClipReport:
     """Select the athlete in one clip and write its parquet + JSON.
 
     Reads ``<in_root>/<rotate_mode>/<clip_id>.parquet`` (the multi-person
     runner's output) and writes ``<out_root>/<rotate_mode>/<clip_id>.{parquet,json}``.
-    Clips whose parquet already exists are skipped unless ``overwrite`` is true.
+    ``source`` says which model those two roots belong to, and is what the
+    loader reads the file as — the sidecar records it as the ``source_parquet``
+    path, so the output explains itself. Clips whose parquet already exists are
+    skipped unless ``overwrite`` is true.
 
     Both files are written atomically and the parquet is renamed last: its
     existence is what marks a clip as done, so an interrupted run must never
@@ -1458,10 +1654,11 @@ def run_clip(
     """
     if rotate_mode not in ROTATE_MODES:
         raise ValueError(f"unknown rotate mode {rotate_mode!r}; expected one of {ROTATE_MODES}")
+    joints_for_source(source)  # rejects an unknown source before any file is touched
     in_path = pathlib.Path(in_root) / rotate_mode / f"{clip_id}.parquet"
     if not in_path.is_file():
         raise FileNotFoundError(
-            missing_input_message(rotate_mode, pathlib.Path(in_root) / rotate_mode)
+            missing_input_message(rotate_mode, pathlib.Path(in_root) / rotate_mode, source)
         )
     out_dir = pathlib.Path(out_root) / rotate_mode
     parquet_path = out_dir / f"{clip_id}.parquet"
@@ -1481,7 +1678,7 @@ def run_clip(
         )
 
     started = time.perf_counter()
-    frames = load_frames(in_path)
+    frames = load_frames(in_path, source)
     choices = select_athlete(frames)
     table = athlete_table(frames, choices)
     runtime_seconds = time.perf_counter() - started
@@ -1495,7 +1692,7 @@ def run_clip(
     sidecar = {
         "clip_id": clip_id,
         "rotate": rotate_mode,
-        "source_parquet": f"{input_dirname()}/{rotate_mode}/{clip_id}.parquet",
+        "source_parquet": f"{input_dirname(source)}/{rotate_mode}/{clip_id}.parquet",
         "frame_count": frame_count,
         "athlete_frame_count": athlete_frames,
         "contact_frame_count": contact_frames,
@@ -1536,6 +1733,7 @@ def available_clips(
     rotate_mode: str,
     in_root: str | pathlib.Path,
     clips: Sequence[str] | None = None,
+    source: str = DEFAULT_SOURCE,
 ) -> list[str]:
     """The clip ids to process: ``clips`` as given, else every parquet found.
 
@@ -1546,7 +1744,7 @@ def available_clips(
     if clips:
         return [str(clip) for clip in clips]
     if not root.is_dir():
-        raise FileNotFoundError(missing_input_message(rotate_mode, root))
+        raise FileNotFoundError(missing_input_message(rotate_mode, root, source))
     return sorted(path.stem for path in root.glob("*.parquet"))
 
 
@@ -1559,8 +1757,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m handstand.athlete",
         description=(
-            "Pick the athlete out of the multi-person MediaPipe keypoints and "
-            "flag the frames where the trainer overlaps or touches them."
+            "Pick the athlete out of the multi-person keypoints of one pose model "
+            "and flag the frames where the trainer overlaps or touches them."
         ),
     )
     parser.add_argument(
@@ -1569,6 +1767,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ROTATE,
         help=(
             f"rotation mode of the keypoints to read, and of the output (default: {DEFAULT_ROTATE})"
+        ),
+    )
+    parser.add_argument(
+        "--source",
+        choices=SOURCES,
+        default=DEFAULT_SOURCE,
+        help=(
+            "which pose model's multi-person keypoints to read: mediapipe is "
+            f"mediapipe_multi -> {ATHLETE_OUTPUT_DIRNAME} (default: {DEFAULT_SOURCE}), "
+            f"vision is {vision_import.MULTI_OUTPUT_DIRNAME} -> "
+            f"{VISION_ATHLETE_OUTPUT_DIRNAME}. Same rules either way."
         ),
     )
     parser.add_argument(
@@ -1606,11 +1815,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--limit must be >= 0")
 
     root = pathlib.Path(args.data) if args.data is not None else data_dir()
-    in_root = root / "keypoints" / input_dirname()
-    out_root = root / "keypoints" / output_dirname()
+    in_root = root / "keypoints" / input_dirname(args.source)
+    out_root = root / "keypoints" / output_dirname(args.source)
 
     try:
-        clip_ids = available_clips(args.rotate, in_root, args.clips)
+        clip_ids = available_clips(args.rotate, in_root, args.clips, args.source)
     except FileNotFoundError as error:
         print(f"athlete: {error}")
         return 2
@@ -1620,7 +1829,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("no clips to process")
         return 0
 
-    print(f"rotate={args.rotate} clips={len(clip_ids)} in={in_root} out={out_root}")
+    print(
+        f"source={args.source} rotate={args.rotate} clips={len(clip_ids)} "
+        f"in={in_root} out={out_root}"
+    )
     failures = 0
     for clip_id in clip_ids:
         try:
@@ -1630,6 +1842,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 in_root=in_root,
                 out_root=out_root,
                 overwrite=args.overwrite,
+                source=args.source,
             )
         except Exception as error:  # one bad clip must not kill the whole batch
             failures += 1

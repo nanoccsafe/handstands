@@ -19,6 +19,8 @@ same columns, same types, same coordinate conventions.
 <data_dir>/keypoints/vision_multi/<rotate>/<clip_id>.json           # sidecar metadata
 <data_dir>/keypoints/vision/<rotate>/<clip_id>.parquet             # the lowest-wrist person
 <data_dir>/keypoints/vision/<rotate>/<clip_id>.json                 # sidecar metadata
+<data_dir>/keypoints/vision_athlete/<rotate>/<clip_id>.parquet     # athlete selection
+<data_dir>/keypoints/vision_athlete/<rotate>/<clip_id>.json         # sidecar metadata
 ```
 
 * `<data_dir>` = `handstand.paths.data_dir()` (default
@@ -36,6 +38,10 @@ same columns, same types, same coordinate conventions.
   the CSV is produced on the Mac mini (`tools/mac/run_vision.sh`) and imported
   here, into the same two schemas, so a Vision run and a MediaPipe run of the
   same clip and mode differ only in which directory they are in.
+* `vision_athlete` is the athlete selection of the Vision keypoints —
+  `handstand.athlete --source vision`, with the same rules, the same four extra
+  columns and the same 33 rows per frame as `mediapipe_athlete`
+  ([below](#athlete-selection--trainer-contact)).
 * `<clip_id>` = the `clip_id` column of `<data_dir>/catalogue.csv`
   (`clip_id,filename`) when that file exists, otherwise the first 12 hex
   characters of the SHA-1 of the video file's bytes (same definition as the
@@ -55,6 +61,10 @@ uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \
     --running-mode image --min-detection 0.2 --min-presence 0.2
 uv run python -m handstand.athlete --rotate auto
 uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
+
+# the same selection over the Apple Vision keypoints (chainlink #16's bake-off)
+uv run python -m handstand.athlete --source vision --rotate auto
+uv run python -m handstand.overlay --clip 6508f9b355bd --source vision_athlete
 ```
 
 ## Parquet: one row per (frame, joint)
@@ -196,7 +206,15 @@ stage keeps working unchanged.
 cd pipeline
 uv run python -m handstand.athlete --rotate auto
 uv run python -m handstand.athlete --rotate auto --clips 6508f9b355bd
+uv run python -m handstand.athlete --source vision --rotate auto   # Apple Vision
 ```
+
+`--source {mediapipe,vision}` (default `mediapipe`, whose output is unchanged)
+picks the pair of directories to work on and nothing else: the same rules, the
+same constants, the same four extra columns. `vision` reads `vision_multi/` and
+writes `vision_athlete/`, so the bake-off compares the two models *after* the
+same selection rather than one of them before it. What a Vision block looks like
+to these rules is under [Apple Vision](#apple-vision).
 
 | column | type | meaning |
 |---|---|---|
@@ -307,6 +325,10 @@ that must not be scored are obvious while watching:
 cd pipeline
 uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
 # -> <data_dir>/overlays/6508f9b355bd_athlete_auto.mp4
+
+# the same selection over the Apple Vision keypoints
+uv run python -m handstand.overlay --clip 6508f9b355bd --source vision_athlete
+# -> <data_dir>/overlays/6508f9b355bd_vision_athlete_auto.mp4
 ```
 
 The source is part of the file name (only for a non-default source), so the
@@ -448,13 +470,14 @@ Any run whose detector settings differ from MediaPipe's own defaults (see
 A run on the defaults records none of them, so a historical sidecar stays
 byte-identical.
 
-A sidecar under `mediapipe_athlete` (written by `handstand.athlete`) describes
-the selection instead:
+A sidecar under `mediapipe_athlete` (written by `handstand.athlete`) — or under
+`vision_athlete`, which is the same thing for `--source vision` — describes the
+selection instead:
 
 | key | meaning |
 |---|---|
 | `clip_id`, `rotate` | as above |
-| `source_parquet` | the multi-person parquet it read, e.g. `mediapipe_multi/auto/1a2b3c4d5e6f.parquet` |
+| `source_parquet` | the multi-person parquet it read, e.g. `mediapipe_multi/auto/1a2b3c4d5e6f.parquet` (or `vision_multi/...` for `--source vision`) |
 | `frame_count` | frames in the clip (rows / 33) |
 | `athlete_frame_count` | frames a person was attributed to |
 | `contact_frame_count` | of those, the frames flagged as trainer contact |
@@ -601,7 +624,8 @@ same order, the same dtypes and the same ordering rules as the MediaPipe runner:
   `person_idx`, holding the person whose **wrists are lowest** in each frame. The
   same rule `pose_mediapipe.lowest_wrist_pose` applies to a MediaPipe run, so
   "which body is this frame about" is decided identically for both. Choosing the
-  athlete out of several people is still `handstand.athlete`'s job.
+  athlete out of several people is still `handstand.athlete`'s job — which is
+  what `handstand.athlete --source vision` does, writing `vision_athlete/`.
 
 Three columns do not survive the crossing:
 
@@ -613,6 +637,40 @@ Three columns do not survive the crossing:
 
 Everything else — `frame_idx`, `t_ms`, `joint`, `x`, `y`, `rotated`, `detected`
 (and `person_idx` in the multi file) — is identical.
+
+### The athlete selection over Vision keypoints
+
+`handstand.athlete --source vision` runs the rules of
+[Athlete selection + trainer contact](#athlete-selection--trainer-contact)
+unchanged over `vision_multi/` and writes `vision_athlete/`: the same four extra
+columns, and the same **33 rows per frame in MediaPipe's joint order**, so the
+two athlete files of one clip join on `(frame_idx, joint)` row for row. The 16
+landmarks Vision has no name for are NaN in that file, which is the schema's own
+way of saying "this model did not report this joint"; Vision's own `neck` and
+`root` are not MediaPipe rows and are left out entirely.
+
+Every rule therefore either reads joints both models have, or skips the ones that
+are not there:
+
+* the visibility term (the 12 main joints) and all ten measured bones —
+  upper arm, forearm, thigh, shin and the side of the torso — are shoulders,
+  elbows, wrists, hips, knees and ankles, all of which Vision reports;
+* the mat line and the centre line's foot are the lowest wrist or **ankle**
+  rather than of a toe, and the mixed-skeleton check asks about the eight limb
+  joints a Vision skeleton has;
+* the head end of the centre line is the mean of the face joints Vision did
+  report (no mouth), falling back to the shoulders when it reported none;
+* a bone one of whose ends is missing is not measured, and a frame with nothing
+  to place a centre line on is simply not checked for a stitch.
+
+One number does not carry over, and it is worth knowing before reading a
+comparison: a Vision parquet's `visibility` is a **confidence** on a lower scale
+than MediaPipe's visibility, while `CONTACT_MIN_VISIBILITY` is MediaPipe's `0.5`.
+A Vision bone is therefore only measurable when both of its ends clear `0.5` and
+is skipped otherwise, so `bone_length` can see less of a Vision clip than of a
+MediaPipe one. The *selection* does not read that threshold as a filter (only as
+the mean of the 12 main scores, a score), so which athlete is chosen is decided
+the same way for both models whatever it is.
 
 ### The Vision sidecar
 
