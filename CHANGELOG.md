@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Agent pre-labels for the 300 frames (independent model) + review queue (#77)
 - Agent pre-labels for the labelling sample (RTMPose, not a bake-off model) (#77)
 - Apple Developer account decision (#6)
 - Data storage and sync strategy for videos (#5)
