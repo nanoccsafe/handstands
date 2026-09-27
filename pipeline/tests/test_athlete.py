@@ -235,6 +235,7 @@ def test_schema_and_constants_match_the_documented_contract() -> None:
     assert (athlete.DEDUP_HIP_TOLERANCE, athlete.DEDUP_JOINT_TOLERANCE) == (0.15, 0.1)
     assert athlete.CONTACT_MIN_IOU == 0.3
     assert athlete.BONE_LENGTH_TOLERANCE == 0.35
+    assert athlete.BONE_LENGTH_PERCENTILE == 90.0
     # The reasons are the documented ones, and every bone has a mirror image.
     assert athlete.CONTACT_REASONS == ("box_iou", "mixed_skeleton", "bone_length")
     assert athlete.REASON_NONE == ""
@@ -521,8 +522,8 @@ def test_contact_reason_names_the_rule_that_fired() -> None:
     body = athlete.measure_person(stitched)
     assert athlete.contact_reason(body, [trainer]) == "mixed_skeleton"
     # c. a leg half again too long — and nobody else in the frame at all, which
-    #    is the case the two rules above cannot see. The clip's own medians are
-    #    what say so; without them only the left/right rule can run.
+    #    is the case the two rules above cannot see. The clip's own full length
+    #    is what says so; without one the left/right rule still can.
     long_leg = scaled_bone(handstand(ATHLETE_X), "left_knee", "left_ankle", 1.5)
     body = athlete.measure_person(long_leg)
     assert athlete.contact_reason(body, [], {"shin_l": 150.0}) == "bone_length"
@@ -542,9 +543,42 @@ def test_contact_reason_names_the_rule_that_fired() -> None:
 # --------------------------------------------------------------------------- #
 
 
+#: Long enough for the 90th percentile of a bone's length to be the length the
+#: clip shows in all but a handful of frames. A clip of three or four frames
+#: cannot judge anything: the 90th percentile of [150, 150, 150, 225] is 202,
+#: so the 225 is inside the band and nothing is flagged.
+CLIP_FRAMES = 20
+#: Where the odd frame of a clip goes: past the 90th percentile, so the one bad
+#: frame does not become the reference.
+ODD_FRAME = 7
+
+
 def handstand_clip(poses: Sequence[np.ndarray]) -> list[athlete.FramePeople]:
     """One frame per pose: a standing trainer beside that athlete, in handstand."""
     return [frame_of(index, standing(TRAINER_X), pose) for index, pose in enumerate(poses)]
+
+
+def clip_of(pose: np.ndarray, odd: np.ndarray | None = None) -> list[athlete.FramePeople]:
+    """:data:`CLIP_FRAMES` of the same handstand, one of them ``odd`` if given."""
+    poses = [pose] * CLIP_FRAMES
+    if odd is not None:
+        poses[ODD_FRAME] = odd
+    return handstand_clip(poses)
+
+
+def reasons(frames: Sequence[athlete.FramePeople]) -> list[str]:
+    """The contact reason the selection gave every frame of that clip."""
+    return [choice.reason for choice in athlete.select_athlete(frames)]
+
+
+def leg_length(pose: np.ndarray, leg: str) -> float:
+    """One leg of that pose as a single length, thigh + shin."""
+    return athlete.leg_lengths(athlete.measure_person(pose))[leg]
+
+
+def clip_bone_lengths_of(pose: np.ndarray, odd: np.ndarray | None = None) -> dict[str, float]:
+    """The full lengths the rule would measure that clip's odd frame against."""
+    return athlete.clip_bone_lengths(athlete.select_athlete(clip_of(pose, odd)))
 
 
 def test_bone_lengths_measure_every_bone_and_skip_the_ones_not_seen() -> None:
@@ -571,71 +605,164 @@ def test_bone_lengths_measure_every_bone_and_skip_the_ones_not_seen() -> None:
     assert math.isfinite(athlete.leg_lengths(half)["leg_r"])
 
 
-def test_a_bone_off_the_clips_own_length_is_flagged_bone_length() -> None:
+def test_the_clip_learns_each_bones_full_length_from_its_ninetieth_percentile() -> None:
+    """How long this clip says each of the athlete's own bones is, at full length."""
+    good = handstand(ATHLETE_X)
+    full_lengths = clip_bone_lengths_of(good)
+
+    # The synthetic handstand is built with 100 px arms and 150 px bones.
+    assert set(full_lengths) == {name for name, _, _ in athlete.BONES}
+    assert full_lengths["shin_l"] == pytest.approx(150.0, abs=0.1)
+    assert full_lengths["shin_r"] == pytest.approx(150.0, abs=0.1)
+    assert "leg_l" not in full_lengths  # thigh + shin is the left/right rule's business
+
+    # A tenth of the clip being long *is* the reference: four shins at 225 in
+    # twenty frames put the 90th percentile at 225, where the median would still
+    # have been 150 and would have flagged all four. That is the trade the
+    # percentile buys — a bone that is long in a tenth of the frames of a clip
+    # is that long in this clip.
+    long_shin = scaled_bone(good, "left_knee", "left_ankle", 1.5)
+    stretched = [long_shin if index % 5 == 0 else good for index in range(CLIP_FRAMES)]
+    absorbed = athlete.clip_bone_lengths(athlete.select_athlete(handstand_clip(stretched)))
+    assert absorbed["shin_l"] == pytest.approx(225.0, abs=0.1)
+
+
+def test_a_limb_stretched_to_one_and_a_half_times_is_flagged_bone_length() -> None:
     """One frame's ankle lands on the trainer's foot: a shin 50 % too long."""
     good = handstand(ATHLETE_X)
     long_leg = scaled_bone(good, "left_knee", "left_ankle", 1.5)
-    chosen = athlete.select_athlete(handstand_clip([good, good, long_leg, good, good]))
+    chosen = athlete.select_athlete(clip_of(good, long_leg))
 
-    assert [choice.reason for choice in chosen] == ["", "", "bone_length", "", ""]
-    assert [choice.contact for choice in chosen] == [False, False, True, False, False]
+    expected = [""] * CLIP_FRAMES
+    expected[ODD_FRAME] = "bone_length"
+    assert [choice.reason for choice in chosen] == expected
+    assert [choice.contact for choice in chosen][ODD_FRAME] is True
     # The frame keeps the athlete: the flag takes it out of scoring, not the clip.
     assert all(choice.chosen for choice in chosen)
-    assert chosen_x(chosen[2]) == pytest.approx(ATHLETE_X)
-    # It is the shin, and the clip's own median is what says so: one bad frame
-    # out of five does not move the median of the other four.
-    medians = athlete.clip_bone_medians(chosen)
-    assert medians["shin_l"] == pytest.approx(150.0, abs=0.1)
-    assert athlete.bone_lengths(chosen[2].person)["shin_l"] == pytest.approx(225.0, abs=0.1)
-    assert athlete.bone_length_outlier(chosen[2].person, medians) == "shin_l"
-    assert athlete.bone_length_outlier(chosen[0].person, medians) is None
-    # The left/right rule is not what caught it: 225 against 150 is inside the
-    # band once it is measured against the longer of the two.
-    assert athlete.counterpart_outlier(chosen[2].person) is None
-    assert athlete.bone_length_mismatch(chosen[2].person, medians) == "shin_l"
+    assert chosen_x(chosen[ODD_FRAME]) == pytest.approx(ATHLETE_X)
+    # It is the shin, and the clip's own full length is what says so: one long
+    # frame in twenty is past the 90th percentile, not on it.
+    full_lengths = athlete.clip_bone_lengths(chosen)
+    assert full_lengths["shin_l"] == pytest.approx(150.0, abs=0.1)
+    assert athlete.bone_lengths(chosen[ODD_FRAME].person)["shin_l"] == pytest.approx(225.0, abs=0.1)
+    assert athlete.bone_length_outlier(chosen[ODD_FRAME].person, full_lengths) == "shin_l"
+    assert athlete.bone_length_outlier(chosen[0].person, full_lengths) is None
+    assert athlete.bone_length_mismatch(chosen[ODD_FRAME].person, full_lengths) == "shin_l"
 
 
-def test_a_shorter_bone_off_the_clip_is_flagged_too() -> None:
-    """A trainer's bent leg is *shorter* than the athlete's, not only longer."""
+def test_a_split_leg_foreshortened_to_sixty_percent_is_not_flagged() -> None:
+    """A leg swung out of the camera plane: 60 % of its length, and the athlete's.
+
+    A split, a stag or a straddle in a handstand makes one leg point away from
+    the camera, and a projection can only ever be *shorter* than the thing it
+    projects. Nothing about a short bone is evidence of a second body, so the
+    per-clip half never fires on one — this is the frame a two-sided rule was
+    throwing away in 85 % of a solo split clip. The clip has to be a solo one
+    (a72f0c886e1c: one person reported in all 526 frames), because the
+    left/right half cannot tell a straddle from a swapped leg and only runs when
+    the clip has shown a second body: see
+    :func:`test_the_left_right_rule_waits_for_a_second_body_to_have_been_seen`.
+    """
     good = handstand(ATHLETE_X)
-    short_leg = scaled_bone(good, "left_knee", "left_ankle", 0.5)
-    chosen = athlete.select_athlete(handstand_clip([good, good, short_leg, good, good]))
-    assert [choice.reason for choice in chosen] == ["", "", "bone_length", "", ""]
-    medians = athlete.clip_bone_medians(chosen)
-    assert athlete.bone_length_outlier(chosen[2].person, medians) == "shin_l"
+    split = scaled_leg(good, 0.6)
+    assert leg_length(split, "leg_l") == pytest.approx(180.0, abs=0.3)
+    poses = [good] * CLIP_FRAMES
+    poses[ODD_FRAME] = split
+    alone = [frame_of(index, pose) for index, pose in enumerate(poses)]
+
+    assert max(frame.n_people for frame in alone) < athlete.ASYMMETRY_MIN_PEOPLE
+    assert reasons(alone) == [""] * CLIP_FRAMES
+    person = athlete.measure_person(split)
+    full_lengths = clip_bone_lengths_of(good)
+    assert athlete.bone_length_outlier(person, full_lengths) is None
+    assert athlete.bone_length_mismatch(person, full_lengths, compare_sides=False) is None
+    # It is only *too long* that the per-clip half calls a stitch, so the same
+    # skeleton read against a reference of its own short leg is still clean.
+    assert athlete.bone_length_outlier(person, {"thigh_l": 90.0, "shin_l": 90.0}) is None
 
 
 def test_foreshortening_within_tolerance_is_not_flagged() -> None:
     """A leg pointing at the camera is shorter, and that is the athlete's own."""
     good = handstand(ATHLETE_X)
     foreshortened = scaled_bone(good, "left_knee", "left_ankle", 0.8)
-    chosen = athlete.select_athlete(handstand_clip([good, good, foreshortened, good, good]))
+    poses = [good] * CLIP_FRAMES
+    poses[ODD_FRAME] = foreshortened
+    alone = [frame_of(index, pose) for index, pose in enumerate(poses)]
 
-    assert [choice.reason for choice in chosen] == [""] * 5
-    assert not any(choice.contact for choice in chosen)
-    medians = athlete.clip_bone_medians(chosen)
-    assert medians["shin_l"] == pytest.approx(150.0, abs=0.1)
-    assert athlete.bone_length_outlier(chosen[2].person, medians) is None
-    assert athlete.counterpart_outlier(chosen[2].person) is None
+    assert reasons(alone) == [""] * CLIP_FRAMES
+    full_lengths = clip_bone_lengths_of(good)
+    assert full_lengths["shin_l"] == pytest.approx(150.0, abs=0.1)
+    assert athlete.bone_length_outlier(athlete.measure_person(foreshortened), full_lengths) is None
 
 
 def test_a_leg_that_differs_from_its_other_side_is_flagged() -> None:
-    """The left/right rule needs no clip history: the two sides disagree.
+    """The left/right half needs no clip history: the two sides disagree.
 
     The knee slides down the leg, so the left thigh is 30 % long and the right
-    25 % short — each inside the tolerance around the median, and the two legs
-    still the same length end to end. The skeleton is still not one body.
+    25 % short — each inside the tolerance around the clip's own full length, so
+    the per-clip half cannot see it, and the two legs still the same length end
+    to end. This half is two-sided, because a trainer standing behind the
+    athlete shortens a bone as surely as one beside them lengthens it
+    (5f71d966c49a).
     """
     good = handstand(ATHLETE_X)
     bent = scaled_bone(good, "left_hip", "left_knee", 1.3)
     bent = scaled_bone(bent, "right_hip", "right_knee", 0.75)
-    chosen = athlete.select_athlete(handstand_clip([good, good, bent, good, good]))
 
-    medians = athlete.clip_bone_medians(chosen)
-    assert athlete.bone_length_outlier(chosen[2].person, medians) is None
-    assert athlete.counterpart_outlier(chosen[2].person) == "thigh_l"
-    assert [choice.reason for choice in chosen] == ["", "", "bone_length", "", ""]
+    chosen = athlete.select_athlete(clip_of(good, bent))
+    full_lengths = athlete.clip_bone_lengths(chosen)
+    person = chosen[ODD_FRAME].person
+    assert athlete.bone_length_outlier(person, full_lengths) is None
+    assert athlete.counterpart_outlier(person) == "thigh_l"
+    expected = [""] * CLIP_FRAMES
+    expected[ODD_FRAME] = "bone_length"
+    assert [choice.reason for choice in chosen] == expected
     assert all(choice.chosen for choice in chosen)
+
+
+def test_one_leg_half_again_as_long_as_the_other_is_flagged() -> None:
+    """6508f9b355bd frame 121: a leg of 157 px against the other one's 105.
+
+    One leg half again the other, both of them seen — which is what a limb
+    finished at the trainer's foot looks like, and the shape this rule has to
+    catch from inside a single reported skeleton. The per-clip half is what
+    catches it: the thigh is 225 px where this clip shows the bone at 157.5. The
+    left/right half is not, at this size — a 1.5× leg differs from its mirror by
+    33 %, inside the 35 % band — which is why the two halves are both needed.
+    """
+    good = handstand(ATHLETE_X)
+    stretched = scaled_leg(good, 1.5)
+    assert leg_length(stretched, "leg_l") == pytest.approx(450.0, abs=0.4)
+    assert leg_length(stretched, "leg_r") == pytest.approx(300.0, abs=0.2)
+
+    assert reasons(clip_of(good, stretched))[ODD_FRAME] == "bone_length"
+    full_lengths = clip_bone_lengths_of(good)
+    person = athlete.measure_person(stretched)
+    assert athlete.bone_length_outlier(person, full_lengths) == "thigh_l"
+    assert athlete.counterpart_outlier(person) is None
+    assert athlete.bone_length_mismatch(person, full_lengths) == "thigh_l"
+
+
+def test_a_bone_long_in_a_few_frames_is_caught_against_its_other_side() -> None:
+    """What the left/right half is for: a stitch the clip's own 90th percentile cannot see.
+
+    Three frames of the clip have the left shin at 255 px — 70 % longer than the
+    150 px the other shin measures in every frame. Three in twenty *is* the 90th
+    percentile, so the full length of that shin is 255 and the per-clip half
+    cannot judge it against itself; the left/right half still can.
+    """
+    good = handstand(ATHLETE_X)
+    long_shin = scaled_bone(good, "left_knee", "left_ankle", 1.7)
+    poses = [long_shin if index in (4, 9, 14) else good for index in range(CLIP_FRAMES)]
+    chosen = athlete.select_athlete(handstand_clip(poses))
+    full_lengths = athlete.clip_bone_lengths(chosen)
+
+    assert full_lengths["shin_l"] == pytest.approx(255.0, abs=0.1)
+    assert [index for index, choice in enumerate(chosen) if choice.reason] == [4, 9, 14]
+    assert all(chosen[index].reason == "bone_length" for index in (4, 9, 14))
+    assert athlete.bone_length_outlier(chosen[4].person, full_lengths) is None
+    assert athlete.counterpart_outlier(chosen[4].person) == "shin_l"
+    assert athlete.bone_length_mismatch(chosen[4].person, full_lengths) == "shin_l"
 
 
 def test_a_whole_leg_the_wrong_length_is_named_as_the_leg() -> None:
@@ -657,53 +784,47 @@ def test_a_whole_leg_the_wrong_length_is_named_as_the_leg() -> None:
 def test_the_left_right_rule_waits_for_a_second_body_to_have_been_seen() -> None:
     """A straddling handstand is not a stitch: nobody else is in the clip.
 
-    The same frame either way: one leg 30 % long and its mirror 25 % short, which
-    only the left/right rule can see. In a clip that has shown a second person
-    somewhere, that leg could be the trainer's; in a clip that never has, the
-    legs are the athlete's own and the frame must stay scorable.
+    The same frames either way: a shin 50 % too long in three of the clip's
+    twenty frames, which only the left/right rule can see. In a clip that has
+    shown a second person somewhere, that shin could be the trainer's; in a
+    clip that never has, there is nothing to have swapped it with, so those
+    frames are the athlete's own and must stay scorable.
     """
     good = handstand(ATHLETE_X)
-    bent = scaled_bone(good, "left_hip", "left_knee", 1.3)
-    bent = scaled_bone(bent, "right_hip", "right_knee", 0.75)
+    long_shin = scaled_bone(good, "left_knee", "left_ankle", 1.7)
+    poses = [long_shin if index in (4, 9, 14) else good for index in range(CLIP_FRAMES)]
 
-    alone = [frame_of(index, pose) for index, pose in enumerate([good, good, bent, good, good])]
+    alone = [frame_of(index, pose) for index, pose in enumerate(poses)]
     assert max(frame.n_people for frame in alone) < athlete.ASYMMETRY_MIN_PEOPLE
-    assert [choice.reason for choice in athlete.select_athlete(alone)] == [""] * 5
+    assert reasons(alone) == [""] * CLIP_FRAMES
 
     # One extra person in one frame of the clip is enough to switch it on, and
-    # the median rule — which needs no second body — is on either way.
-    with_trainer = [frame_of(0, standing(TRAINER_X), bent)]
-    with_trainer += [frame_of(index, pose) for index, pose in enumerate([good, good, good], 1)]
+    # that frame itself is a handstand with a trainer standing well clear.
+    with_trainer = [frame_of(0, standing(TRAINER_X), poses[0])]
+    with_trainer += [frame_of(index, pose) for index, pose in enumerate(poses[1:], 1)]
     assert max(frame.n_people for frame in with_trainer) >= athlete.ASYMMETRY_MIN_PEOPLE
-    assert [choice.reason for choice in athlete.select_athlete(with_trainer)] == [
-        "bone_length",
-        "",
-        "",
-        "",
-    ]
-    # A bone off the clip's own median is caught with or without a second body.
-    long_leg = scaled_bone(good, "left_knee", "left_ankle", 1.5)
-    solo = [frame_of(index, pose) for index, pose in enumerate([good, good, long_leg])]
-    assert [choice.reason for choice in athlete.select_athlete(solo)] == [
-        "",
-        "",
-        "bone_length",
-    ]
+    assert [index for index, reason in enumerate(reasons(with_trainer)) if reason] == [4, 9, 14]
 
 
 def test_a_one_frame_clip_is_judged_on_its_other_side_alone() -> None:
-    """No medians worth learning from: the left/right rule still runs."""
+    """No full length worth learning from: the left/right rule still runs.
+
+    That half needs no clip history and no second body, so it is the only one
+    that can fire in a clip of a single frame: 50 % on the shin is inside the
+    band once it is measured against the longer of the two sides, 60 % is not.
+    The per-clip half cannot fire here at all — its reference would be that one
+    frame, and nothing is longer than itself.
+    """
     good = handstand(ATHLETE_X)
-    long_shin = scaled_bone(good, "left_knee", "left_ankle", 1.6)
-    # 50 % on the shin is inside the band once it is measured against the
-    # longer of the two sides, 60 % is not.
     inside = athlete.measure_person(scaled_bone(good, "left_knee", "left_ankle", 1.5))
-    outside = athlete.measure_person(long_shin)
+    outside = athlete.measure_person(scaled_bone(good, "left_knee", "left_ankle", 1.6))
     assert athlete.contact_reason(inside, []) == ""
     assert athlete.counterpart_outlier(outside) == "shin_l"
     assert athlete.contact_reason(outside, []) == "bone_length"
-    # In a clip of one frame the median is that frame, so only this can fire.
-    chosen = athlete.select_athlete(handstand_clip([long_shin]))
+    assert athlete.bone_length_outlier(outside, None) is None
+
+    one_frame = scaled_bone(good, "left_knee", "left_ankle", 1.6)
+    chosen = athlete.select_athlete(handstand_clip([one_frame]))
     assert [choice.reason for choice in chosen] == ["bone_length"]
     assert [choice.contact for choice in chosen] == [True]
 
@@ -927,13 +1048,15 @@ def test_run_clip_records_which_rule_flagged_every_frame(tmp_path: pathlib.Path)
     in_root = tmp_path / "keypoints" / "mediapipe_multi"
     out_root = tmp_path / "keypoints" / "mediapipe_athlete"
     good = handstand(ATHLETE_X)
+    # Enough plain frames that the one frame with a long shin is past the clip's
+    # 90th percentile rather than on it, so the bone-length rule can see it.
     write_multi(
         in_root / "auto",
         [
             [standing(TRAINER_X), good],
             [standing(ATHLETE_X + 20.0), good],  # the trainer's box over the athlete's
             [standing(TRAINER_X), scaled_bone(good, "left_knee", "left_ankle", 1.5)],
-            [standing(TRAINER_X), good],
+            *[[standing(TRAINER_X), good]] * CLIP_FRAMES,
             [],
         ],
         clip_id="clip00000001",
@@ -952,8 +1075,10 @@ def test_run_clip_records_which_rule_flagged_every_frame(tmp_path: pathlib.Path)
 
     table = pd.read_parquet(report.parquet_path)
     by_frame = table.groupby("frame_idx").first()
-    assert by_frame["contact_reason"].tolist() == ["", "box_iou", "bone_length", "", ""]
-    assert by_frame["trainer_contact"].tolist() == [False, True, True, False, False]
+    flagged = ["", "box_iou", "bone_length", *[""] * CLIP_FRAMES, ""]
+    assert by_frame["contact_reason"].tolist() == flagged
+    contacts = [False, True, True, *([False] * CLIP_FRAMES), False]
+    assert by_frame["trainer_contact"].tolist() == contacts
     assert all(isinstance(value, str) for value in table["contact_reason"])
     # A flagged frame still carries the athlete's keypoints, not the trainer's.
     flagged = table[(table["frame_idx"] == 2) & (table["joint"] == "nose")]

@@ -224,29 +224,54 @@ The rules, applied to each frame in this order (the constants are
    |---|---|
    | `box_iou` | another person's bounding box (of its visible joints, visibility ≥ 0.5) overlaps the athlete's by IoU > `0.3` |
    | `mixed_skeleton` | one of the athlete's limb joints is closer to the other person's joints than to the athlete's own centre line (their feet to their head) — the two skeletons overlap so much that the model stitched them into one |
-   | `bone_length` | one of the athlete's own bones is the wrong length: more than `BONE_LENGTH_TOLERANCE` (0.35) off the median of the same bone over the clip, or off the same bone on the other side of the body |
+   | `bone_length` | one of the athlete's own bones is the wrong length: more than `BONE_LENGTH_TOLERANCE` (0.35) off the 90th percentile of the same bone over the clip (`BONE_LENGTH_PERCENTILE`), or off the same bone on the other side of the body |
 
    The first two need a *second detection*, so contamination inside a single
    reported skeleton — the athlete's upper body with the trainer's foot on the
    floor, which is what MediaPipe reports when the trainer stands right behind
    them — slips past them. `bone_length` is what catches that: the bones are
    measured over the five pairs of the athlete's own (upper arm, forearm,
-   thigh, shin, and the side of the torso, left and right), each pair's median
-   over the frames where both its joints were seen at visibility ≥ 0.5, and a
-   bone outside the ±35 % band is somebody else's limb.
+   thigh, shin, and the side of the torso, left and right), and each is compared
+   against the **90th percentile** of its own length over the frames where both
+   its joints were seen at visibility ≥ 0.5 — the length the bone is seen at
+   when it lies in the picture plane, i.e. at full length. A bone outside the
+   ±35 % band is somebody else's limb. The percentile, rather than the median,
+   is what leaves room for a bone that is foreshortened in most of a clip while
+   still being measured against the frames in which it is not.
 
-   The left/right half of that rule only runs for a clip in which MediaPipe
-   reported 2+ people in at least one frame (`ASYMMETRY_MIN_PEOPLE`). An athlete
-   straddling their legs in a handstand has one leg pointing at the camera and
-   one away, and MediaPipe reports that as a 35–50 % left/right difference for
-   whole stretches of a clip with nobody else in it — those frames are the
-   athlete's own and must stay scorable. The per-clip median needs no second
-   body, so it always runs.
+   **That half only ever fires on a bone that is too _long_.** Foreshortening can
+   only make a projected bone *shorter*: a leg swung out of the camera plane in
+   a split, a stag or a straddle comes out shorter and the model is right.
+   Contamination by another body goes the other way — the limb has been finished
+   at the trainer's foot, so it comes out longer. So against the clip's own
+   history a short bone is the athlete's own and is never flagged, and a
+   two-sided version of that half was throwing away the frames of a solo split
+   clip for nothing: in `a72f0c886e1c` and `a9153273dab1` MediaPipe reported one
+   person in every frame, and 85 % and 81 % of them were flagged, none of them a
+   trainer. Both are now 0 %.
+
+   The left/right half is **two-sided**, and has to be: a trainer standing
+   *behind* the athlete shortens a bone just as surely as one standing beside
+   them lengthens it (in `5f71d966c49a` the right thigh and shin come out at
+   roughly half the left ones in nearly every frame, which is 71 % of the clip
+   still flagged). What that half cannot do is tell a straddle from a swapped
+   leg — to it a leg pointing at the camera and a leg that was never seen whole
+   look the same — which is why it only runs for a clip in which MediaPipe
+   reported 2+ people in at least one frame (`ASYMMETRY_MIN_PEOPLE`). The
+   per-clip full length needs no second body, so it always runs.
 
    What no rule can catch: contamination that *is* the clip's norm. In
    6508f9b355bd the trainer's leg is stitched onto the athlete's left hip in
-   every frame the model reports one body, so the clip's own median is the
-   contaminated length and only the worst frames stand out (16 of 244).
+   every frame the model reports one body, so the clip's own reference is the
+   contaminated length: the left leg measures 158.9 px against the right one's
+   105.5 in frame 121, and very nearly that in almost every other frame, so
+   there is no outlier left for the per-clip half to find. The left/right half
+   still catches 14 of the 244 frames, and the frames the model does report two
+   people in are caught by `box_iou` (20 of 244) and `mixed_skeleton` (1).
+
+   Net over all 180 clips: `bone_length` falls from 22.3 % of frames to 7.3 %,
+   and from 17.6 % to 2.7 % in the 107 clips with no trainer detected, with no
+   clip in either group flagged *more* than before.
 4. **Give up honestly.** A frame whose best score is below `0.35`, or where the
    two best candidates are within `0.05` of each other, is written as *not
    detected*: 33 NaN rows with `detected = false`, exactly as a frame the model
