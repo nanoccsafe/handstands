@@ -1,6 +1,6 @@
 # Keypoint labelling (Label Studio)
 
-The pose-model bake-off ([#16](https://github.com/handstand-analytics/handstand/issues/16))
+The pose-model bake-off (chainlink #16)
 needs ground truth: frames a person has marked the athlete's joints on by hand,
 so MediaPipe — and later Apple Vision and YOLO-pose — can be scored against a
 human instead of against another model. This page is the whole loop: pick the
