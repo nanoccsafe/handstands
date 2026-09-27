@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Athlete selection for Vision multi-person keypoints (--source vision) (#76)
 - Athlete selection over the Apple Vision keypoints (`--source vision`, unchanged output for `mediapipe`) (#76)
 - Apple Vision body-pose runner (Swift CLI on the Mac mini) + import to keypoint schema (#15)
 - Frame sampler + keypoint labeling setup (Label Studio) (#65)
