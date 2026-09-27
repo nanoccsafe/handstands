@@ -11,7 +11,8 @@ prompt names the issue and its acceptance criteria. Stay inside that scope.
 - Never `cd` into directories outside your worktree (data, videos, the main checkout): pass absolute paths to
   commands instead (`ls /mnt/sharedOs/handstand-workspace/data/...`, `ffprobe <abs path>`) or use Python with
   `handstand.paths`. A `cd` outside the worktree triggers a permission request nobody can answer and blocks you.
-- Do not read or modify `.chainlink/` and do not run `chainlink`; the lead tracks issues.
+- Do not read or modify `.chainlink/` and do not run `chainlink`; the lead tracks issues. Refer to issues as
+  `chainlink #N`; never write GitHub issue URLs or other links you have not verified (the repo is public).
 - `CLAUDE.md` is the lead's instructions, not yours: do not read or follow it.
 
 ## Layout
