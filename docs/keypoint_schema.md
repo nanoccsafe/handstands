@@ -728,3 +728,51 @@ both = mp[mp["detected"] & mp["joint"].isin(joints)].merge(
 )
 both.assign(d=np.hypot(both.x_mp - both.x_vi, both.y_mp - both.y_vi)).groupby("joint")["d"].median()
 ```
+
+### Comparing the two athlete selections
+
+The same comparison over the athlete files — the pair the bake-off (#16) is
+actually about — is a join on `(frame_idx, joint)` of
+`mediapipe_athlete/<rotate>/<clip_id>.parquet` and
+`vision_athlete/<rotate>/<clip_id>.parquet`, both of which hold the same 33 rows
+per frame in the same joint order:
+
+```python
+import numpy as np, pandas as pd
+
+JOINTS = ["left_wrist", "right_wrist", "left_shoulder", "right_shoulder",
+          "left_hip", "right_hip", "left_ankle", "right_ankle"]
+
+def read(root, clip):
+    t = pd.read_parquet(f".../keypoints/{root}/auto/{clip}.parquet")
+    t = t[t["detected"] & t["joint"].isin(JOINTS)]
+    return t[["frame_idx", "joint", "x", "y"]].rename(columns={"x": f"x_{root}", "y": f"y_{root}"})
+
+both = read("mediapipe_athlete", CLIP).merge(read("vision_athlete", CLIP), on=["frame_idx", "joint"])
+both = both.dropna()          # only frames both models attributed, with finite pixels
+both["d"] = np.hypot(both.x_mediapipe_athlete - both.x_vision_athlete,
+                     both.y_mediapipe_athlete - both.y_vision_athlete)
+per_joint = both.groupby("joint").d.median()
+per_joint.median()             # A: median of the eight per-joint medians
+both.d.median()                # B: pooled median over every row
+```
+
+**Say which of the two you quote.** They are not the same number, because one bad
+joint is one of eight rows pooled and one of eight medians, and per clip they
+differ by more than 5 px (`6508f9b355bd`: A = 12.9 px, B = 18.1 px, because its
+left ankle is ~280 px out in every frame). The numbers the issue for #76 asked
+for, per clip, as of that run (`--rotate auto`, 3 clips with Vision keypoints):
+
+| clip | A: median of per-joint medians | B: pooled median | worst joint (its median) |
+|---|---|---|---|
+| `057c9e6c96af` | 12.6 px | 12.0 px | `left_ankle` 160 px |
+| `64184de33f84` | 14.9 px | 13.6 px | `left_hip` 22 px, but `left_wrist` 240+ px in 51 of 275 frames (max 266) |
+| `6508f9b355bd` | 12.9 px | 18.1 px | `left_ankle` 282 px (>100 px in 195 of 195 rows) |
+
+The aggregate hides the shape of the disagreement: it is concentrated in **one
+leg**. In `057c9e6c96af` and `6508f9b355bd` the athlete's left ankle is far out
+while the other seven joints agree to ~10 px, and in `64184de33f84` the left
+wrist is 240+ px out in 51 frames (a further 47 frames are over 100 px) while the
+body agrees. That is the trainer's leg and the trainer's wrist being read as the
+athlete's — the trainer standing right behind them, inside **one** skeleton,
+which is why the contact rules (which need a *second* detection) cannot see it.

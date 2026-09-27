@@ -55,7 +55,11 @@ import numpy as np
 import pandas as pd
 from mediapipe.tasks.python import vision as mp_vision
 
-from handstand.athlete import ATHLETE_OUTPUT_DIRNAME, VISION_ATHLETE_OUTPUT_DIRNAME
+from handstand.athlete import (
+    ATHLETE_OUTPUT_DIRNAME,
+    SOURCE_VISION,
+    VISION_ATHLETE_OUTPUT_DIRNAME,
+)
 from handstand.paths import data_dir, videos_dir
 from handstand.pose_mediapipe import (
     JOINT_NAMES,
@@ -742,7 +746,12 @@ def producer_commands(
     The plain single-person parquets are one command. The athlete parquets are
     two — the multi-person keypoints they are selected from first, with their
     own flags — and the Vision athlete parquets are the Apple Vision import and
-    then the same selection run with ``--source vision``.
+    then the selection over them.
+
+    The flag a source is *read* with is not the flag the selection is *run*
+    with: overlay's ``vision_athlete`` is written by
+    ``handstand.athlete --source vision``, whose own ``--source`` values are
+    :data:`handstand.athlete.SOURCES`, so that is what the message names.
     """
     if source == DEFAULT_SOURCE:
         command = f"uv run python -m handstand.pose_mediapipe --rotate {mode}"
@@ -752,8 +761,8 @@ def producer_commands(
     if source == VISION_ATHLETE_SOURCE:
         return [
             f"uv run python -m handstand.vision_import --rotate {mode} --clips {clip_id}",
-            f"uv run python -m handstand.athlete --source {source} --rotate {mode} "
-            f"--clips {clip_id}",
+            "uv run python -m handstand.athlete "
+            f"--source {SOURCE_VISION} --rotate {mode} --clips {clip_id}",
         ]
     return [
         "uv run python -m handstand.pose_mediapipe "
