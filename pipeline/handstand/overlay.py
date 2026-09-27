@@ -55,7 +55,11 @@ import numpy as np
 import pandas as pd
 from mediapipe.tasks.python import vision as mp_vision
 
-from handstand.athlete import ATHLETE_OUTPUT_DIRNAME
+from handstand.athlete import (
+    ATHLETE_OUTPUT_DIRNAME,
+    SOURCE_VISION,
+    VISION_ATHLETE_OUTPUT_DIRNAME,
+)
 from handstand.paths import data_dir, videos_dir
 from handstand.pose_mediapipe import (
     JOINT_NAMES,
@@ -91,6 +95,7 @@ __all__ = [
     "FrameKeypoints",
     "OverlayReport",
     "PanelKeypoints",
+    "VISION_ATHLETE_SOURCE",
     "build_arg_parser",
     "caption_metrics",
     "draw_border",
@@ -104,6 +109,7 @@ __all__ = [
     "overlay_filename",
     "overlays_dir",
     "panel_parquet_path",
+    "producer_commands",
     "render_clip",
     "render_overlay",
     "require_parquet",
@@ -162,14 +168,19 @@ TRAINER_CONTACT_LABEL = "trainer contact"
 #: The column of the ``--source athlete`` parquets carrying that flag.
 CONTACT_COLUMN = "trainer_contact"
 
+#: ``--source`` value of the Apple Vision athlete selection, which is the
+#: ``handstand.athlete --source vision`` output (``docs/keypoint_schema.md``).
+VISION_ATHLETE_SOURCE = "vision_athlete"
+
 #: ``--source`` choices: which ``keypoints/`` root a panel is read from.
-SOURCES: tuple[str, ...] = ("mediapipe", "athlete")
+SOURCES: tuple[str, ...] = ("mediapipe", "athlete", VISION_ATHLETE_SOURCE)
 #: The plain single-person runner, unchanged from before the flag existed.
 DEFAULT_SOURCE = "mediapipe"
 #: ``--source`` value -> the directory name under ``<data_dir>/keypoints/``.
 SOURCE_DIRNAMES: dict[str, str] = {
     DEFAULT_SOURCE: SINGLE_OUTPUT_DIRNAME,
     "athlete": ATHLETE_OUTPUT_DIRNAME,
+    VISION_ATHLETE_SOURCE: VISION_ATHLETE_OUTPUT_DIRNAME,
 }
 
 #: Frames a video and a keypoint parquet may disagree by before the render fails.
@@ -727,6 +738,40 @@ def panel_parquet_path(
     return keypoints_root(data, source) / mode / f"{clip_id}.parquet"
 
 
+def producer_commands(
+    source: str, mode: str, clip_id: str, video_path: str | pathlib.Path | None = None
+) -> list[str]:
+    """The commands that generate a ``--source``'s keypoints, in the order to run.
+
+    The plain single-person parquets are one command. The athlete parquets are
+    two — the multi-person keypoints they are selected from first, with their
+    own flags — and the Vision athlete parquets are the Apple Vision import and
+    then the selection over them.
+
+    The flag a source is *read* with is not the flag the selection is *run*
+    with: overlay's ``vision_athlete`` is written by
+    ``handstand.athlete --source vision``, whose own ``--source`` values are
+    :data:`handstand.athlete.SOURCES`, so that is what the message names.
+    """
+    if source == DEFAULT_SOURCE:
+        command = f"uv run python -m handstand.pose_mediapipe --rotate {mode}"
+        if video_path is not None:
+            command += f' --clips "{video_path}"'
+        return [command]
+    if source == VISION_ATHLETE_SOURCE:
+        return [
+            f"uv run python -m handstand.vision_import --rotate {mode} --clips {clip_id}",
+            "uv run python -m handstand.athlete "
+            f"--source {SOURCE_VISION} --rotate {mode} --clips {clip_id}",
+        ]
+    return [
+        "uv run python -m handstand.pose_mediapipe "
+        f"--rotate {mode} --num-poses 3 --running-mode image "
+        "--min-detection 0.2 --min-presence 0.2",
+        f"uv run python -m handstand.athlete --rotate {mode} --clips {clip_id}",
+    ]
+
+
 def missing_parquet_message(
     clip_id: str,
     mode: str,
@@ -735,19 +780,8 @@ def missing_parquet_message(
     source: str = DEFAULT_SOURCE,
 ) -> str:
     """The error shown when a panel's keypoint parquet has not been generated yet."""
-    if source == DEFAULT_SOURCE:
-        steps = [f"cd pipeline && uv run python -m handstand.pose_mediapipe --rotate {mode}"]
-        if video_path is not None:
-            steps[0] += f' --clips "{video_path}"'
-    else:
-        # The athlete parquet is the second step: the multi-person keypoints it
-        # reads have to exist first, and that run needs its own flags.
-        steps = [
-            "cd pipeline && uv run python -m handstand.pose_mediapipe "
-            f"--rotate {mode} --num-poses 3 --running-mode image "
-            "--min-detection 0.2 --min-presence 0.2",
-            f"cd pipeline && uv run python -m handstand.athlete --rotate {mode} --clips {clip_id}",
-        ]
+    commands = producer_commands(source, mode, clip_id, video_path)
+    steps = [f"cd pipeline && {command}" for command in commands]
     return (
         f"no keypoints for clip {clip_id} in mode {mode!r}: {path}\n"
         "generate them first with:\n" + "\n".join(f"  {step}" for step in steps)
@@ -870,7 +904,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "which keypoints to draw: mediapipe is the plain single-person "
             "runner (default), athlete is the selection from handstand.athlete, "
-            "whose trainer-contact frames get a red border"
+            "vision_athlete the same selection over the Apple Vision keypoints "
+            "(handstand.athlete --source vision); the trainer-contact frames of "
+            "either athlete source get a red border"
         ),
     )
     parser.add_argument(

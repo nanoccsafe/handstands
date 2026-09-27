@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from handstand import overlay, paths
+from handstand import athlete, overlay, paths, pose_mediapipe, vision_import
 from handstand.pose_mediapipe import JOINT_NAMES, resolve_clip_id
 
 FRAME_COUNT = 20
@@ -29,6 +29,13 @@ FPS = 10
 PORTRAIT_WIDTH = 576
 PORTRAIT_HEIGHT = 1024
 PORTRAIT_FRAMES = 6
+
+#: The CLI of every module whose command a "generate them first" message names.
+RUNNERS = {
+    "handstand.pose_mediapipe": pose_mediapipe.build_arg_parser,
+    "handstand.vision_import": vision_import.build_arg_parser,
+    "handstand.athlete": athlete.build_arg_parser,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -823,7 +830,7 @@ def test_output_locations_live_under_the_data_dir() -> None:
 
 
 def test_the_athlete_source_reads_its_own_keypoints_root() -> None:
-    assert overlay.SOURCES == ("mediapipe", "athlete")
+    assert overlay.SOURCES == ("mediapipe", "athlete", "vision_athlete")
     assert overlay.DEFAULT_SOURCE == "mediapipe"
     assert overlay.source_dirname() == "mediapipe"
     assert overlay.source_dirname("mediapipe") == "mediapipe"
@@ -834,8 +841,61 @@ def test_the_athlete_source_reads_its_own_keypoints_root() -> None:
     assert overlay.panel_parquet_path("abc", "auto", "/data", "athlete") == pathlib.Path(
         "/data/keypoints/mediapipe_athlete/auto/abc.parquet"
     )
+    # The Apple Vision selection is its own root, one directory over vision_multi.
+    assert overlay.source_dirname("vision_athlete") == "vision_athlete"
+    assert overlay.keypoints_root("/data", "vision_athlete") == pathlib.Path(
+        "/data/keypoints/vision_athlete"
+    )
+    assert overlay.panel_parquet_path("abc", "auto", "/data", "vision_athlete") == pathlib.Path(
+        "/data/keypoints/vision_athlete/auto/abc.parquet"
+    )
     with pytest.raises(ValueError, match="unknown source"):
         overlay.source_dirname("everything")
+
+
+def test_missing_vision_athlete_parquet_error_names_both_commands(tmp_path: pathlib.Path) -> None:
+    """The Vision import first, then the selection run with ``--source vision``."""
+    path = tmp_path / "keypoints" / "vision_athlete" / "auto" / f"{CLIP_ID}.parquet"
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        overlay.require_parquet(CLIP_ID, "auto", tmp_path, source="vision_athlete")
+
+    message = str(excinfo.value)
+    assert f"python -m handstand.vision_import --rotate auto --clips {CLIP_ID}" in message
+    assert f"python -m handstand.athlete --source {athlete.SOURCE_VISION} --rotate auto" in message
+    assert f"--clips {CLIP_ID}" in message
+    assert str(path) in message
+
+
+def test_producer_commands_are_the_runner_then_the_selection() -> None:
+    assert overlay.producer_commands("mediapipe", "auto", "abc") == [
+        "uv run python -m handstand.pose_mediapipe --rotate auto"
+    ]
+    assert overlay.producer_commands("mediapipe", "auto", "abc", "/videos/x.mp4") == [
+        'uv run python -m handstand.pose_mediapipe --rotate auto --clips "/videos/x.mp4"'
+    ]
+    # The athlete sources need the multi-person keypoints their selection reads.
+    for source in ("athlete", "vision_athlete"):
+        assert len(overlay.producer_commands(source, "auto", "abc")) == 2
+
+
+def test_every_command_a_source_names_is_one_the_runner_accepts() -> None:
+    """The flag a panel is *read* with is not the flag the selection is *run* with.
+
+    ``--source vision_athlete`` is an overlay value; ``handstand.athlete``
+    accepts :data:`handstand.athlete.SOURCES`, so a message that named the
+    overlay value would send the reader to a command that exits 2.
+    """
+    assert overlay.producer_commands("vision_athlete", "auto", "abc")[1] == (
+        "uv run python -m handstand.athlete --source vision --rotate auto --clips abc"
+    )
+    for source in overlay.SOURCES:
+        for command in overlay.producer_commands(source, "auto", "abc"):
+            argv = command.split()[3:]  # "uv run python", then "-m module flags"
+            assert argv[0] == "-m", command
+            module, *rest = argv[1:]
+            # An unknown flag or an invalid choice exits 2 here, failing the test.
+            RUNNERS[module]().parse_args(rest)
 
 
 def test_missing_parquet_error_names_the_command(tmp_path: pathlib.Path) -> None:
