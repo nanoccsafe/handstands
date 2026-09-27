@@ -23,6 +23,7 @@ from handstand import labels, prelabel
 from handstand.frame_sampler import MANIFEST_COLUMNS
 from handstand.labels import LABEL_JOINTS, import_export
 from handstand.prelabel import (
+    JOINT_SEPARATOR,
     LABEL_COLUMNS,
     MODEL_VERSION,
     SCORE_THRESHOLD,
@@ -1197,6 +1198,76 @@ def test_image_uri_uses_a_file_uri_by_default(tmp_path: pathlib.Path) -> None:
 # --------------------------------------------------------------------------- #
 # Contact sheet
 # --------------------------------------------------------------------------- #
+
+
+def test_review_queue_puts_frames_with_no_prelabel_first(tmp_path: pathlib.Path) -> None:
+    """A frame with no pre-label is ranked ahead of every frame that has one.
+
+    It scores nothing on its own — no pose means no measurable disagreement — so
+    ranking it by the score alone sinks it to the bottom, where a labeler working
+    top to bottom would reach it last with nothing in the row to explain why. It
+    is also the frame with the most work on it: all 15 joints by hand.
+    """
+    path = write_review_queue(
+        [
+            _queue_row("worst_disagreement.jpg", 4.3, "nose"),
+            _queue_row("blank.jpg", 0.0, JOINT_SEPARATOR.join(LABEL_JOINTS)),
+            _queue_row("mild.jpg", 0.05, ""),
+        ],
+        tmp_path / "queue.csv",
+    )
+    images = [row["image"] for row in read_review(path)]
+    assert images == ["blank.jpg", "worst_disagreement.jpg", "mild.jpg"]
+
+
+def test_a_blank_frame_is_identifiable_from_the_columns_that_exist(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A row listing all 15 joints can only mean "there is no pre-label here"."""
+    prediction = _prediction(None)
+    assert prediction.has_prelabel is False
+    assert prediction.low_score_joints == tuple(LABEL_JOINTS)
+
+    # ...and that is exactly the string the queue writer would put in the cell.
+    path = write_review_queue(
+        [
+            {
+                **_queue_row("a.jpg", 0.0, ""),
+                "low_score_joints": JOINT_SEPARATOR.join(prediction.low_score_joints),
+            }
+        ],
+        tmp_path / "queue.csv",
+    )
+    row = read_review(path)[0]
+    assert row["low_score_joints"].split(JOINT_SEPARATOR) == list(LABEL_JOINTS)
+
+
+def test_a_frame_with_a_prelabel_does_not_claim_every_joint() -> None:
+    """The all-15 signal must not fire on an ordinary frame, or it means nothing."""
+    pose = PersonPose(
+        joints={name: (50.0, 20.0) for name in LABEL_JOINTS},
+        scores={name: 0.9 for name in LABEL_JOINTS},
+    )
+    prediction = _prediction(pose)
+    assert prediction.has_prelabel is True
+    assert prediction.low_score_joints == ()
+
+
+def test_review_queue_still_orders_by_disagreement_within_each_class(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The new first class must not have flattened the ordering underneath it."""
+    path = write_review_queue(
+        [
+            _queue_row("a.jpg", 0.10, ""),
+            _queue_row("blank.jpg", 0.0, JOINT_SEPARATOR.join(LABEL_JOINTS)),
+            _queue_row("b.jpg", 0.90, ""),
+            _queue_row("c.jpg", 0.50, ""),
+        ],
+        tmp_path / "queue.csv",
+    )
+    images = [row["image"] for row in read_review(path)]
+    assert images == ["blank.jpg", "b.jpg", "c.jpg", "a.jpg"]
 
 
 def test_contact_sheet_draws_a_grid_of_the_worst_frames(

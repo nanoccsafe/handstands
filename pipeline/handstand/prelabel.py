@@ -8,7 +8,7 @@ ONNX Runtime on the CPU) over every image
 be wrong at the top::
 
     <data_dir>/label_studio_prelabels.json   # one task per image, with "predictions"
-    <data_dir>/labels/review_queue.csv       # worst-first, with the reason
+    <data_dir>/labels/review_queue.csv       # frames needing a human, most work first
 
 The user then imports the tasks **with** their predictions into Label Studio
 (#13), corrects what is wrong and exports as usual — ``handstand.labels`` imports
@@ -70,11 +70,20 @@ models' points for the same joint — RTMPose, the MediaPipe athlete
 (:data:`handstand.overlay.SOURCES`) and the Vision athlete when it is there —
 divided by that frame's body length, so a tall athlete and a short one are
 judged on the same terms. ``worst_joint`` names the joint that disagreement was
-on. Rows are sorted by that disagreement plus
-:data:`LOW_SCORE_WEIGHT` times the share of joints RTMPose was unsure about, so a
-frame can reach the top either because two models put a joint in different
-places or because the pre-labels are missing joints the labeler has to find
-themselves.
+on. Read it as "these two models do not agree here", **not** as "this pre-label
+is wrong": on the top-queue frames it is often the contestant that followed the
+trainer's leg.
+
+The queue leads with the frames that have **no pre-label at all** — RTMPose found
+nobody, or the athlete reference rejected every body — because that is the case
+that would otherwise be missed. They are the most work (all 15 joints to place
+by hand) and the only one where the pre-label is *guaranteed* absent rather than
+merely doubtful, and a row listing all 15 joints in ``low_score_joints`` is how
+one is told apart inside the columns that exist. Ranking such a frame by its own
+numbers would bury it: no pose means no measurable disagreement, so it scores
+zero and sinks to the bottom of the queue with nothing in the row to say why.
+The rest are ordered by that disagreement plus :data:`LOW_SCORE_WEIGHT` times the
+share of joints RTMPose was unsure about.
 
 CLI::
 
@@ -127,6 +136,7 @@ __all__ = [
     "DEFAULT_ROTATE",
     "DEFAULT_VISION_SOURCE",
     "JOINT_MAP",
+    "JOINT_SEPARATOR",
     "LABEL_COLUMNS",
     "LOW_SCORE_WEIGHT",
     "MAX_REFERENCE_GAP",
@@ -947,8 +957,25 @@ class ImagePrediction:
 
     @property
     def low_score_joints(self) -> tuple[str, ...]:
-        """The joints the labeler has to place themselves."""
-        return () if self.pose is None else self.pose.low_score_joints
+        """The joints the labeler has to place themselves, in :data:`LABEL_JOINTS` order.
+
+        A frame with **no** pre-label at all — RTMPose found nobody, or the
+        athlete reference rejected every body it found — returns *every* labelled
+        joint, because that is the truth about the work: all 15 are the labeler's
+        to place. That is also what makes such a row identifiable in the review
+        queue from the columns that exist, since a row listing all 15 joints can
+        only mean "there is no pre-label here". Leaving it empty, as an earlier
+        version did, made these frames indistinguishable from a clean one and let
+        them sink to the bottom of the queue.
+        """
+        if self.pose is None:
+            return tuple(LABEL_JOINTS)
+        return self.pose.low_score_joints
+
+    @property
+    def has_prelabel(self) -> bool:
+        """Did any pre-label survive for this frame?"""
+        return self.pose is not None
 
 
 def keypoint_result(
@@ -1231,10 +1258,42 @@ def _review_score(max_disagreement: float, low_score_joints: Sequence[str]) -> f
     return max_disagreement + LOW_SCORE_WEIGHT * len(low_score_joints) / len(LABEL_JOINTS)
 
 
+def _review_key(row: Mapping[str, str]) -> tuple[int, float, str]:
+    """The order the labeler works in: no pre-label first, then worst-first.
+
+    Two classes of frame need a human, and they are not the same kind of problem.
+
+    A frame with **no** pre-label — RTMPose found nobody, or the athlete
+    reference rejected every body — is ranked ahead of everything else. It is the
+    only frame whose pre-label is *guaranteed* absent rather than merely
+    doubtful, and it is the most work: all 15 joints to place by hand. Ranking
+    it by its own numbers would bury it, because a frame with no pose has no
+    measurable disagreement at all and so scores zero. An earlier version did
+    exactly that and put all 19 of them at ranks 282-300, indistinguishable from a
+    clean frame in every column — a labeler working top to bottom would have
+    found out about them last, with nothing in the row to explain why.
+
+    Within each class the order is :func:`_review_score`: the disagreement
+    between the models, plus
+    :data:`LOW_SCORE_WEIGHT` for every labelled joint RTMPose was unsure about.
+    A frame rises either because two models put a joint in different places —
+    something is there and the models disagree about what — or because the
+    pre-labels are missing joints the labeler has to find themselves. Ties fall
+    back to the image name, so the same inputs always give the same file.
+    """
+    low = _split_joints(row.get("low_score_joints"))
+    has_prelabel = 0 if len(low) >= len(LABEL_JOINTS) else 1
+    return (
+        has_prelabel,
+        -_review_score(_as_float(row.get("max_disagreement")), low),
+        str(row.get("image", "")),
+    )
+
+
 def write_review_queue(
     rows: Sequence[Mapping[str, str]], path: str | pathlib.Path
 ) -> pathlib.Path:
-    """Write the review queue worst-first, atomically.
+    """Write the review queue in :func:`_review_key` order, atomically.
 
     Sorting here rather than at the call site means the file on disk is the
     order the labeler works in, whatever order the frames were predicted in, and
@@ -1243,15 +1302,7 @@ def write_review_queue(
     """
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = sorted(
-        rows,
-        key=lambda row: (
-            -_review_score(
-                _as_float(row.get("max_disagreement")), _split_joints(row.get("low_score_joints"))
-            ),
-            str(row.get("image", "")),
-        ),
-    )
+    ordered = sorted(rows, key=_review_key)
     handle, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temp_path = pathlib.Path(name)
     try:
@@ -1521,6 +1572,13 @@ def contact_sheet(
     rotated pass was used, and its disagreement), which is what makes a
     surprising skeleton explainable.
 
+    Queued frames with **no** pre-label are skipped rather than drawn as blank
+    tiles. They now sort to the very top of the queue (see :func:`_review_key`),
+    so taking the first N would show nothing but empty frames and the sheet would
+    say nothing about pre-label quality. A tile is a demonstration of a
+    pre-label, and a frame without one demonstrates nothing. How many were
+    skipped is the run's ``no_pose`` line, which reports the same count.
+
     Returns ``None`` when there is nothing to draw, rather than writing an empty
     image nobody asked for.
     """
@@ -1529,21 +1587,11 @@ def contact_sheet(
     loader = read_image or _read_image
     by_image = {str(task["data"]["image"]).rsplit("/", 1)[-1]: task for task in tasks}
 
-    ordered = sorted(
-        rows,
-        key=lambda row: (
-            -_review_score(
-                _as_float(row.get("max_disagreement")), _split_joints(row.get("low_score_joints"))
-            ),
-            str(row.get("image", "")),
-        ),
-    )
-    wanted = min(len(ordered), columns * rows_wanted)
-    if wanted <= 0:
-        return None
-
+    wanted = columns * rows_wanted
     tiles: list[np.ndarray] = []
-    for row in ordered[:wanted]:
+    for row in sorted(rows, key=_review_key):
+        if len(tiles) >= wanted:
+            break
         name = str(row["image"])
         image = loader(pathlib.Path(frames_dir) / name)
         if image is None:
@@ -1560,8 +1608,9 @@ def contact_sheet(
                 _percent_to_pixels(value["x"], value["y"], image.shape[1], image.shape[0])
             )
             scores[joint] = 1.0
-        if joints:
-            image = draw_pose(image, joints, scores, min_visibility=0.0)
+        if not joints:
+            continue
+        image = draw_pose(image, joints, scores, min_visibility=0.0)
         tiles.append(
             draw_caption(
                 image,
@@ -1720,7 +1769,8 @@ def summarise(report: PrelabelReport) -> str:
     lines += [
         f"  {report.with_disagreement} frame(s) have a measurable disagreement; "
         f"{report.mean_low_score_joints:.1f} joint(s) per frame left for the labeler",
-        f"  review queue: {report.review_path} (worst first)",
+        f"  review queue: {report.review_path} "
+        f"({report.no_pose} frame(s) with no pre-label first, then worst first)",
     ]
     lines += [f"  fail {name}: {reason}" for name, reason in report.failures]
     return "\n".join(lines)

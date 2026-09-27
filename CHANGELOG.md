@@ -17,7 +17,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   athlete, not bounding-box overlap: a crouching trainer's box can overlap the
   athlete's more than the athlete's own inverted skeleton does, which pre-labelled
   the trainer on 20 of 300 frames. Keypoint matching plus writing no pre-label at
-  all where the reference rejects every detection brings that to 0/300 (#77)
+  all where the reference rejects every detection brings that to 0/300, and those
+  19 no-pre-label frames lead the review queue instead of sinking to the bottom —
+  they are identifiable inside the specified columns by `low_score_joints`
+  listing all 15 joints (#77)
 - Athlete selection for the Apple Vision keypoints: `handstand.athlete --source
   vision` runs the same athlete and trainer-contact rules over `vision_multi/`
   and writes `vision_athlete/` in the same schema, so the bake-off compares the

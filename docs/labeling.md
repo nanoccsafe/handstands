@@ -93,8 +93,8 @@ pre-labelled 300 frame(s) with RTMPose in 142s
   19 frame(s) have a reference athlete that rejected every body RTMPose found
   (usually only the trainer was detected), so they are written with no pre-label
   at all; 19 frame(s) in total are left for the labeler
-  281 frame(s) have a measurable disagreement; 0.0 joint(s) per frame left for the labeler
-  review queue: .../data/labels/review_queue.csv (worst first)
+  281 frame(s) have a measurable disagreement; 1.0 joint(s) per frame left for the labeler
+  review queue: .../data/labels/review_queue.csv (19 frame(s) with no pre-label first, then worst first)
 ```
 
 On the full 300-frame sample that is **under three minutes** of compute for
@@ -107,7 +107,7 @@ Two files come out:
 | file | what it is |
 | --- | --- |
 | `data/label_studio_prelabels.json` | one Label Studio task per image, each with a `predictions` entry holding the model's points |
-| `data/labels/review_queue.csv` | the same frames, worst first, with the reason each is doubtful |
+| `data/labels/review_queue.csv` | the same frames in the order to work them: the ones with no pre-label first, then the doubtful ones worst-first |
 
 Useful flags: `--mode lightweight|balanced|performance` (the RTMPose
 detector/pose pair; `balanced` is the default), `--limit N` for a quick pass,
@@ -201,10 +201,17 @@ Two further consequences for you as the labeler:
 * A frame with **no** pre-label is not necessarily a frame the model failed on —
   it may be a frame where the reference refused every detection. Label it from
   scratch.
-* All the wrong-body frames land at the **top of the review queue**, because a
-  skeleton on the wrong person disagrees with the MediaPipe athlete violently.
-  But see above: a large `max_disagreement` is not by itself evidence that the
-  *pre-label* is wrong.
+* **How to find them: they are the top of the review queue**, and their row lists
+  all 15 joints in `low_score_joints` — a row that names every joint can only
+  mean there is no pre-label. They are ranked first deliberately. A frame with no
+  pre-label has no measurable disagreement, so ranking it by that number alone
+  put all 19 at the bottom (ranks 282–300) with `max_disagreement` `0.0000` and
+  nothing in the row to say why. They are at the top now because they are the
+  frames with the most work on them — all 15 joints by hand — and the only case
+  where the pre-label is *guaranteed* absent rather than merely doubtful.
+* The remaining 281 frames are ordered by `max_disagreement`. Read that as "these
+  two models do not agree here", not as "this pre-label is wrong": on the
+  top-queue frames it is often the contestant that followed the trainer's leg.
 
 ### The rotated pass, and how often it wins
 
@@ -218,22 +225,39 @@ model change cannot quietly start feeding the labeler the wrong orientation.
 
 ### The review queue
 
-`max_disagreement` is, per frame, the largest distance between any two models'
-points for the same joint — RTMPose, the MediaPipe athlete, and the Vision
-athlete when its selection exists — divided by that frame's body length, so a
-tall and a short athlete are judged on the same terms. `worst_joint` names the
-joint. Rows are sorted by that disagreement plus a penalty for every joint RTMPose
-was unsure about, so a frame reaches the top either because two models put a
-joint in different places or because the pre-labels are missing joints you have
-to find yourself.
+The queue has two classes of frame, and the first one is not about a pre-label
+being *wrong* but about there being none at all.
+
+**Ranks 1 to 19 — no pre-label.** RTMPose found nobody, or the athlete reference
+rejected every body it found. All 15 joints are yours to place by hand. These are
+the frames with the most work on them and the only ones whose pre-label is
+*guaranteed* absent, so they lead. Their row lists all 15 joints in
+`low_score_joints`; a row that names every joint can only mean there is no
+pre-label, which is how you spot one without needing a ninth column.
+
+**Ranks 20 to 300 — a pre-label that may be wrong.** `max_disagreement` is the
+largest distance between any two models' points for the same joint — RTMPose, the
+MediaPipe athlete, and the Vision athlete when its selection exists — divided by
+that frame's body length, so a tall and a short athlete are judged on the same
+terms. `worst_joint` names that joint. Rows are sorted by that disagreement plus a
+penalty for every joint RTMPose was unsure about, so a frame rises either because
+two models put a joint in different places or because the pre-labels are missing
+joints you have to find yourself. Read it as "these two models do not agree
+here", **not** as "this pre-label is wrong" — see above.
+
+The split is deliberate, and it was not the first attempt. Sorting purely by
+`max_disagreement` put the 19 no-pre-label frames at ranks 282–300, because a
+frame with no pose has no measurable disagreement and so scores zero — the exact
+frames needing the most attention sorted last, with `max_disagreement` `0.0000`
+and empty columns making them indistinguishable from a clean frame.
 
 | column | meaning |
 | --- | --- |
 | `image`, `clip_id`, `frame_idx` | which frame |
 | `stratum` | from the sampler manifest: `clean_no_trainer`, `clean_trainer`, `trainer_contact` |
-| `max_disagreement` | worst joint gap, in body lengths |
-| `worst_joint` | which joint that gap was on |
-| `low_score_joints` | `;`-separated joints RTMPose scored below 0.3 — yours to place |
+| `max_disagreement` | worst joint gap, in body lengths; `0.0000` on a no-pre-label frame, which does not mean "they agree" but "there is nothing to compare" |
+| `worst_joint` | which joint that gap was on; empty when there is no gap |
+| `low_score_joints` | `;`-separated joints you must place: those RTMPose scored below 0.3, **or all 15 on a frame with no pre-label at all** |
 | `rotated_used` | `true` when the rotated pass won |
 
 The Vision athlete has only been generated for a couple of clips so far, so most
@@ -303,21 +327,29 @@ If you would rather serve the frames over HTTP, re-run the pre-labeller with
 instead.
 
 Check the pre-labels arrived by opening one task: it should show a skeleton
-already drawn. If a task is blank, `data/labels/review_queue.csv` tells you why
-— `low_score_joints` lists what the model was unsure about, and a frame with
-nobody in it is simply empty.
+already drawn. A blank task is expected on 19 of the 300 frames — the
+pre-labeller wrote no pre-label for those, because RTMPose found nobody or the
+athlete reference refused every body it found. It does not tell you *which* of
+the two happened (nothing in a Label Studio task could), so the review queue
+carries the signal instead: those 19 frames are **ranks 1 and up**, and each row
+lists all 15 joints in `low_score_joints`. Start there.
 
 ## 5. Label
 
-Work through `data/labels/review_queue.csv` **top to bottom** — it is sorted so
-the frames whose pre-labels are most likely wrong come first, which is where a
-correction is worth the most. Match each row to its image by the `image`
-column, and use the other columns as the hint they are:
+Work through `data/labels/review_queue.csv` **top to bottom**. The first rows are
+the frames with **no pre-label at all** — all 15 joints for you to place, the most
+work in the queue. After those come the frames whose pre-labels most likely need
+correcting, worst first, which is where a correction is worth the most. Match
+each row to its image by the `image` column, and use the other columns as the hint
+they are:
 
+* `low_score_joints` — the joints you must place. It lists all 15 on a frame with
+  no pre-label; otherwise it names the ones RTMPose was unsure about, which got
+  no point drawn for them.
 * `max_disagreement` / `worst_joint` — two models put this joint in different
-  places. Check it first.
-* `low_score_joints` — RTMPose was unsure about these, so no point was drawn for
-  them. Place them yourself, or leave them out if you cannot see them.
+  places. Check it first, but read it as "the models disagree", not as "this
+  point is wrong": on these frames it is often the other model that followed the
+  trainer's leg.
 * `stratum` — `trainer_contact` frames are the hard ones by construction.
 * `rotated_used` — the pre-labels came from the model looking at the frame
   upside down, which is the normal case for a hold.
