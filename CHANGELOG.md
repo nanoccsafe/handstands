@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Frame sampler + Label Studio setup for keypoint labelling: a stratified sample
+  of frames to label, the labelling config, and an importer that turns a Label
+  Studio export into display-frame keypoint pixels (#65)
 - Catalogue every handstand video with ffprobe into a CSV to annotate by hand
   (`uv run python -m handstand.catalogue`), safe to re-run without losing
   annotations (#8)

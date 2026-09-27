@@ -1,0 +1,40 @@
+<View>
+  <Header value="Label the athlete's joints: nose, both shoulders, elbows, wrists, hips, knees, ankles and toes (foot_index). left/right is the ATHLETE's own left and right, not the left and right of the picture. Do not label the trainer."/>
+  <Text name="rule_visibility" value="A joint you cannot see gets NO point: a missing point means not visible, and the scorer counts it as such. Do not guess where a hidden joint would be. If the whole frame is unusable, say so in the choice at the bottom."/>
+  <Image name="image" value="$image" zoom="true" zoomControl="true"/>
+  <!--
+    The label values are the MediaPipe joint names from
+    pipeline/handstand/pose_mediapipe.py JOINT_NAMES, unchanged: the converter
+    matches them against that list, so a renamed joint here is an unlabelled
+    joint there.
+
+    Label Studio has no per-keypoint visibility (checked against 1.23.1, the
+    current release: KeyPointLabels takes name, toName, choice, maxUsages,
+    showInline, opacity, strokeWidth and snap, and nothing else). That is why the
+    rule above asks for a missing point rather than a flag. If a later version
+    adds one, it will appear as an extra Choice inside this tag and the import
+    (handstand/labels.py) already reads value.occluded / value.visible.
+  -->
+  <KeyPointLabels name="keypoints" toName="image" choice="single" maxUsages="1" strokeWidth="3" opacity="0.7">
+    <Choice value="nose"/>
+    <Choice value="left_shoulder"/>
+    <Choice value="right_shoulder"/>
+    <Choice value="left_elbow"/>
+    <Choice value="right_elbow"/>
+    <Choice value="left_wrist"/>
+    <Choice value="right_wrist"/>
+    <Choice value="left_hip"/>
+    <Choice value="right_hip"/>
+    <Choice value="left_knee"/>
+    <Choice value="right_knee"/>
+    <Choice value="left_ankle"/>
+    <Choice value="right_ankle"/>
+    <Choice value="left_foot_index"/>
+    <Choice value="right_foot_index"/>
+  </KeyPointLabels>
+  <Choices name="occluded_or_unsure" toName="image" choice="single" showInline="false" required="true">
+    <Choice value="clear"/>
+    <Choice value="occluded"/>
+    <Choice value="unsure"/>
+  </Choices>
+</View>
