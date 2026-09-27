@@ -44,4 +44,10 @@ fi
 git push -q
 "$(dirname "$0")/stop.sh" "$name" --clean
 chainlink -q issue close "$issue" || echo "note: could not close chainlink issue #$issue" >&2
+# Closing the issue appends to CHANGELOG.md; commit and push that too so main is left clean.
+if ! git diff --quiet -- CHANGELOG.md; then
+  git add CHANGELOG.md
+  git commit -q -m "CHANGELOG: close #$issue" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+  git push -q
+fi
 echo "merged $name into main, pushed, cleaned up, closed #$issue"

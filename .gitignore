@@ -41,3 +41,6 @@ pipeline/models/
 
 # Worker task prompt copied into each worktree
 .worker-prompt.md
+
+# uv temp lock files
+uv-*.lock
