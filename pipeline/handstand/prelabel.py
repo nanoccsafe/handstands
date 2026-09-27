@@ -46,12 +46,16 @@ An inverted body is what pose models are worst at, and the map-back is the same
 exact formula the MediaPipe runner uses (:func:`handstand.rotation.inverse_rotate_points`),
 so a rotated prediction lands in the same pixels as an upright one.
 
-When RTMPose finds more than one person, the athlete is the one whose box best
-overlaps the MediaPipe athlete of the same frame
-(:func:`select_person`) — the selection ``handstand.athlete`` already made for
-this very frame, so the two models are compared on the same body. Without a
-reference the most confident person is taken and the frame is marked as having
-no reference.
+When RTMPose finds more than one person, the athlete is the one whose **keypoints**
+agree best with the MediaPipe athlete of the same frame (:func:`select_person`) —
+the selection ``handstand.athlete`` already made for this very frame, so the two
+models are compared on the same body. Keypoints and not bounding boxes, because
+two people standing together overlap in both directions: on 6508f9b355bd_1 a
+crouching trainer's box scores 0.41 IoU against the athlete's box while the
+athlete's own skeleton scores 0.17, so ranking by box pre-labels the trainer —
+the one person the labelling config forbids. A frame where a reference exists and
+*every* detected body is far from it gets **no** pre-label at all, because
+"the nearest of the wrong bodies" is not a useful thing to hand a labeler.
 
 **Points RTMPose scored below** :data:`SCORE_THRESHOLD` are **not** written.
 A guessed point is worse than no point: the labelling rule asks a labeler to
@@ -125,11 +129,18 @@ __all__ = [
     "JOINT_MAP",
     "LABEL_COLUMNS",
     "LOW_SCORE_WEIGHT",
+    "MAX_REFERENCE_GAP",
+    "MIN_SHARED_JOINTS",
     "MODES",
     "MODELS_DIRNAME",
     "MODEL_VERSION",
+    "NO_MATCH",
+    "NO_PERSON",
     "PERCENT_DIGITS",
+    "PRELABELS_FILENAME",
+    "REFERENCE_SOURCES",
     "REVIEW_FILENAME",
+    "RTMPOSE_INDEX",
     "SCORE_THRESHOLD",
     "Detection",
     "ImagePrediction",
@@ -142,6 +153,7 @@ __all__ = [
     "contact_sheet",
     "image_uri",
     "keypoint_result",
+    "keypoint_gap",
     "landmarks_block",
     "load_manifest",
     "main",
@@ -152,6 +164,7 @@ __all__ = [
     "predict_frame",
     "prelabel",
     "rotate_box_180",
+    "rotate_pose_180",
     "run_model",
     "select_person",
     "summarise",
@@ -303,6 +316,9 @@ DEFAULT_CONTACT_SHEET = CONTACT_SHEET_COLUMNS * CONTACT_SHEET_ROWS
 TRUE = "true"
 FALSE = "false"
 
+#: ``Detection.person_index`` when nobody was detected at all. Distinct from
+#: :data:`NO_MATCH`, which means a reference existed and rejected every body.
+NO_PERSON = -1
 #: A body length that came out at the floor was never measured; see
 #: :func:`handstand.athlete.body_length`.
 UNMEASURED_BODY_LENGTH = athlete_module.MIN_BODY_LENGTH_PIXELS
@@ -618,10 +634,27 @@ class Detection:
 
     @property
     def pose(self) -> PersonPose | None:
-        """The person that was taken, or ``None`` when nobody was found."""
+        """The person that was taken, or ``None`` when nobody was taken.
+
+        ``None`` covers three different situations, which the run counts
+        separately: nobody was detected (:data:`NO_PERSON`), the reference
+        rejected every body (:data:`NO_MATCH`), or nobody was detected at all in
+        the other orientation. Only the first two are worth telling apart, and
+        :attr:`rejected` does that.
+        """
         if not self.people or not 0 <= self.person_index < len(self.people):
             return None
         return self.people[self.person_index]
+
+    @property
+    def rejected(self) -> bool:
+        """Did a reference exist and refuse every body RTMPose found?
+
+        The frame is then left with **no** pre-label on purpose: the reference is
+        the athlete, every detected body is some distance from the athlete, and
+        writing down the nearest of them is how the trainer gets labelled.
+        """
+        return self.person_index == NO_MATCH
 
     @property
     def mean_score(self) -> float:
@@ -687,45 +720,144 @@ def _into_display(detection: Detection, width: int, height: int) -> Detection:
 def _map_back_joints(
     joints: Mapping[str, tuple[float, float]], width: int, height: int
 ) -> dict[str, tuple[float, float]]:
-    """One person's joints out of the rotated frame and back into the display one."""
-    points = np.asarray(
-        [joints[name] for name in LABEL_JOINTS], dtype=np.float64
-    ).reshape(-1, 2)
+    """One person's joints out of the rotated frame and back into the display one.
+
+    Maps whatever joints the pose actually has, in its own order. A MediaPipe
+    reference carries only the joints it measured well, so assuming the full
+    15 would raise on a frame where the model dropped a knee.
+    """
+    names = list(joints)
+    if not names:
+        return {}
+    points = np.asarray([joints[name] for name in names], dtype=np.float64).reshape(-1, 2)
     mapped = _map_back(points, width, height)
-    return {
-        name: (float(x), float(y)) for name, (x, y) in zip(LABEL_JOINTS, mapped, strict=True)
-    }
+    return {name: (float(x), float(y)) for name, (x, y) in zip(names, mapped, strict=True)}
+
+
+#: Fewest joints two poses must share before their keypoints can be compared at
+#: all. Below this the "agreement" would be one coincidence, not a body.
+MIN_SHARED_JOINTS = 4
+#: A candidate whose keypoints sit further than this from the reference's, in
+#: body lengths, is not accepted as a match however well its box overlaps. Below
+#: that bar the reference is treated as having identified nobody, and a frame
+#: with a reference but no match writes **no** pre-label rather than the most
+#: confident body — see :func:`select_person`.
+MAX_REFERENCE_GAP = 0.35
+#: ``Detection.person_index`` when a reference existed and rejected every body.
+#: Distinct from :data:`NO_PERSON` ("nobody was detected") and from a real index.
+NO_MATCH = -2
+
+
+def keypoint_gap(pose: PersonPose, reference: PersonPose, length: float) -> float:
+    """How far a candidate's joints sit from the reference's, in body lengths.
+
+    The **median** distance over the joints both poses measured, which is the
+    same shape of measure :func:`handstand.athlete.same_body` uses to decide
+    whether two detections are one body. The median rather than the mean because
+    a handstand's feet are often a long way from where either model puts them
+    while every other joint agrees, and one bad pair must not decide identity.
+
+    NaN when the two share fewer than :data:`MIN_SHARED_JOINTS` joints: there is
+    then no evidence, rather than thin evidence.
+    """
+    if not math.isfinite(length) or length <= 0.0:
+        return float("nan")
+    shared = [
+        joint for joint in LABEL_JOINTS if pose.usable(joint) and reference.usable(joint)
+    ]
+    if len(shared) < MIN_SHARED_JOINTS:
+        return float("nan")
+    distances = sorted(
+        math.hypot(
+            pose.joints[joint][0] - reference.joints[joint][0],
+            pose.joints[joint][1] - reference.joints[joint][1],
+        )
+        for joint in shared
+    )
+    middle = len(distances) // 2
+    median = (
+        distances[middle]
+        if len(distances) % 2
+        else (distances[middle - 1] + distances[middle]) / 2.0
+    )
+    return median / length
+
+
+def rotate_pose_180(pose: PersonPose | None, width: int, height: int) -> PersonPose | None:
+    """A reference pose turned 180°, for matching the rotated pass.
+
+    The reference is measured in the frame the labeler sees and the rotated pass
+    is matched in the frame the model saw, so the reference has to be turned with
+    the picture. Rotating a pose is the same map-back the points themselves get.
+    """
+    if pose is None:
+        return None
+    return PersonPose(
+        joints=_map_back_joints(pose.joints, width, height), scores=dict(pose.scores)
+    )
 
 
 def select_person(
-    people: Sequence[PersonPose], reference_box: tuple[float, float, float, float] | None
+    people: Sequence[PersonPose],
+    reference: PersonPose | None = None,
+    reference_box: tuple[float, float, float, float] | None = None,
 ) -> Detection:
     """Which of the people RTMPose found is the athlete.
 
-    With a ``reference_box`` — the bounding box of the MediaPipe athlete of this
-    very frame, so the two models are compared on the same body — the winner is
-    the person whose box overlaps it most (:func:`handstand.athlete.box_iou`, the
-    measure the athlete module itself uses). A reference that overlaps nobody at
-    all is not evidence, so the most confident person is taken instead and
-    ``athlete_reference`` is ``False``: the frame is then ranked on RTMPose's own
-    confidence rather than pretended to be a reference match.
+    With a ``reference`` — the MediaPipe athlete of this very frame, as its own
+    joints — the winner is the person whose **keypoints** agree with it best
+    (:func:`keypoint_gap`). Box overlap is the tie-break, not the decision.
 
-    Without a reference at all the most confident person is taken for the same
-    reason. Ties keep the model's own order, so the choice is deterministic.
+    This ordering is the whole point, and it is the opposite of the obvious one.
+    Two people standing together overlap in *both* directions: a trainer
+    crouching beside a handstand can cover more of the athlete's bounding box
+    than the athlete's own thin, inverted skeleton does. On 6508f9b355bd_1 the
+    trainer's squat scored 0.41 IoU against the athlete's own 0.17, so ranking
+    by box picked the trainer and pre-labelled the one person the labelling
+    config says not to label. Keypoints cannot make that mistake: the trainer's
+    feet are side by side on the floor and the athlete's are 320 px apart, and
+    no amount of box overlap hides it.
+
+    ``reference_box`` is the athlete's bounding box, kept for the tie-break.
+
+    A reference that *no* candidate's keypoints come close to is a different
+    failure from having no reference at all, and it is not papered over. When the
+    MediaPipe athlete exists and every body RTMPose found is further than
+    :data:`MAX_REFERENCE_GAP` from it, nobody is taken: ``person_index`` is -1, so
+    :func:`build_task` writes an empty result and the frame is asked for by hand
+    rather than pre-labelled with a body the labelling config forbids. That
+    happens when RTMPose's detector found only the trainer — 14 of the 17
+    wrong-body frames on the 300-frame sample — and the honest answer is "this
+    frame has no usable pre-label", not "here is the most confident person, who
+    is the wrong person". A frame with no reference at all still falls back to the
+    most confident body, because there is nothing there to contradict.
+
+    Ties keep the model's own order, so the choice is deterministic.
     """
     if not people:
-        return Detection(people=(), person_index=-1, athlete_reference=False)
+        return Detection(people=(), person_index=NO_PERSON, athlete_reference=False)
 
-    if reference_box is not None:
-        overlaps = []
-        for person in people:
-            box = person_box(person.joints, person.scores)
-            overlaps.append(0.0 if box is None else athlete_module.box_iou(box, reference_box))
-        best = max(range(len(people)), key=lambda index: (overlaps[index], -index))
-        if overlaps[best] > 0.0:
-            return Detection(
-                people=tuple(people), person_index=best, athlete_reference=True
-            )
+    if reference is not None:
+        length = athlete_module.body_length(reference.to_landmarks())
+        if length > UNMEASURED_BODY_LENGTH:
+            ranked: list[tuple[float, float, int]] = []
+            for index, person in enumerate(people):
+                gap = keypoint_gap(person, reference, length)
+                box = person_box(person.joints, person.scores)
+                overlap = (
+                    0.0
+                    if reference_box is None or box is None
+                    else athlete_module.box_iou(box, reference_box)
+                )
+                # A NaN gap must never win, so it is pushed to the far end of
+                # the ordering rather than compared as a number.
+                ranked.append((gap if math.isfinite(gap) else math.inf, -overlap, index))
+            # Lower gap first, then higher box overlap, then the model's own order.
+            ranked.sort()
+            best_gap, _, best = ranked[0]
+            if best_gap <= MAX_REFERENCE_GAP:
+                return Detection(people=tuple(people), person_index=best, athlete_reference=True)
+            return Detection(people=tuple(people), person_index=NO_MATCH, athlete_reference=False)
 
     best_confident = max(range(len(people)), key=lambda index: (people[index].mean_score, -index))
     return Detection(people=tuple(people), person_index=best_confident, athlete_reference=False)
@@ -749,6 +881,7 @@ def predict_frame(
     model: PoseModel,
     image: np.ndarray,
     *,
+    reference: PersonPose | None = None,
     reference_box: tuple[float, float, float, float] | None = None,
 ) -> tuple[Detection, bool]:
     """Predict one frame: upright and rotated, athlete chosen, better one kept.
@@ -759,22 +892,26 @@ def predict_frame(
     anything is compared, so both passes end up speaking the frame's own
     coordinates.
 
-    ``reference_box`` is the athlete's box in **display** pixels, and it is the
+    ``reference`` is the athlete as a pose in **display** pixels, and it is the
     only reference the caller supplies. Each pass is matched against the
     reference *as it appears in the frame that pass was given* — the upright one
-    against the box, the rotated one against :func:`rotate_box_180` of it — and
+    against the pose, the rotated one against :func:`rotate_pose_180` of it — and
     the rotated poses are only mapped home afterwards. Matching a rotated pose
-    against an unrotated box would put the athlete's own body nowhere near it.
+    against an unrotated reference would put the athlete's own body nowhere near
+    it, and say they were the same person in the wrong place.
     """
     height, width = int(image.shape[0]), int(image.shape[1])
     rotated_image = apply_display_rotation(image, 180)
 
     upright_people, _ = run_model(model, image)
-    upright = select_person(upright_people, reference_box)
+    upright = select_person(upright_people, reference, reference_box)
 
     rotated_people, _ = run_model(model, rotated_image)
+    rotated_box = rotate_box_180(reference_box, width, height)
     rotated = _into_display(
-        select_person(rotated_people, rotate_box_180(reference_box, width, height)),
+        select_person(
+            rotated_people, rotate_pose_180(reference, width, height), rotated_box
+        ),
         width,
         height,
     )
@@ -926,25 +1063,55 @@ class PanelCache:
         panel = self.panel(source, clip_id)
         return None if panel is None else panel.frame(frame_idx)
 
+    def labelled(
+        self, source: str, clip_id: str, frame_idx: int
+    ) -> tuple[dict[str, tuple[float, float]], dict[str, float]]:
+        """One frame's :data:`LABEL_JOINTS` and their visibilities, as a pose's halves.
+
+        Only the 15 joints the labelling config asks for, and only those the
+        source measured at :data:`handstand.athlete.CONTACT_MIN_VISIBILITY` and
+        above: a joint MediaPipe only guessed is not evidence about *which* of
+        two bodies is the athlete, and using it would let a trainer's
+        hallucinated ankle count as agreement.
+        """
+        frame = self.frame(source, clip_id, frame_idx)
+        if frame is None or not frame.detected:
+            return {}, {}
+        joints: dict[str, tuple[float, float]] = {}
+        scores: dict[str, float] = {}
+        for name in LABEL_JOINTS:
+            if name not in frame.joints_xy:
+                continue
+            score = frame.visibility.get(name, float("nan"))
+            if not math.isfinite(score) or score < athlete_module.CONTACT_MIN_VISIBILITY:
+                continue
+            x, y = frame.joints_xy[name]
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            joints[name] = (float(x), float(y))
+            scores[name] = float(score)
+        return joints, scores
+
+    def pose(self, source: str, clip_id: str, frame_idx: int) -> PersonPose | None:
+        """One frame's athlete as a :class:`PersonPose`, or ``None`` when absent.
+
+        This is the reference :func:`select_person` matches candidates against. A
+        pose with no usable joint is no reference at all.
+        """
+        joints, scores = self.labelled(source, clip_id, frame_idx)
+        return PersonPose(joints=joints, scores=scores) if joints else None
+
     def box(self, source: str, clip_id: str, frame_idx: int) -> tuple[
         float, float, float, float
     ] | None:
         """One frame's box around the :data:`LABEL_JOINTS`, or ``None``.
 
-        The box is measured over the 15 labelled joints rather than the whole
-        keypoint set so it is comparable with :func:`person_box`.
+        Measured over the same 15 joints :meth:`pose` uses, so the box is
+        comparable with :func:`person_box`. Kept for the tie-break in
+        :func:`select_person`; identity itself is decided on keypoints.
         """
-        frame = self.frame(source, clip_id, frame_idx)
-        if frame is None or not frame.detected:
-            return None
-        joints = {name: frame.joints_xy[name] for name in LABEL_JOINTS if name in frame.joints_xy}
-        scores = {
-            name: frame.visibility.get(name, float("nan"))
-            for name in joints
-            if math.isfinite(frame.visibility.get(name, float("nan")))
-            and frame.visibility[name] >= athlete_module.CONTACT_MIN_VISIBILITY
-        }
-        return person_box(joints, scores)
+        joints, scores = self.labelled(source, clip_id, frame_idx)
+        return person_box(joints, scores) if joints else None
 
 
 # --------------------------------------------------------------------------- #
@@ -1134,6 +1301,10 @@ class PrelabelReport:
     detected: int
     rotated: int
     with_reference: int
+    #: Frames where a reference athlete existed and rejected every body RTMPose
+    #: found, so no pre-label was written at all. Usually the detector saw only
+    #: the trainer; these frames are handed to the labeler empty on purpose.
+    rejected: int
     failures: list[tuple[str, str]]
     prelabels_path: pathlib.Path
     review_path: pathlib.Path
@@ -1236,6 +1407,7 @@ def prelabel(
     predictions: list[ImagePrediction] = []
     failures: list[tuple[str, str]] = []
     detected = rotated = with_reference = with_disagreement = no_pose = 0
+    rejected = 0
 
     for index, row in enumerate(entries, start=1):
         name = str(row["image"])
@@ -1247,11 +1419,14 @@ def prelabel(
         height, width = int(image.shape[0]), int(image.shape[1])
         clip_id = str(row["clip_id"])
         frame_idx = int(row["frame_idx"])
-        reference = cache.box(ATHLETE_SOURCE, clip_id, frame_idx)
+        reference = cache.pose(ATHLETE_SOURCE, clip_id, frame_idx)
+        reference_box = cache.box(ATHLETE_SOURCE, clip_id, frame_idx)
 
         frame_started = time.perf_counter()
         try:
-            detection, rotated_used = predict_frame(model, image, reference_box=reference)
+            detection, rotated_used = predict_frame(
+                model, image, reference=reference, reference_box=reference_box
+            )
         except (ValueError, RuntimeError) as error:
             failures.append((name, f"{type(error).__name__}: {error}"))
             continue
@@ -1275,6 +1450,7 @@ def prelabel(
         tasks.append(build_task(name, image_uri(path, image_base), prediction))
         detected += int(pose is not None)
         no_pose += int(pose is None)
+        rejected += int(detection.rejected)
         rotated += int(rotated_used)
         with_reference += int(detection.athlete_reference)
 
@@ -1305,6 +1481,7 @@ def prelabel(
         detected=detected,
         rotated=rotated,
         with_reference=with_reference,
+        rejected=rejected,
         failures=failures,
         prelabels_path=prelabels_out,
         review_path=review_out,
@@ -1527,10 +1704,20 @@ def summarise(report: PrelabelReport) -> str:
         f"pre-labelled {report.images} frame(s) with RTMPose in {report.runtime_seconds:.0f}s",
         f"  model: {MODEL_VERSION} ({report.mode}); wrote {report.prelabels_path}",
         f"  found somebody in {report.detected}/{report.images} "
-        f"({report.detected_percent:.1f} %), {report.no_pose} frame(s) left for the labeler",
-        f"  rotated pass won {report.rotated}/{report.images} "
-        f"({report.rotated_percent:.1f} %); athlete reference used in "
-        f"{report.with_reference}",
+        f"({report.detected_percent:.1f} %)",
+        f"  rotated pass won {report.rotated}/{report.images} ({report.rotated_percent:.1f} %); "
+        f"athlete reference used in {report.with_reference}",
+    ]
+    if report.rejected:
+        lines.append(
+            f"  {report.rejected} frame(s) have a reference athlete that rejected every body "
+            "RTMPose found (usually only the trainer was detected), so they are written "
+            f"with no pre-label at all; {report.no_pose} frame(s) in total are left for the "
+            "labeler"
+        )
+    else:
+        lines.append(f"  {report.no_pose} frame(s) left for the labeler")
+    lines += [
         f"  {report.with_disagreement} frame(s) have a measurable disagreement; "
         f"{report.mean_low_score_joints:.1f} joint(s) per frame left for the labeler",
         f"  review queue: {report.review_path} (worst first)",

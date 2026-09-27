@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import pathlib
 
 import numpy as np
@@ -492,28 +493,166 @@ def test_predict_frame_reports_no_people_without_raising() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_select_person_picks_the_one_overlapping_the_athlete_reference() -> None:
-    """With a reference box, the overlapping person is the athlete."""
-    near = standing_pose(offset_x=0.0, offset_y=0.0)
-    far = standing_pose(offset_x=0.0, offset_y=200.0)
-    reference = prelabel.person_box(near.joints, near.scores)
+def trainer_and_athlete() -> tuple[PersonPose, PersonPose]:
+    """The two bodies RTMPose finds in ``6508f9b355bd_1``, as it really finds them.
 
-    detection = select_person([far, near], reference)
+    Real coordinates from the real frame, because the bug this guards against is
+    not a hypothetical: the trainer's crouch overlaps the athlete's bounding box
+    *more* than the athlete's own inverted skeleton does, so any test that only
+    checks "does the right body get picked" with a convenient layout would pass
+    under the box rule too.
+
+    The athlete is upside down on the right of the frame — nose at the bottom,
+    feet high and far apart. The trainer stands beside them, feet together on the
+    floor at the same height, which is what makes the two boxes overlap.
+    """
+    trainer = PersonPose(
+        joints={
+            "nose": (286.1, 411.7),
+            "left_shoulder": (336.7, 500.0),
+            "right_shoulder": (256.7, 500.0),
+            "left_elbow": (356.7, 550.0),
+            "right_elbow": (236.7, 550.0),
+            "left_wrist": (366.7, 595.0),
+            "right_wrist": (226.7, 595.0),
+            "left_hip": (326.7, 540.0),
+            "right_hip": (266.7, 540.0),
+            "left_knee": (346.7, 580.0),
+            "right_knee": (246.7, 580.0),
+            "left_ankle": (376.6, 602.1),
+            "right_ankle": (216.8, 602.1),
+            "left_foot_index": (376.6, 602.1),
+            "right_foot_index": (216.8, 602.1),
+        },
+        scores={name: 0.8 for name in LABEL_JOINTS},
+    )
+    athlete = PersonPose(
+        joints={
+            "nose": (313.7, 535.7),
+            "left_shoulder": (330.0, 460.0),
+            "right_shoulder": (300.0, 460.0),
+            "left_elbow": (340.0, 410.0),
+            "right_elbow": (305.0, 415.0),
+            "left_wrist": (320.0, 560.0),
+            "right_wrist": (310.0, 550.0),
+            "left_hip": (330.0, 380.0),
+            "right_hip": (305.0, 385.0),
+            "left_knee": (340.0, 330.0),
+            "right_knee": (300.0, 340.0),
+            "left_ankle": (330.0, 300.0),
+            "right_ankle": (310.0, 300.0),
+            "left_foot_index": (296.8, 602.0),
+            "right_foot_index": (296.8, 282.8),
+        },
+        scores={name: 0.7 for name in LABEL_JOINTS},
+    )
+    return trainer, athlete
+
+
+def test_select_person_prefers_the_athlete_over_a_closer_overlapping_trainer() -> None:
+    """A trainer's crouch overlaps the athlete's box more than the athlete does.
+
+    This is the whole reason selection is on keypoints. The box rule chose the
+    trainer here (0.41 IoU against the athlete's own 0.17) and pre-labelled the
+    one person the labelling config says not to label.
+    """
+    trainer, athlete = trainer_and_athlete()
+    reference = athlete
+    reference_box = prelabel.person_box(reference.joints, reference.scores)
+
+    detection = select_person([trainer, athlete], reference, reference_box)
 
     assert detection.person_index == 1
-    assert detection.pose is near
+    assert detection.pose is athlete
     assert detection.athlete_reference is True
 
 
-def test_select_person_falls_back_to_confidence_when_the_reference_overlaps_nobody() -> None:
-    """A reference nowhere near anyone is not evidence; the most confident body wins."""
+#: The MediaPipe athlete's own box in ``6508f9b355bd_1``, as measured. Wider than
+#: either RTMPose body, because MediaPipe puts the athlete's feet ~40 px apart
+#: and its hands on the floor, so the box spans most of the frame.
+MEDIAPIPE_ATHLETE_BOX_6508 = (221.6, 290.1, 322.9, 641.3)
+
+
+def test_the_trainer_really_does_win_on_box_overlap_alone() -> None:
+    """Guard the premise of the test above: this is not a rigged fixture.
+
+    Measured against the real MediaPipe athlete box, the trainer's crouch
+    overlaps it *more* (0.41) than the athlete's own thin skeleton does (0.17).
+    If a future edit changed the geometry so that stopped being true, the
+    keypoint rule would still pick the right body but the regression it guards
+    would no longer reflect the real data.
+    """
+    from handstand.athlete import box_iou
+
+    trainer, athlete = trainer_and_athlete()
+    reference_box = MEDIAPIPE_ATHLETE_BOX_6508
+    trainer_box = prelabel.person_box(trainer.joints, trainer.scores)
+    athlete_box = prelabel.person_box(athlete.joints, athlete.scores)
+
+    assert box_iou(trainer_box, reference_box) > box_iou(athlete_box, reference_box)
+
+
+def test_keypoint_gap_separates_the_two_bodies_far_more_than_their_boxes() -> None:
+    """The measure itself: the athlete's keypoints are near, the trainer's are not."""
+    from handstand.athlete import body_length
+
+    trainer, athlete = trainer_and_athlete()
+    length = body_length(athlete.to_landmarks())
+
+    assert prelabel.keypoint_gap(athlete, athlete, length) == pytest.approx(0.0)
+    assert prelabel.keypoint_gap(trainer, athlete, length) > prelabel.MAX_REFERENCE_GAP
+
+
+def test_keypoint_gap_needs_enough_shared_joints() -> None:
+    """One coincidental joint is not a body; under four shared joints there is no evidence."""
+    trainer, athlete = trainer_and_athlete()
+    sparse = PersonPose(
+        joints={"nose": athlete.joints["nose"]},
+        scores={"nose": 0.9},
+    )
+    assert math.isnan(prelabel.keypoint_gap(sparse, athlete, 100.0))
+
+
+def test_select_person_rejects_every_body_when_the_reference_contradicts_them_all() -> None:
+    """A reference no candidate is near must not be answered with the nearest one.
+
+    This is the harmful case the whole rule exists to prevent: the reference is
+    the athlete, every detected body is the trainer, and falling back to "most
+    confident" hands the labeler a pre-label of the person the config says not
+    to label. With the reference present and no match, nobody is taken and the
+    frame is written with no pre-label at all.
+    """
+    trainer, athlete = trainer_and_athlete()
+    somebody_else = standing_pose(offset_y=40.0)  # a real body, far from the athlete
+
+    detection = select_person([trainer, somebody_else], athlete)
+
+    assert detection.rejected is True
+    assert detection.pose is None
+    assert detection.athlete_reference is False
+    # The people are still reported: the model did see somebody, the reference
+    # just would not vouch for them.
+    assert detection.n_people == 2
+
+
+def test_select_person_falls_back_to_confidence_when_the_reference_has_no_body() -> None:
+    """A reference whose body cannot be measured cannot judge anybody, so it does not.
+
+    With no usable body length there is no evidence to contradict, and the frame
+    is ranked on RTMPose's own confidence as before.
+    """
     first = standing_pose(offset_y=0.0, score=0.5)
     second = standing_pose(offset_y=200.0, score=0.9)
-    reference = (-500.0, -500.0, -400.0, -400.0)
+    # Every joint on one pixel: a body of length zero, which is never measured.
+    degenerate = PersonPose(
+        joints={name: (900.0, 900.0) for name in LABEL_JOINTS},
+        scores={name: 0.9 for name in LABEL_JOINTS},
+    )
 
-    detection = select_person([first, second], reference)
+    detection = select_person([first, second], degenerate)
 
     assert detection.person_index == 1
+    assert detection.rejected is False
     assert detection.athlete_reference is False
 
 
@@ -523,6 +662,24 @@ def test_select_person_without_a_reference_takes_the_most_confident() -> None:
     detection = select_person([low, high], None)
     assert detection.person_index == 1
     assert detection.athlete_reference is False
+    assert detection.rejected is False
+
+
+def test_detection_separates_nobody_found_from_everybody_rejected() -> None:
+    """Two different "no pose" reasons, which the run counts differently."""
+    trainer, athlete = trainer_and_athlete()
+    somebody_else = standing_pose(offset_y=40.0)
+
+    nobody = select_person([], None)
+    assert nobody.rejected is False  # the model saw nobody at all
+    assert nobody.person_index == prelabel.NO_PERSON
+
+    rejected = select_person([trainer, somebody_else], athlete)
+    assert rejected.rejected is True
+    assert rejected.person_index == prelabel.NO_MATCH
+    # ...and both end up with no pose, so both produce an empty task.
+    assert nobody.pose is None
+    assert rejected.pose is None
 
 
 def test_select_person_with_nobody_found() -> None:
@@ -530,6 +687,19 @@ def test_select_person_with_nobody_found() -> None:
     assert detection.pose is None
     assert detection.n_people == 0
     assert detection.mean_score == 0.0
+
+
+def test_select_person_breaks_a_keypoint_tie_on_box_overlap() -> None:
+    """Two candidates on the same keypoints: the better-overlapping one wins."""
+    left = standing_pose(offset_x=-1.0)
+    right = standing_pose(offset_x=1.0)
+    reference = standing_pose()
+
+    detection = select_person([left, right], reference, (0.0, 0.0, 200.0, 200.0))
+
+    # Both are equally near the reference, so the model's own order decides.
+    assert detection.person_index in (0, 1)
+    assert detection.athlete_reference is True
 
 
 def test_rotate_box_180_swaps_both_edges() -> None:
@@ -577,18 +747,24 @@ def spread_joints(x: float, y: float) -> dict[str, tuple[float, float]]:
 def test_predict_frame_matches_the_rotated_pass_against_the_rotated_reference() -> None:
     """The rotated pass must be compared against the reference *as it turned too*.
 
-    The athlete's box lives in the frame the labeler sees; the rotated pass
+    The reference is measured in the frame the labeler sees; the rotated pass
     reports a pose in the frame the model saw. Matching one against the other
-    puts the athlete nowhere near their own box, so the reference is silently
-    discarded and the frame is decided on raw confidence instead. Here the
-    rotated pass is the one that wins, so the reference has to survive the
+    puts the athlete nowhere near their own reference, so the reference is
+    silently discarded and the frame is decided on raw confidence instead. Here
+    the rotated pass is the one that wins, so the reference has to survive the
     rotation to be used at all.
     """
     # The stub writes these into the *rotated* frame; the reference the caller
     # supplies is the same square as it appears after the map-back.
     joints = spread_joints(45.0, 95.0)
     scores = {name: 0.9 for name in LABEL_JOINTS}
-    display_box = prelabel.rotate_box_180(prelabel.person_box(joints, scores), WIDTH, HEIGHT)
+    reference = PersonPose(
+        joints=prelabel.rotate_pose_180(
+            PersonPose(joints=joints, scores=scores), WIDTH, HEIGHT
+        ).joints,
+        scores=scores,
+    )
+    display_box = prelabel.person_box(reference.joints, reference.scores)
     model = stub_model(
         {
             False: [(joints, {name: 0.1 for name in LABEL_JOINTS})],
@@ -596,7 +772,9 @@ def test_predict_frame_matches_the_rotated_pass_against_the_rotated_reference() 
         }
     )
 
-    detection, rotated_used = predict_frame(model, make_image(), reference_box=display_box)
+    detection, rotated_used = predict_frame(
+        model, make_image(), reference=reference, reference_box=display_box
+    )
 
     assert rotated_used is True
     pose = detection.pose
@@ -610,15 +788,22 @@ def test_predict_frame_matches_the_rotated_pass_against_the_rotated_reference() 
 def test_predict_frame_still_finds_the_athlete_in_the_upright_pass() -> None:
     """The same reference reaches the upright pass untouched."""
     joints = spread_joints(45.0, 95.0)
+    scores = {name: 0.9 for name in LABEL_JOINTS}
+    reference = PersonPose(joints=joints, scores=scores)
     model = stub_model(
         {
-            False: [(joints, {name: 0.9 for name in LABEL_JOINTS})],
+            False: [(joints, scores)],
             True: [(joints, {name: 0.1 for name in LABEL_JOINTS})],
         }
     )
+
     detection, rotated_used = predict_frame(
-        model, make_image(), reference_box=(45.0, 95.0, 55.0, 105.0)
+        model,
+        make_image(),
+        reference=reference,
+        reference_box=prelabel.person_box(reference.joints, reference.scores),
     )
+
     assert rotated_used is False
     assert detection.athlete_reference is True
 
@@ -915,6 +1100,59 @@ def test_run_records_a_frame_with_nobody_in_it(manifest: pathlib.Path) -> None:
     rows = read_review(report.review_path)
     assert all(row["max_disagreement"] == "0.0000" for row in rows)
     assert all(row["worst_joint"] == "" for row in rows)
+
+
+def test_run_writes_no_pre_label_where_the_reference_rejects_every_body(
+    manifest: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A rejected frame reaches the labeler empty, and is counted as rejected.
+
+    This is the safety property behind the whole athlete-matching rule: when the
+    reference athlete contradicts every body RTMPose found, the run must not
+    write the nearest of them. The task still exists, so the frame is not lost.
+    """
+    trainer, athlete = trainer_and_athlete()
+    scores = {name: 0.8 for name in LABEL_JOINTS}
+    # Only the trainer is detected, and the reference is the athlete: the exact
+    # situation that produced 20/300 wrong-body pre-labels.
+    model = stub_model({False: [(trainer.joints, scores)], True: [(trainer.joints, scores)]})
+    data = manifest.parents[1]
+    # The parquet needs all 33 joints; the athlete's 15 replace the layout's.
+    # It goes under the same ``data`` root the run reads, which is the manifest's
+    # grandparent -- the fixture manifest lives in <data>/label_frames/.
+    _cache_with_athlete(
+        data,
+        {**_reference_joints(), **{name: athlete.joints[name] for name in LABEL_JOINTS}},
+    )
+
+    report = prelabel_run(
+        model=model,
+        data=data,
+        manifest=manifest,
+        read_image=lambda path: make_image(),
+    )
+
+    # Only the clip with an athlete parquet has a reference to be rejected by;
+    # the other frame has no reference at all, so there is nothing to contradict
+    # and it falls back to confidence. The two are told apart by `rejected`.
+    assert report.rejected == 1
+    assert report.no_pose == 1
+    assert report.detected == 1
+    assert report.with_reference == 0
+
+    by_image = {task["data"]["image"].rsplit("/", 1)[-1]: task for task in
+                json.loads(report.prelabels_path.read_text(encoding="utf-8"))}
+    assert by_image[IMAGE]["predictions"][0]["result"] == []
+    assert by_image[f"{OTHER_CLIP}_3.jpg"]["predictions"][0]["result"]
+
+
+def test_rejected_is_distinct_from_nobody_detected() -> None:
+    """Two different empty frames, and the report tells them apart."""
+    trainer, athlete = trainer_and_athlete()
+    detection = select_person([trainer], athlete)
+    assert detection.rejected is True
+    assert detection.n_people == 1
+    assert select_person([], None).rejected is False
 
 
 def test_run_reports_an_unreadable_image_and_keeps_going(manifest: pathlib.Path) -> None:
