@@ -13,6 +13,12 @@ same columns, same types, same coordinate conventions.
 <data_dir>/keypoints/mediapipe_multi/<rotate>/<clip_id>.json        # sidecar metadata
 <data_dir>/keypoints/mediapipe_athlete/<rotate>/<clip_id>.parquet  # athlete selection
 <data_dir>/keypoints/mediapipe_athlete/<rotate>/<clip_id>.json      # sidecar metadata
+<data_dir>/keypoints/vision_raw/<rotate>/<clip_id>.csv             # Apple Vision, from the Mac
+<data_dir>/keypoints/vision_raw/<rotate>/<clip_id>.json             # its run manifest
+<data_dir>/keypoints/vision_multi/<rotate>/<clip_id>.parquet       # every person Vision saw
+<data_dir>/keypoints/vision_multi/<rotate>/<clip_id>.json           # sidecar metadata
+<data_dir>/keypoints/vision/<rotate>/<clip_id>.parquet             # the lowest-wrist person
+<data_dir>/keypoints/vision/<rotate>/<clip_id>.json                 # sidecar metadata
 ```
 
 * `<data_dir>` = `handstand.paths.data_dir()` (default
@@ -26,6 +32,10 @@ same columns, same types, same coordinate conventions.
 * `mediapipe_athlete` is the athlete selection
   ([below](#athlete-selection--trainer-contact)) — the single-person schema
   again, holding only the athlete's body.
+* `vision*` is [Apple Vision](#apple-vision), whose model is macOS/iOS only:
+  the CSV is produced on the Mac mini (`tools/mac/run_vision.sh`) and imported
+  here, into the same two schemas, so a Vision run and a MediaPipe run of the
+  same clip and mode differ only in which directory they are in.
 * `<clip_id>` = the `clip_id` column of `<data_dir>/catalogue.csv`
   (`clip_id,filename`) when that file exists, otherwise the first 12 hex
   characters of the SHA-1 of the video file's bytes (same definition as the
@@ -474,6 +484,167 @@ no person can be ranked the first person is judged instead, which for a
 single-person frame is exactly the rule above. A frame where nobody was
 detected at all still keeps the previous decision.
 
+## Apple Vision
+
+`swift/VisionPose` is the second pose model, Apple's `VNDetectHumanBodyPoseRequest`
+— no dependency to install, but macOS/iOS only, so it runs on the Mac mini and
+everything after it runs here. It exists so the two models can be compared on the
+same clips, frame by frame (the bake-off, chainlink #16), which only means
+anything if they write the same schema. They do, with one difference of joint set
+and two of column content, both below.
+
+```sh
+# on this machine: copy the clips across, build, run, copy the CSVs back
+tools/mac/run_vision.sh --rotate none --rotate auto --clips 6508f9b355bd
+tools/mac/run_vision.sh --all --rotate auto
+
+# then import them (Linux)
+cd pipeline
+uv run python -m handstand.vision_import --rotate auto
+uv run python -m handstand.vision_import --rotate none --rotate auto --clips 6508f9b355bd
+```
+
+`run_vision.sh` rsyncs the videos to the Mac mini
+(`--ignore-existing`, so a second run transfers no video), copies the package,
+builds it release, runs it, and rsyncs the CSVs back. Each run also writes a
+**run manifest** (`<clip_id>.json` next to the CSV) with the things only the Mac
+knows — the macOS version, the Vision revision, the runtime — which
+`handstand.vision_import` folds into the parquet's sidecar.
+
+### The CSV
+
+One row per (frame, person, joint), `x`/`y` already in display pixels:
+
+| column | type | meaning |
+|---|---|---|
+| `frame_idx` | int | 0-based index of the decoded frame, in decode order |
+| `t_ms` | int | frame presentation timestamp in ms, rounded |
+| `person_idx` | int | which person of the frame, `0 .. P-1` in the order Vision returned them; `-1` on a frame with nobody |
+| `joint` | string | one of the 19 [Vision joints](#vision-joint-names) |
+| `x`, `y` | float | display-frame pixels, 4 decimals; **empty** on a `person_idx = -1` row |
+| `confidence` | float | Vision's per-joint confidence, 6 decimals; empty on a `person_idx = -1` row |
+| `rotated` | bool | was this frame fed to the model 180° turned? |
+| `detected` | bool | did Vision find a person on this frame? |
+
+A frame nobody was detected in still gets one row per joint, with
+`person_idx = -1`, empty `x`/`y`/`confidence` and `detected = false` — the same
+placeholder the MediaPipe schema uses, so a frame is never missing.
+
+### Coordinates
+
+Identical conventions to MediaPipe, and that is the point: `x_px = x * (width - 1)`,
+`y_px = (1 - y) * (height - 1)`. The only difference is where the normalized
+origin is — **Vision puts it at the bottom left**, so its `y` is flipped where
+MediaPipe's is not. The `size - 1` indexing and the 180° map-back
+`x = width - 1 - x_rotated` are the same formulas, so `--rotate 180` and
+`--rotate auto` produce display pixels in both runners.
+
+Frames are decoded in display orientation too: the Swift runner applies the
+track's `preferredTransform` itself, so a 1024x576 clip with rotation `-90` is
+decoded as 576x1024 and the frame counts match the MediaPipe parquets frame for
+frame (it warns on stderr if they ever do not, and `run_vision.sh` passes
+MediaPipe's own count as the reference).
+
+### Rotation modes
+
+Identical to [MediaPipe's](#rotation-modes), including the rule: `auto` turns the
+next frame when the **previous** frame's body had its wrists below its ankles,
+judged from the person whose wrists are lowest, with the first frame never
+turned and a frame with nobody in it keeping the previous decision. Both
+implementations have to agree or the two runs are not comparable at all.
+
+### Vision joint names
+
+19 joints, in the runner's joint order (which is the CSV row order and, after
+import, the row order inside a person's block):
+
+| # | name | # | name | # | name |
+|---|---|---|---|---|---|
+| 0 | `nose` | 7 | `neck` † | 14 | `right_hip` |
+| 1 | `left_eye` | 8 | `left_elbow` | 15 | `left_knee` |
+| 2 | `right_eye` | 9 | `right_elbow` | 16 | `right_knee` |
+| 3 | `left_ear` | 10 | `left_wrist` | 17 | `left_ankle` |
+| 4 | `right_ear` | 11 | `right_wrist` | 18 | `right_ankle` |
+| 5 | `left_shoulder` | 12 | `root` † | | |
+| 6 | `right_shoulder` | 13 | `left_hip` | | |
+
+The authoritative list in code is `VisionJoint.columnNames` (Swift) and
+`handstand.vision_import.JOINT_NAMES` (Python).
+
+**What is different from MediaPipe's 33:**
+
+* **17 shared joints, spelled MediaPipe's way** — `left_shoulder`, `right_ankle`
+  and so on, so a comparison is a join on the joint name.
+* **2 Vision-only joints, `neck` and `root`** († above) — Vision's shoulder and
+  hip midpoints. MediaPipe spells those out with several landmarks each and has
+  no single name for them, so a join drops them and a stage that indexes joints
+  by MediaPipe's names never sees them.
+* **16 MediaPipe joints are missing**, and nothing fills them in: the four
+  eye-inner/eye-outer points, `mouth_left`/`mouth_right`, and — the ones that
+  matter for a handstand — **`left_pinky`/`right_pinky`, `left_index`/
+  `right_index`, `left_thumb`/`right_thumb` and `left_heel`/`right_heel`/
+  `left_foot_index`/`right_foot_index`**. Vision stops at the wrist and the
+  ankle: there is no hand or foot detail, so the wrist and the ankle *are* the
+  extremities. Any analysis that used the foot index to measure how flat a
+  handstand is has to stop at the ankle.
+
+### The parquets
+
+`handstand.vision_import` writes the two files above, with the same columns, the
+same order, the same dtypes and the same ordering rules as the MediaPipe runner:
+
+* `vision_multi/<rotate>/<clip_id>.parquet` — every person Vision reported
+  (`person_idx` `0 .. P-1`, one 19-row block per person, the `person_idx = -1`
+  placeholder for a frame with nobody). Vision returns every person it finds, so
+  this is written unconditionally rather than behind a `--num-poses` flag.
+* `vision/<rotate>/<clip_id>.parquet` — the **single-person schema**, no
+  `person_idx`, holding the person whose **wrists are lowest** in each frame. The
+  same rule `pose_mediapipe.lowest_wrist_pose` applies to a MediaPipe run, so
+  "which body is this frame about" is decided identically for both. Choosing the
+  athlete out of several people is still `handstand.athlete`'s job.
+
+Three columns do not survive the crossing:
+
+| column | MediaPipe | Vision |
+|---|---|---|
+| `visibility` | visibility score | the model's per-joint **confidence** |
+| `presence` | presence score | **NaN** — Vision reports no separate presence |
+| `z` | depth estimate | **NaN** — Vision's body-pose model reports no depth |
+
+Everything else — `frame_idx`, `t_ms`, `joint`, `x`, `y`, `rotated`, `detected`
+(and `person_idx` in the multi file) — is identical.
+
+### The Vision sidecar
+
+```json
+{
+  "clip_id": "1a2b3c4d5e6f",
+  "source_file": "WhatsApp Video 2026-07-06 at 7.09.23 PM.mp4",
+  "source_csv": "1a2b3c4d5e6f.csv",
+  "model": "apple-vision-body-pose",
+  "vision_revision": 1,
+  "macos_version": "26.7.0",
+  "rotate": "auto",
+  "display_width": 576,
+  "display_height": 1024,
+  "frame_count": 244,
+  "detected_frame_count": 200,
+  "rotated_frame_count": 239,
+  "frames_by_people": {"0": 44, "1": 200},
+  "runtime_seconds": 2.679
+}
+```
+
+`model`, `macos_version`, `vision_revision`, `runtime_seconds`, `display_width`
+and `display_height` come from the Mac's run manifest, not from the CSV, which is
+nothing but keypoints. The sidecar next to the `vision/` (single-person) parquet
+adds two more:
+
+| key | meaning |
+|---|---|
+| `selection` | always `"lowest_wrist"` — which person the single-person table kept |
+| `selected_frame_count` | frames a person was attributed to |
+
 ## Reading the file
 
 ```python
@@ -483,4 +654,19 @@ df = pd.read_parquet(".../keypoints/mediapipe/auto/1a2b3c4d5e6f.parquet")
 good = df[df["detected"]]
 frame0 = good[good["frame_idx"] == 0].set_index("joint")
 frame0.loc["left_wrist", ["x", "y"]]   # display-frame pixels
+```
+
+The two models side by side — same columns, so it is a join on
+`(frame_idx, joint)`:
+
+```python
+import numpy as np, pandas as pd
+
+mp = pd.read_parquet(".../keypoints/mediapipe/auto/1a2b3c4d5e6f.parquet")
+vi = pd.read_parquet(".../keypoints/vision/auto/1a2b3c4d5e6f.parquet")
+joints = ["left_wrist", "right_wrist", "left_shoulder", "left_ankle"]
+both = mp[mp["detected"] & mp["joint"].isin(joints)].merge(
+    vi[vi["detected"] & vi["joint"].isin(joints)], on=["frame_idx", "joint"], suffixes=("_mp", "_vi")
+)
+both.assign(d=np.hypot(both.x_mp - both.x_vi, both.y_mp - both.y_vi)).groupby("joint")["d"].median()
 ```

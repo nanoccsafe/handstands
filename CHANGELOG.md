@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Apple Vision body-pose keypoints as a second pose model: a Swift CLI that runs
+  on the Mac mini in the same schema as MediaPipe, a script that drives it from
+  the workstation, and a CSV -> parquet import (`tools/mac/run_vision.sh`, then
+  `uv run python -m handstand.vision_import`) (#15)
 - Frame sampler + Label Studio setup for keypoint labelling: a stratified sample
   of frames to label, the labelling config, and an importer that turns a Label
   Studio export into display-frame keypoint pixels (#65)
