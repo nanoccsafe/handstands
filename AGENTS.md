@@ -26,7 +26,10 @@ prompt names the issue and its acceptance criteria. Stay inside that scope.
   use tiny synthetic inputs (e.g. numpy arrays, a 10-frame generated video).
 
 ## Swift
-- You cannot build Swift here (Linux). Write the code and tests; the lead builds and tests on the Mac.
+- Swift cannot build on Linux. Build and test on the Mac mini over SSH, non-interactively: copy the worktree with
+  `rsync -a --delete --exclude .git --exclude .venv --exclude .build ./ macmini:wt/<issue>/`, then
+  `ssh macmini 'cd wt/<issue>/swift/<Package> && swift build && swift test'`. Never use sudo on the Mac and never
+  touch `~/GitRepo` there. Include the build/test summary lines in your report.
 
 ## Finishing
 1. Run tests and lint; fix failures.
