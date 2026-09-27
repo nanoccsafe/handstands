@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Frame sampler + keypoint labeling setup (Label Studio) (#65)
 - Refine bone-length contact rule: flag lengthened bones only (#70)
 - Quantify trainer presence across the whole dataset (#69)
 - Athlete selection + trainer-contact flag (per-frame multi-person detection) (#68)
