@@ -158,9 +158,6 @@ MEDIAPIPE_SHARED_JOINTS: tuple[str, ...] = tuple(
 #: The joints the lowest-wrist rule reads.
 WRIST_JOINTS: tuple[str, ...] = ("left_wrist", "right_wrist")
 
-#: NaN in the three columns Vision has nothing to say about.
-_MISSING_COLUMNS = ("z", "presence")
-
 
 # --------------------------------------------------------------------------- #
 # Reading the CSV
