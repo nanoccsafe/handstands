@@ -26,6 +26,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Apple Developer account decision (#6)
+- Data storage and sync strategy for videos (#5)
+- Check WhatsApp compression impact; recover originals if possible (#9)
+- Write recording protocol for new clips (#11)
 - Athlete selection for Vision multi-person keypoints (--source vision) (#76)
 - Athlete selection over the Apple Vision keypoints (`--source vision`, unchanged output for `mediapipe`) (#76)
 - Apple Vision body-pose runner (Swift CLI on the Mac mini) + import to keypoint schema (#15)
