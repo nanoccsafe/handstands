@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Apple Vision body-pose runner (Swift CLI on the Mac mini) + import to keypoint schema (#15)
 - Frame sampler + keypoint labeling setup (Label Studio) (#65)
 - Refine bone-length contact rule: flag lengthened bones only (#70)
 - Quantify trainer presence across the whole dataset (#69)
