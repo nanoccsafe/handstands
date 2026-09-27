@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Keypoint post-processing: `uv run python -m handstand.postprocess --all` gates
+  the athlete keypoints (trainer contact, low visibility), removes teleports
+  above 8 body lengths per second, interpolates gaps of at most 0.2 s in time,
+  smooths each joint coordinate with a time-aware One-Euro filter that restarts
+  after every gap, and measures each clip's body length `L` as the sum of the
+  90th-percentile torso, thigh and shin, so a split or a foreshortened frame
+  cannot shrink the scale later stages normalise by. Output goes to
+  `data/processed/<source>/` in the input's own long schema plus `x_raw`,
+  `y_raw`, `valid` and `filled`, so `handstand.overlay` draws it unchanged and
+  every later stage filters on two columns; `handstand.bodyframe` turns a
+  position into the athlete's own coordinates (origin at the wrist midpoint,
+  `u` right, `v` up, in body lengths). Over the 180 MediaPipe clips: 178 usable,
+  73 % of samples keep a position (89 % in hold-like frames), and the median
+  frame-to-frame displacement of the wrists and ankles drops from 0.0063 to
+  0.0014 body lengths (#20)
 - Agent pre-labels for the sampled frames: `uv run python -m handstand.prelabel`
   runs RTMPose (via `rtmlib`, deliberately a model outside the bake-off) over
   every frame in the labelling manifest, upright and rotated, and writes

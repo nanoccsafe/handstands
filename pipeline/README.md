@@ -91,6 +91,31 @@ the share of frames the selection dropped, and the catalogue's `notes`. The
 markdown summary turns that into the dataset-level answer. Both files are derived
 data and are never committed. See `docs/keypoint_schema.md` for every column.
 
+## Keypoint post-processing
+
+The trajectory every later stage measures: the athlete keypoints gated, de-spiked,
+gap-filled and One-Euro smoothed, plus each clip's body length.
+
+```sh
+cd pipeline
+uv run python -m handstand.postprocess --all              # -> $HANDSTAND_DATA/processed/mediapipe/
+uv run python -m handstand.postprocess --source vision --all
+uv run python -m handstand.postprocess --clips 6508f9b355bd --overwrite
+```
+
+Reads `keypoints/mediapipe_athlete/auto/` (`--source vision` reads
+`vision_athlete/`) and writes one parquet and one sidecar per clip under
+`$HANDSTAND_DATA/processed/<source>/`. The parquet keeps the input's long schema
+and rows, with `x`/`y` processed and NaN where there is no position, plus
+`x_raw`/`y_raw` (what the model said), `valid` and `filled` — so
+`handstand.overlay` draws it unchanged and a later stage filters on two columns.
+The sidecar records the clip's body length, how many samples survived each step
+and the jitter removed; the run prints the dataset-level summary. The thresholds
+are module constants, and the sidecar records the ones a run used.
+`handstand.bodyframe` turns a position into the athlete's own coordinates
+(origin at the wrist midpoint, `u` right, `v` up, in body lengths). See
+`docs/keypoint_schema.md` for every column and every rule.
+
 ## Paths
 
 `handstand.paths` resolves the shared workspace at call time (never at import
