@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Agent pre-labels for the sampled frames: `uv run python -m handstand.prelabel`
+  runs RTMPose (via `rtmlib`, deliberately a model outside the bake-off) over
+  every frame in the labelling manifest, upright and rotated, and writes
+  `data/label_studio_prelabels.json` (Label Studio tasks carrying a `predictions`
+  entry) plus `data/labels/review_queue.csv`, which sorts the frames whose
+  pre-labels most likely need correcting to the top with the reason for each (#77)
 - Athlete selection for the Apple Vision keypoints: `handstand.athlete --source
   vision` runs the same athlete and trainer-contact rules over `vision_multi/`
   and writes `vision_athlete/` in the same schema, so the bake-off compares the
@@ -26,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- Agent pre-labels for the labelling sample (RTMPose, not a bake-off model) (#77)
 - Apple Developer account decision (#6)
 - Data storage and sync strategy for videos (#5)
 - Check WhatsApp compression impact; recover originals if possible (#9)

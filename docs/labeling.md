@@ -6,13 +6,15 @@ so MediaPipe — and later Apple Vision and YOLO-pose — can be scored against 
 human instead of against another model. This page is the whole loop: pick the
 frames, label them, export, convert.
 
-Nothing in this loop adds a dependency to the pipeline. Label Studio runs in its
-own environment; the pipeline only reads the images and the JSON.
+Label Studio runs in its own environment, never as a pipeline dependency; the
+pipeline only reads the images and the JSON. RTMPose, which draws the
+pre-labels, *is* a pipeline dependency (`rtmlib` + `onnxruntime`).
 
 ```
 handstand.frame_sampler  ->  data/label_frames/*.jpg + manifest.csv
-Label Studio (separate)   ->  data/label_studio_export.json
-handstand.labels import   ->  data/labels/keypoints.csv
+handstand.prelabel       ->  data/label_studio_prelabels.json + data/labels/review_queue.csv
+Label Studio (separate)  ->  data/label_studio_export.json
+handstand.labels import  ->  data/labels/keypoints.csv
 ```
 
 ## 1. Pick the frames
@@ -73,7 +75,124 @@ wrote 300 of 300 requested frames from 76 clip(s) over 48 session(s) -> .../labe
 300 frames is a couple of hours of careful work. If you want a quick pass first,
 `--n 60` gives a sample with the same shape.
 
-## 2. Install Label Studio
+## 2. Pre-label the frames
+
+Clicking 15 joints on 300 frames is a couple of hours of identical work, so an
+agent does a first pass and you only fix what is wrong:
+
+```bash
+cd pipeline
+uv run python -m handstand.prelabel
+```
+
+```
+pre-labelled 300 frame(s) with RTMPose in 121s
+  model: rtmpose-prelabel (balanced); wrote .../data/label_studio_prelabels.json
+  found somebody in 300/300 (100.0 %), 0 frame(s) left for the labeler
+  rotated pass won 165/300 (55.0 %); athlete reference used in 300
+  300 frame(s) have a measurable disagreement; 0.0 joint(s) per frame left for the labeler
+  review queue: .../data/labels/review_queue.csv (worst first)
+```
+
+On the full 300-frame sample that is **two minutes** of compute for 4 496
+pre-placed points — RTMPose was confident enough about 4 492 of the 4 500 that
+every frame came back with 13 of its 15 joints or all 15.
+
+Two files come out:
+
+| file | what it is |
+| --- | --- |
+| `data/label_studio_prelabels.json` | one Label Studio task per image, each with a `predictions` entry holding the model's points |
+| `data/labels/review_queue.csv` | the same frames, worst first, with the reason each is doubtful |
+
+Useful flags: `--mode lightweight|balanced|performance` (the RTMPose
+detector/pose pair; `balanced` is the default), `--limit N` for a quick pass,
+`--contact-sheet [N]` to draw the worst frames as one JPEG for a look before
+importing anything, `--rotate`, `--image-base`, `--data`. The 0.3 score bar is a
+constant, not a flag: it is the labelling rule above turned into a number, and a
+run whose pre-labels were written at one bar and reviewed at another would be
+comparing two different questions.
+
+### Why RTMPose and not MediaPipe
+
+The bake-off contestants are **MediaPipe** and **Apple Vision**. Drawing the
+first-pass labels with a contestant would quietly bias the ground truth towards
+it: the labeler corrects the *other* model's mistakes most, so the "human" labels
+would end up measuring agreement with whoever drew them. RTMPose (a top-down
+pose estimator on a YOLOX detector, trained on COCO-WholeBody) is a third,
+independent model, so what you correct is a model's mistake rather than a
+contestant's — and where RTMPose and a contestant disagree, the disagreement is
+itself a reason to look at that frame first.
+
+That last point is not theoretical on this sample: on the `clean_trainer`
+frames the median disagreement is **0.83 body lengths** against `0.08` on
+`clean_no_trainer`, and the single largest is 4.4 body lengths — a foot placed a
+third of the image away from the other model's. Those are frames where one of
+the two models has followed the trainer's leg, and they are the frames you most
+want a human to look at.
+
+### What it does to each frame
+
+* **Twice.** Once as displayed, once rotated 180°, and the pass with the higher
+  mean keypoint score wins. The map-back is the same exact formula the MediaPipe
+  runner uses, so both passes speak the frame's own pixels.
+* **The athlete, not the trainer.** When RTMPose finds several people, the one
+  whose box best overlaps the MediaPipe athlete of the same frame
+  (`keypoints/mediapipe_athlete/auto/`) is taken, so the two models are compared
+  on the same body. Where no reference overlaps anybody, the most confident body
+  is taken instead and the frame is marked as having had no reference.
+* **The 15 joints the config asks for.** RTMPose's COCO-WholeBody output is
+  translated to MediaPipe's names; `foot_index` is COCO-WholeBody's `big_toe`.
+  Its 68 face and 42 hand points are ignored.
+* **Nothing below 0.3 is written.** A guessed point is worse than no point — the
+  rule below asks for a missing point rather than a guess, and a low-scoring
+  pre-label fights that. Those joints are exactly what `low_score_joints` lists
+  for you to place. On this sample only 4 points in 4 500 fell below 0.3.
+
+### The rotated pass, and how often it wins
+
+The rotated pass won **55 %** of the frames — less than you would guess from the
+sampler, which says 271 of the 300 frames are an actual inverted hold. It wins
+57 % of the holds and 35 % of the kick-ups. So RTMPose copes with a handstand
+upright about as often as it does upside down, and the "inverted bodies are what
+pose models are worst at" rule only half holds here. The run reports the count
+either way, and the decision is made on the score rather than on the rule, so a
+model change cannot quietly start feeding the labeler the wrong orientation.
+
+### The review queue
+
+`max_disagreement` is, per frame, the largest distance between any two models'
+points for the same joint — RTMPose, the MediaPipe athlete, and the Vision
+athlete when its selection exists — divided by that frame's body length, so a
+tall and a short athlete are judged on the same terms. `worst_joint` names the
+joint. Rows are sorted by that disagreement plus a penalty for every joint RTMPose
+was unsure about, so a frame reaches the top either because two models put a
+joint in different places or because the pre-labels are missing joints you have
+to find yourself.
+
+| column | meaning |
+| --- | --- |
+| `image`, `clip_id`, `frame_idx` | which frame |
+| `stratum` | from the sampler manifest: `clean_no_trainer`, `clean_trainer`, `trainer_contact` |
+| `max_disagreement` | worst joint gap, in body lengths |
+| `worst_joint` | which joint that gap was on |
+| `low_score_joints` | `;`-separated joints RTMPose scored below 0.3 — yours to place |
+| `rotated_used` | `true` when the rotated pass won |
+
+The Vision athlete has only been generated for a couple of clips so far, so most
+frames are scored on RTMPose against MediaPipe alone. That is not a problem: a
+joint only one model measured has no gap to report and is skipped rather than
+counted as a disagreement with nobody.
+
+On the full sample the disagreement is **0.13 body lengths at the median** and
+0.06 at the tenth percentile, with a 90th percentile of 1.6 — so most frames
+agree closely and roughly a tenth disagree so badly that they are the queue's
+whole reason for existing. The feet are where it happens: `left_foot_index` and
+`right_foot_index` are the worst joint on 169 of the 300 frames, because in a
+handstand the two feet are together, partly out of frame and often behind the
+trainer, and a toe is the smallest thing either model is asked to find.
+
+## 3. Install Label Studio
 
 **Not a project dependency.** Do not `uv add label-studio`; it would pin a web
 framework into the analysis pipeline. Either of these is fine:
@@ -94,7 +213,7 @@ python3 -m venv ~/label-studio
 `--password` set it non-interactively; leave them out and Label Studio asks on
 first start). Open <http://localhost:8080>.
 
-## 3. Create the project
+## 4. Create the project
 
 1. **Create Project**, name it e.g. `handstand-keypoints`.
 2. Open **Settings → Labeling Interface** and paste the contents of
@@ -103,23 +222,60 @@ first start). Open <http://localhost:8080>.
    shoulders, elbows, wrists, hips, knees, ankles and `foot_index` toes — using
    the exact joint names of `handstand.pose_mediapipe.JOINT_NAMES`, plus one
    `occluded_or_unsure` choice per image.
-3. **Import** → *Upload selected files* → select
-   `data/label_frames/*.jpg` (not `manifest.csv`).
+3. **Import** → *Import pre-annotations* (or drag the file in / use the API
+   `POST /api/projects/<id/import`) and choose
+   `data/label_studio_prelabels.json` from step 2.
 
-Uploading is a copy: Label Studio stores each file under its own name with a
-hash in front of it. That is fine — the converter finds the frame again from the
-`<clip_id>_<frame_idx>` tail of the name (see below).
+Import the **JSON**, not the JPEGs. The JSON carries one task per image *with*
+the pre-labels already in it, so Label Studio creates 300 tasks that arrive with
+the model's points drawn and you only move what is wrong. Uploading the folder
+instead still works — the converter finds each frame again from the
+`<clip_id>_<frame_idx>` tail of the name either way — but then you click all
+15 joints on all 300 frames, which is the work this step exists to avoid.
 
-## 4. Label
+The file uses `file://` URIs, so Label Studio has to be allowed to read local
+files. Start it with:
 
-For each frame, place one point per joint you can see. `left`/`right` is the
-**athlete's** own left and right, not the left and right of the picture: in a
-handstand filmed from the front, the athlete's left arm is on the right of the
-screen. Ignore the trainer completely.
+```bash
+export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
+export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=$(realpath ../data/label_frames)
+```
+
+If you would rather serve the frames over HTTP, re-run the pre-labeller with
+`--image-base http://localhost:8080/frames` and the URIs come out that way
+instead.
+
+Check the pre-labels arrived by opening one task: it should show a skeleton
+already drawn. If a task is blank, `data/labels/review_queue.csv` tells you why
+— `low_score_joints` lists what the model was unsure about, and a frame with
+nobody in it is simply empty.
+
+## 5. Label
+
+Work through `data/labels/review_queue.csv` **top to bottom** — it is sorted so
+the frames whose pre-labels are most likely wrong come first, which is where a
+correction is worth the most. Match each row to its image by the `image`
+column, and use the other columns as the hint they are:
+
+* `max_disagreement` / `worst_joint` — two models put this joint in different
+  places. Check it first.
+* `low_score_joints` — RTMPose was unsure about these, so no point was drawn for
+  them. Place them yourself, or leave them out if you cannot see them.
+* `stratum` — `trainer_contact` frames are the hard ones by construction.
+* `rotated_used` — the pre-labels came from the model looking at the frame
+  upside down, which is the normal case for a hold.
+
+Then do what the pre-labels did not do: for each joint you can see, check the
+point and move it if it is wrong. `left`/`right` is the **athlete's** own left
+and right, not the left and right of the picture: in a handstand filmed from
+the front, the athlete's left arm is on the right of the screen. Ignore the
+trainer completely.
 
 | what you see | what to do |
 | --- | --- |
-| the joint | place a point on it |
+| the pre-label is right | leave it |
+| the pre-label is on the wrong spot | drag it to the joint |
+| the joint is visible but has no pre-label | place a point on it |
 | the joint is hidden (behind the trainer, out of frame) | **place no point** |
 | the whole frame is unusable | set `occluded_or_unsure` to `occluded` or `unsure` |
 
@@ -132,13 +288,18 @@ so the config does not pretend to have one; the `occluded_or_unsure` choice is
 the per-image safety net. If a later version adds per-keypoint visibility, the
 converter already reads the `occluded`/`visible` keys such a point would carry.
 
-## 5. Export
+## 6. Export
 
 **Export** → *Export to JSON*, with all annotations. Save it as
 `data/label_studio_export.json` (any path works; the next step takes it as an
 argument).
 
-## 6. Convert to pixels
+This is unchanged by the pre-labels. A task you accepted without touching is an
+ordinary annotation once you submit it, so the export is the same file it would
+have been without step 2, and the import below does not know or care that the
+first point on a joint came from a model.
+
+## 7. Convert to pixels
 
 ```bash
 cd pipeline
@@ -156,6 +317,12 @@ data/labels/keypoints.csv
 clip_id, frame_idx, joint, x, y, visible, labeler, labeled_at
 6508f9b355bd,122,left_wrist,288.0,702.4,true,someone@example.com,2026-09-27T10:05:00Z
 ```
+
+A pre-label written by `handstand.prelabel` uses the **same** conversion in the
+other direction, so a point that survives the export lands back on the pixel the
+model predicted. A round trip of the whole file — pre-label to export to
+`keypoints.csv` — is covered by `tests/test_prelabel.py`, so the two converters
+cannot drift apart.
 
 * `visible` is `false` for a point the tool flagged occluded and for every point
   of an image marked `occluded`/`unsure`. The coordinates are kept either way:
@@ -197,3 +364,23 @@ sampler to rewrite both the images and the manifest together.
 the size of the JPEG the labeler saw, and the conversion is exact in integer
 pixels. If you resized an image by hand before importing it, re-import the
 originals; the CSV's coordinates are in the frame's own pixels either way.
+
+**Pre-labels do not show up in Label Studio** — the tasks were imported from
+the folder of JPEGs rather than from `data/label_studio_prelabels.json`, or
+Label Studio could not read the images. For the `file://` URIs it needs
+`LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true` and
+`LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT` pointing at `data/label_frames` (see
+step 4); otherwise re-run with `--image-base http://...`. Importing the JSON
+again creates a second set of tasks — delete the first.
+
+**A pre-label is on the wrong joint** — RTMPose and MediaPipe disagree about
+`left`/`right` in a handstand: it is easy for both to swap which arm is the
+athlete's left when the athlete is upside down. The review queue's
+`worst_joint` column is where this shows up first, and the `left`/`right` rule
+in step 5 is the tiebreak.
+
+**`max_disagreement` is 0.0000 for a whole column** — nothing was measured to
+compare. Either `keypoints/mediapipe_athlete/auto/` is missing for those clips
+(generate it as above) or the Vision athlete has no keypoints yet, so the frame
+is scored on RTMPose's own confidence alone. A frame with one model measuring
+every joint is not called disagreeing with nobody; it is simply unranked.
