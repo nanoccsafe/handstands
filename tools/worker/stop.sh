@@ -48,6 +48,9 @@ stop_one() {
       opencode session delete "$sid" >/dev/null 2>&1 && echo "$name: deleted opencode session $sid"
     done
     rm -f "$log" "$(env_path "$name")" "$WORKER_STATE/$name.loop-state.json"
+    # Swift work is built on the Mac mini in ~/wt/<...>; remove this issue's copies (best effort).
+    ssh -o BatchMode=yes -o ConnectTimeout=5 macmini "rm -rf ~/wt/i$issue ~/wt/lead-i$issue ~/wt/$name" 2>/dev/null \
+      && echo "$name: removed Mac build copies" || true
   fi
 }
 
