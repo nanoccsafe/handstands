@@ -27,7 +27,7 @@ for a in "$@"; do [[ "$a" == "--rerun" ]] && rerun=1 || args+=("$a"); done
 set -- "${args[@]}"
 
 issue="$1"; slug="$2"; mode="$3"
-model="${4:-opencode/space-bunny-free}"
+model="${4:-opencode-go/mimo-v2.6-flash}"
 name="i${issue}-${slug}"
 wt="$(wt_path "$name")"; log="$(log_path "$name")"; env="$(env_path "$name")"
 

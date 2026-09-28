@@ -32,8 +32,8 @@ The default flow is one issue at a time through the opencode-loop-plugin's singl
 Fallback when the plugin is unavailable: `spawn.sh <id> <slug> <prompt-file> [model]` (one-shot worker; keep the
 prompt in `docs/prompts/`).
 
-- Models: default `opencode/space-bunny-free`; alternatives `opencode/mimo-v2.6-flash-free`,
-  `opencode-go/mimo-v2.6-flash`. Switch model on a rerun if a model keeps failing.
+- Models: default worker `opencode-go/mimo-v2.6-flash` (user, 2026-09-28: Space Bunny may be capped);
+  alternatives `opencode/mimo-v2.6-flash-free`, `opencode/space-bunny-free`. Switch model on a rerun if a model keeps failing.
 - Every worker: worktree `../wt-i<id>-<slug>`, branch `i<id>-<slug>`, tmux window in session `workers`, state and
   log in `/tmp/handstand-workers/<name>.{env,log}`. Runs use `opencode run --standalone`, so a worker has a private
   server that dies with its window; never drop `--standalone` (the shared service keeps runs going after the
