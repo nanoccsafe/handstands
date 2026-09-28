@@ -33,13 +33,17 @@ CLI::
 
 The per-frame table is one row per frame, in frame order: ``frame_idx``,
 ``t_ms``, the ``phase`` and ``hold_id`` the frame carries over from #21, then
-``valid``, ``side_view`` and every feature in :data:`FEATURES`. A feature the
+``valid``, ``side_view``, every feature in :data:`FEATURES` and the centre-of-
+mass and balance columns of :data:`COM_COLUMNS`. A feature the
 frame could not support is NaN — never a number made of nothing — and ``valid``
 is the column to filter on. :data:`HOLD_SUMMARY_NAME` is the same answer per
 hold: the median and the inter-quartile range of every feature over that hold's
-measurable frames, and how long the hold lasted. A hold is what gets scored, and
-a median over a hold says what the hold looked like while an IQR says how much
-it wobbled, which is the difference between a fault and a bad frame.
+measurable frames, how long the hold lasted, and the balance numbers of
+:data:`HOLD_STABILITY` — where the centre of mass sat, how far it swayed and how
+fast, and how much of the hold was spent outside the base of support. A hold is
+what gets scored, and a median over a hold says what the hold looked like while
+an IQR says how much it wobbled, which is the difference between a fault and a
+bad frame.
 
 Nothing here knows which pose model produced the keypoints: it reads a source's
 processed parquet and nothing else, so ``--source mediapipe`` and
@@ -184,6 +188,58 @@ judge form can use the same numbers this docstring quotes.
     in the table because #73 and #57 need to tell a straddle from a split, and
     because a fault classifier that is handed a ratio it cannot trust in most of
     the dataset should learn to ignore it.
+
+Centre of mass and balance
+--------------------------
+
+Balance, the other half of a form, is where the body's **centre of mass** sits
+over the hands: handstand research measures it that way and reads corrections
+at the hips ("hip strategy") as the sign of a weaker balance than corrections
+at the shoulders, because a body that has already tipped can only be brought
+back by moving the CoM itself. :mod:`handstand.com` is the segment model —
+Winter's (2009) mass fractions and CoM positions over the seven-segment body,
+with the missing-side and renormalisation rules documented there — and this
+module is where it meets the frames, the hold labels and the table. Six columns
+are added to the per-frame parquet, in :data:`COM_COLUMNS` order, all in the
+body frame's units:
+
+``com_u``, ``com_v`` — **NaN when the frame has nothing to measure**
+    The CoM itself, in ``L``. A segment missing on one side is measured on the
+    other side's coordinates (in a side view the two sides overlap, so there is
+    nothing to mirror); a segment missing on both is dropped and the rest
+    renormalised, which is what ``com_complete`` flags.
+``facing_sign`` — **+1 towards ``+u``, -1 towards ``-u``, NaN without a nose**
+    Which way the athlete faces, read from the nose's side of the
+    shoulder_mid→hip_mid line — in a handstand the fingers point the way the
+    chest faces — and then decided **per hold by majority**, because that side
+    is a couple of hundredths of a body length wide and a per-frame vote
+    flickers.
+``com_forward`` — **0 L, target; over :data:`com.BASE_FRONT` is overbalanced**
+    ``com_u × facing_sign``: the CoM in the athlete's own coordinates, positive
+    towards the fingers (the overbalance side) and negative towards the heel of
+    the hand, so a clip shot from the other side reads the same sign.
+``com_complete`` — **true when every segment was there**
+    False where a segment was missing on both sides and the masses were
+    renormalised without it: the number is still the CoM of the parts that were
+    seen, and this is the column that says how much of the body that was.
+``balance_zone`` — ``under`` / ``ok`` / ``over``
+    Which side of the base of support the CoM is on: ``under`` behind the heel
+    of the hand (``com_forward < -com.BASE_BACK``), ``over`` in front of the
+    fingertips (``com_forward > com.BASE_FRONT``), else ``ok``. Both edges are
+    approximate — the base of support runs from the heel of the hand to the
+    fingertips, roughly ``0.03 L`` back and ``0.06 L`` forward — and asymmetric
+    because a hand is.
+
+The hold table gains eight columns from the same frames (:data:`HOLD_STABILITY`,
+computed by :func:`hold_stability` over the hold's measurable frames):
+``com_forward_median`` (where the CoM sat through the hold),
+``com_sway_sd`` (how much it swayed, the SD of ``com_forward``),
+``com_sway_range`` (that sway's p95−p5),
+``com_speed_rms`` (how fast it moved, the RMS of ``d com_forward/dt`` in
+``L/s`` from ``t_ms``), ``hip_angle_sd`` and ``shoulder_angle_sd`` (the hip
+strategy against the shoulder strategy: which joint was doing the correcting),
+and ``pct_over`` / ``pct_under`` (the share of the hold's frames outside the
+base of support).
 """
 
 from __future__ import annotations
@@ -195,13 +251,17 @@ import pathlib
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
-from handstand import bodyframe, phases
+from handstand import bodyframe, com, phases
 from handstand.paths import data_dir
 from handstand.postprocess import DEFAULT_SOURCE, SOURCES
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 __all__ = [
     "ABOVE",
@@ -210,11 +270,14 @@ __all__ = [
     "BENT_ELBOW_DEG",
     "BODY_ANGLE_TOL_DEG",
     "BODY_PARTS",
+    "COM_COLUMNS",
     "EITHER",
     "FEATURES",
     "FEATURE_NAMES",
     "FEATURES_DIRNAME",
     "HOLD_PHASE",
+    "HOLD_STABILITY",
+    "HOLD_STABILITY_COLUMNS",
     "HOLD_SUMMARY_COLUMNS",
     "HOLD_SUMMARY_NAME",
     "HEAD_FLEXION_DEG",
@@ -236,7 +299,9 @@ __all__ = [
     "ClipReport",
     "ClipStats",
     "Feature",
+    "apply_hold_facing",
     "available_clips",
+    "balance_fault_line",
     "body_features",
     "body_frame_track",
     "build_arg_parser",
@@ -245,7 +310,9 @@ __all__ = [
     "fails_tolerance",
     "feature_table",
     "hold_rows",
+    "hold_stability",
     "hold_summary_table",
+    "plot_panels",
     "input_dir",
     "main",
     "measure",
@@ -416,9 +483,42 @@ FEATURE_NAMES: tuple[str, ...] = tuple(feature.name for feature in FEATURES)
 
 _BY_NAME: Mapping[str, Feature] = {feature.name: feature for feature in FEATURES}
 
+#: The centre-of-mass and balance columns, in the order the per-frame parquet
+#: carries them after :data:`FEATURE_NAMES`. They are not in :data:`FEATURES`
+#: because they are not one statistic per hold: ``facing_sign`` is decided per
+#: hold rather than measured per frame, ``com_complete`` is a flag and
+#: ``balance_zone`` is a category — and ``com_forward_median``, which the hold
+#: table carries, comes with its sway rather than with an IQR.
+COM_COLUMNS: tuple[str, ...] = (
+    "com_u",
+    "com_v",
+    "facing_sign",
+    "com_forward",
+    "com_complete",
+    "balance_zone",
+)
+
+#: The per-hold balance columns, each with the rounding it is written with:
+#: lengths and speeds to five decimals, angles and percentages to two. Computed
+#: by :func:`hold_stability` over the hold's measurable frames.
+HOLD_STABILITY: tuple[tuple[str, int], ...] = (
+    ("com_forward_median", _LENGTH_DIGITS),
+    ("com_sway_sd", _LENGTH_DIGITS),
+    ("com_sway_range", _LENGTH_DIGITS),
+    ("com_speed_rms", _LENGTH_DIGITS),
+    ("hip_angle_sd", _ANGLE_DIGITS),
+    ("shoulder_angle_sd", _ANGLE_DIGITS),
+    ("pct_over", _ANGLE_DIGITS),
+    ("pct_under", _ANGLE_DIGITS),
+)
+
+#: Those names alone, in write order.
+HOLD_STABILITY_COLUMNS: tuple[str, ...] = tuple(name for name, _ in HOLD_STABILITY)
+
 #: The per-hold table's columns, in write order. Every feature contributes a
 #: median and an inter-quartile range, so the table answers "what shape was this
-#: hold" and "how steady was it" in the same row.
+#: hold" and "how steady was it" in the same row, and the balance columns after
+#: them say where the centre of mass sat and how much it moved.
 HOLD_SUMMARY_COLUMNS: tuple[str, ...] = (
     "clip_id",
     "source",
@@ -429,6 +529,7 @@ HOLD_SUMMARY_COLUMNS: tuple[str, ...] = (
     "hold_end_ms",
     "hold_duration_s",
     *(f"{feature.name}_{stat}" for feature in FEATURES for stat in ("median", "iqr")),
+    *HOLD_STABILITY_COLUMNS,
 )
 
 
@@ -785,6 +886,20 @@ def body_features(track: BodyTrack) -> BodyFeatures:
         _distance(points["left_shoulder"], points["right_shoulder"]),
     )
 
+    # The centre of mass, from the same joints in the same frame: the segment
+    # model of handstand.com, then which way the athlete faces (the nose's side
+    # of the torso line, so +1 is towards +u), then the CoM in that direction.
+    # The facing sign is per *frame* here because the hold has not been seen yet;
+    # apply_hold_facing replaces it with the hold's majority once it has.
+    mass = com.centre_of_mass(track.uv, track.joints)
+    facing = com.facing_sign(shoulder_mid, hip_mid, nose)
+    values["com_u"] = mass.com[:, 0]
+    values["com_v"] = mass.com[:, 1]
+    values["facing_sign"] = facing
+    values["com_forward"] = com.com_forward(mass.com[:, 0], facing)
+    values["com_complete"] = mass.complete
+    values["balance_zone"] = com.balance_zone(values["com_forward"])
+
     # Every part the features are read off has a midpoint, and the wrist group is
     # where the origin comes from, so a frame whose body frame could not be placed
     # at all — no wrist visible, or a source that reports no wrists — is not
@@ -827,10 +942,41 @@ def side_view_assumed(frames: int) -> np.ndarray:
 
 def _unusable_features(frames: int) -> BodyFeatures:
     """The features of a clip with no scale: nothing measured, every frame invalid."""
-    return BodyFeatures(
-        values={name: np.full(frames, np.nan) for name in FEATURE_NAMES},
-        valid=np.zeros(frames, dtype=bool),
-    )
+    values: dict[str, np.ndarray] = {
+        name: np.full(frames, np.nan) for name in (*FEATURE_NAMES, *COM_COLUMNS)
+    }
+    # No body length is no body to weigh and no direction to weigh it in: the
+    # CoM columns are NaN like every other measurement, the completeness flag is
+    # False like every other frame's, and there is no zone without a position.
+    values["com_complete"] = np.zeros(frames, dtype=bool)
+    values["balance_zone"] = np.full(frames, np.nan, dtype=object)
+    return BodyFeatures(values=values, valid=np.zeros(frames, dtype=bool))
+
+
+def apply_hold_facing(features: BodyFeatures, hold_id: np.ndarray) -> BodyFeatures:
+    """One facing sign per hold, and the two columns that follow from it.
+
+    ``facing_sign`` is read off the nose frame by frame, and a nose that clears
+    the torso line by a couple of hundredths of a body length changes sides on a
+    noisy frame — which would flip ``com_forward`` and ``balance_zone`` in the
+    middle of a hold for no anatomical reason. So the hold votes
+    (:func:`handstand.com.majority_per_hold`), every frame of the hold takes the
+    sign most of its frames had (frames outside a hold keep their own vote, and
+    a hold with no majority keeps its frames' NaN), and ``com_forward`` and
+    ``balance_zone`` are recomputed from the result. The CoM itself is not
+    touched: it is where it is whichever way the athlete faces.
+
+    This is the last thing done to a clip's measurements, and the reason the
+    facing sign can be decided at all: it needs the hold labels, which the
+    geometry does not see.
+    """
+    facing = com.majority_per_hold(features.value("facing_sign"), hold_id)
+    forward = com.com_forward(features.value("com_u"), facing)
+    values = dict(features.values)
+    values["facing_sign"] = facing
+    values["com_forward"] = forward
+    values["balance_zone"] = com.balance_zone(forward)
+    return dataclasses.replace(features, values=values)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -973,6 +1119,9 @@ def extract_clip(
                     f"trainer_contact must have one entry per frame ({frames}), got {contact.shape}"
                 )
             measured = dataclasses.replace(measured, valid=measured.valid & ~contact)
+    # The facing sign is decided per hold, so it is applied here rather than in
+    # body_features: this is where the hold labels exist.
+    measured = apply_hold_facing(measured, holds)
     return ClipFeatures(
         clip_id=clip_id,
         source=source,
@@ -1019,6 +1168,24 @@ def feature_table(features: ClipFeatures) -> pd.DataFrame:
     }
     for feature in FEATURES:
         columns[feature.name] = _rounded(features.value(feature.name), feature.digits)
+    # The centre-of-mass columns come last, in COM_COLUMNS order. The two
+    # positions and the signed one round like lengths, the sign is a whole
+    # number, the completeness flag stays a flag and the zone stays words — a
+    # category rounded to five decimals is not a category any more.
+    columns["com_u"] = _rounded(features.value("com_u"), _LENGTH_DIGITS)
+    columns["com_v"] = _rounded(features.value("com_v"), _LENGTH_DIGITS)
+    columns["facing_sign"] = _rounded(features.value("facing_sign"), 0)
+    columns["com_forward"] = _rounded(features.value("com_forward"), _LENGTH_DIGITS)
+    columns["com_complete"] = np.asarray(
+        features.measured.values.get("com_complete", np.zeros(features.frames, dtype=bool)),
+        dtype=bool,
+    )
+    columns["balance_zone"] = np.asarray(
+        features.measured.values.get(
+            "balance_zone", np.full(features.frames, np.nan, dtype=object)
+        ),
+        dtype=object,
+    )
     return pd.DataFrame(columns)
 
 
@@ -1036,13 +1203,78 @@ def _spread(values: np.ndarray) -> tuple[float, float]:
     return float(np.median(finite)), float(np.percentile(finite, 75) - np.percentile(finite, 25))
 
 
+def hold_stability(features: ClipFeatures, hold_id: int) -> dict[str, float]:
+    """How steady one hold was: the CoM's sway and speed, the two strategy angles, the zones.
+
+    Everything is measured over the hold's *measurable* frames
+    (:meth:`ClipFeatures.measurable_hold_mask`), and the CoM numbers over the
+    subset of those with a finite ``com_forward`` — a frame nobody could see is
+    not a frame the balance was measured on. The eight keys are exactly
+    :data:`HOLD_STABILITY_COLUMNS`, NaN where the hold cannot support one:
+
+    * ``com_forward_median`` — where the CoM sat, towards the fingers (+) or
+      the heel of the hand (−);
+    * ``com_sway_sd`` — how far it wandered, the **population** SD of
+      ``com_forward``: the hold's frames are the whole population a judge saw,
+      not a sample of a bigger one, so there is no ``N−1`` correction;
+    * ``com_sway_range`` — the same wander as p95−p5, which one spike cannot
+      inflate the way a max−min can;
+    * ``com_speed_rms`` — how fast it moved, the RMS of
+      ``d com_forward/dt`` in ``L/s``, the difference taken between consecutive
+      measured frames over the **real** ``t_ms`` gap between them, because these
+      clips are variable frame rate and a fixed step would make the same sway
+      faster on the clips that were sampled faster;
+    * ``hip_angle_sd``, ``shoulder_angle_sd`` — how much each joint was
+      correcting, the hip strategy against the shoulder strategy: a hold balanced
+      from the hips has a busy hip angle and a quiet shoulder, and the other way
+      round for a body stacked over the wrists;
+    * ``pct_over``, ``pct_under`` — the percentage of those frames outside the
+      base of support, in front of the fingertips or behind the heel of the hand.
+
+    A spread needs two frames to be a spread, so the SDs, the range and the
+    speed are NaN on a one-frame hold; the median and the percentages are
+    defined on one.
+    """
+    result: dict[str, float] = {name: math.nan for name, _ in HOLD_STABILITY}
+    mask = features.measurable_hold_mask(hold_id)
+    values = features.value("com_forward")
+    kept = np.flatnonzero(mask)
+    kept = kept[np.isfinite(values[kept])]
+    forward = values[kept]
+    if forward.size:
+        result["com_forward_median"] = float(np.median(forward))
+        result["pct_over"] = (
+            100.0 * float(np.count_nonzero(forward > com.BASE_FRONT)) / forward.size
+        )
+        result["pct_under"] = (
+            100.0 * float(np.count_nonzero(forward < -com.BASE_BACK)) / forward.size
+        )
+    if forward.size >= 2:
+        result["com_sway_sd"] = float(np.std(forward))
+        result["com_sway_range"] = float(np.percentile(forward, 95) - np.percentile(forward, 5))
+        times = features.t_ms[kept].astype(np.float64) / 1000.0
+        steps = np.diff(times)
+        moving = steps > 0.0
+        if moving.any():
+            speeds = np.diff(forward)[moving] / steps[moving]
+            result["com_speed_rms"] = float(np.sqrt(np.mean(speeds * speeds)))
+    for name in ("hip_angle", "shoulder_angle"):
+        angles = features.value(name)[mask]
+        angles = angles[np.isfinite(angles)]
+        if angles.size >= 2:
+            result[f"{name}_sd"] = float(np.std(angles))
+    return result
+
+
 def hold_rows(features: ClipFeatures) -> list[dict[str, object]]:
-    """One row per hold of the clip: every feature's median and IQR, and its length.
+    """One row per hold of the clip: every feature's median and IQR, its length, its balance.
 
     Measured over the hold's *measurable* frames
     (:meth:`ClipFeatures.measurable_hold_mask`), so a hold nobody could see for
     part of its length is summarised over the rest, and the row carries both the
     number of frames in the hold and the number of frames the median is over.
+    The balance columns are :func:`hold_stability`'s, rounded to the digits
+    :data:`HOLD_STABILITY` names for each.
     """
     rows: list[dict[str, object]] = []
     for hold_id in features.hold_ids():
@@ -1062,6 +1294,9 @@ def hold_rows(features: ClipFeatures) -> list[dict[str, object]]:
             median, iqr = _spread(features.value(feature.name)[mask])
             row[f"{feature.name}_median"] = _rounded_scalar(median, feature.digits)
             row[f"{feature.name}_iqr"] = _rounded_scalar(iqr, feature.digits)
+        stability = hold_stability(features, hold_id)
+        for name, digits in HOLD_STABILITY:
+            row[name] = _rounded_scalar(stability[name], digits)
         rows.append(row)
     return rows
 
@@ -1112,7 +1347,7 @@ def read_clip_features(parquet_path: str | pathlib.Path) -> pd.DataFrame:
     """
     path = pathlib.Path(parquet_path)
     table = pd.read_parquet(path)
-    required = ("frame_idx", "t_ms", "phase", "hold_id", "valid", *FEATURE_NAMES)
+    required = ("frame_idx", "t_ms", "phase", "hold_id", "valid", *FEATURE_NAMES, *COM_COLUMNS)
     missing = [column for column in required if column not in table.columns]
     if missing:
         raise ValueError(
@@ -1588,17 +1823,104 @@ def fault_line(feature: Feature) -> tuple[tuple[float, ...], str]:
     return (feature.target,), f"target {feature.target:g} {feature.unit}"
 
 
+def plot_panels() -> tuple[str, ...]:
+    """Every panel :func:`plot_clip` draws, in order: the features, then the balance.
+
+    The two balance panels are named rather than described by a :class:`Feature`
+    because neither is a single statistic with a target: ``com_forward`` is the
+    CoM's position *in the direction the athlete faces* and its reference lines
+    are the two edges of the base of support, and ``balance_zone`` is a category
+    with no number to plot at all. Named panels are what keeps the drawing loop
+    and the test that says the plot still has them agreeing.
+    """
+    return (*FEATURE_NAMES, "com_forward", "balance_zone")
+
+
+def balance_fault_line() -> tuple[tuple[float, ...], str]:
+    """The two edges the ``com_forward`` panel draws, and the zone each one starts.
+
+    The back edge of the base of support at ``-BASE_BACK`` and the front edge at
+    ``+BASE_FRONT``: past the first the CoM is behind the heel of the hand, past
+    the second it is in front of the fingertips. Both are approximate, as
+    :mod:`handstand.com` documents, and the label says the number so a reader of
+    the plot knows how approximate.
+    """
+    return (-com.BASE_BACK, com.BASE_FRONT), (
+        f"under < -{com.BASE_BACK:g} L, over > {com.BASE_FRONT:g} L"
+    )
+
+
+#: The colour of each balance zone in the plot: the traffic light a report reads
+#: — blue behind the heel of the hand, green inside the base of support, red
+#: past the fingertips.
+ZONE_COLORS: tuple[tuple[str, str], ...] = (
+    ("under", "tab:blue"),
+    ("ok", "tab:green"),
+    ("over", "tab:red"),
+)
+
+
+def _draw_zones(axis: Axes, times: np.ndarray, zone_values: np.ndarray) -> None:
+    """The ``balance_zone`` panel: one coloured dot per frame, and nothing between them.
+
+    A zone is a category, not a trace: a line drawn through ``under``, ``ok`` and
+    ``over`` would imply a value between them, and there is not one. Dots in the
+    three colours say which zone each frame was in, and a frame with no CoM
+    (NaN) is left as a gap rather than drawn as a zone it was never in.
+    """
+    zone = np.asarray(zone_values, dtype=object)
+    zone = np.where(pd.isna(zone), "", zone)
+    for name, color in ZONE_COLORS:
+        inside = zone == name
+        axis.scatter(
+            times[inside],
+            np.zeros(int(inside.sum()), dtype=np.float64),
+            s=12.0,
+            color=color,
+            label=name,
+            linewidths=0,
+        )
+    axis.set_ylim(-1.0, 1.0)
+    axis.set_yticks([])
+    axis.set_ylabel("balance_zone", fontsize=8)
+    axis.legend(loc="upper center", ncol=len(ZONE_COLORS), fontsize=7, frameon=False)
+
+
+def _draw_panel(axis: Axes, times: np.ndarray, table: pd.DataFrame, name: str) -> None:
+    """Draw one panel: a feature with its fault line, or one of the two balance panels."""
+    if name == "balance_zone":
+        _draw_zones(axis, times, table[name].to_numpy())
+        return
+    if name == "com_forward":
+        values = np.asarray(table[name].to_numpy(), dtype=np.float64)
+        axis.plot(times, values, color="tab:blue", linewidth=0.8)
+        lines, test = balance_fault_line()
+        for line in lines:
+            axis.axhline(line, color="0.35", linestyle=":", linewidth=0.8)
+        axis.set_ylabel(f"{name} (L)\n{test}", fontsize=8)
+        return
+    feature = _BY_NAME[name]
+    values = np.asarray(table[feature.name].to_numpy(), dtype=np.float64)
+    axis.plot(times, values, color="tab:blue", linewidth=0.8)
+    lines, test = fault_line(feature)
+    for line in lines:
+        axis.axhline(line, color="0.35", linestyle=":", linewidth=0.8)
+    axis.set_ylabel(f"{feature.name} ({feature.unit})\n{test}", fontsize=8)
+
+
 def plot_clip(
     table: pd.DataFrame, out_path: str | pathlib.Path, *, title: str = ""
 ) -> pathlib.Path:
     """Draw every feature over time for one clip, with the hold frames shaded.
 
-    One panel per feature in :data:`FEATURES` order, time in seconds along the
-    bottom two, the feature's fault line as a dotted line and the test that says
-    which side of it is wrong in the axis label, and the hold frames shaded — a
+    One panel per entry of :data:`plot_panels` — the features in :data:`FEATURES`
+    order, then ``com_forward`` with the two edges of the base of support drawn
+    on it, then ``balance_zone`` as the zone each frame was in — time in seconds
+    along the bottom two, the fault line as a dotted line and the test that says
+    which side of it is wrong in the axis label, and the hold frames shaded: a
     feature outside a hold is not a fault, and a panel without the shading invites
-    exactly that reading. The longest hold is shaded darker: it is the hold the clip
-    is ranked by.
+    exactly that reading. The longest hold is shaded darker: it is the hold the
+    clip is ranked by.
     """
     import matplotlib
 
@@ -1614,13 +1936,17 @@ def plot_clip(
     runs = _hold_runs(hold_mask)
     longest_run = max(runs, key=lambda run: run[1] - run[0], default=None)
 
+    panels = plot_panels()
     columns = 2
-    rows = math.ceil(len(FEATURES) / columns)
+    rows = math.ceil(len(panels) / columns)
     fig, axes = plt.subplots(
         rows, columns, figsize=(13.0, 2.4 * rows), sharex=True, squeeze=False
     )
     flat = [axis for row in axes for axis in row]
-    for feature, axis in zip(FEATURES, flat, strict=True):
+    for index, axis in enumerate(flat):
+        if index >= len(panels):
+            axis.set_axis_off()
+            continue
         for first, last in runs:
             axis.axvspan(
                 times[first],
@@ -1629,16 +1955,9 @@ def plot_clip(
                 alpha=0.25 if (first, last) == longest_run else 0.10,
                 linewidth=0,
             )
-        values = np.asarray(table[feature.name].to_numpy(), dtype=np.float64)
-        axis.plot(times, values, color="tab:blue", linewidth=0.8)
-        lines, test = fault_line(feature)
-        for line in lines:
-            axis.axhline(line, color="0.35", linestyle=":", linewidth=0.8)
-        axis.set_ylabel(f"{feature.name} ({feature.unit})\n{test}", fontsize=8)
+        _draw_panel(axis, times, table, panels[index])
         axis.grid(alpha=0.25, linewidth=0.5)
         axis.tick_params(labelsize=7)
-    for axis in flat[len(FEATURES) :]:
-        axis.set_axis_off()
     axes[-1][0].set_xlabel("t (s)", fontsize=9)
     axes[-1][1].set_xlabel("t (s)", fontsize=9)
     heading = title or f"{len(table)} frames, {int(hold_mask.sum())} hold frame(s)"

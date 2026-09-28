@@ -603,6 +603,86 @@ hold stops qualifying until the feet land, and `post` once the body is no longer
 above its hands — until the hands are down and the legs rising again, which is a
 second attempt.
 
+## Centre of mass and balance
+
+`handstand.com` is the segment model and `handstand.features` is where it meets
+the frames: the features stage adds six columns to the per-frame parquet above
+and eight to `hold_summary.csv`, and `--plot` draws two more panels. Balance in
+a handstand is the centre of mass (CoM) kept over the hands — handstand
+research measures it that way and reads hip corrections ("hip strategy") as the
+sign of a weaker balance than shoulder corrections — so the columns say where
+the CoM sat relative to the hands, which way the athlete was facing, how far it
+swayed and how fast.
+
+```sh
+cd pipeline
+uv run python -m handstand.features --all                    # every clip, features + holds
+uv run python -m handstand.features --clips 057c9e6c96af --overwrite --plot 057c9e6c96af
+```
+
+### The segment model
+
+Seven segments a side plus two midline ones, each with Winter's mass fraction
+of the body and its centre of mass at a fraction of the segment **from the
+proximal end** (`handstand.com.SEGMENT_SOURCE` names the table):
+
+| segment | mass | CoM position |
+|---|---|---|
+| head + neck (midline) | 0.081 | at the nose |
+| trunk (midline) | 0.497 | 0.5 along `shoulder_mid → hip_mid` |
+| upper arm (each side) | 0.028 | 0.436 along `shoulder → elbow` |
+| forearm + hand (each side) | 0.022 | 0.682 along `elbow → wrist` |
+| thigh (each side) | 0.100 | 0.433 along `hip → knee` |
+| shank (each side) | 0.0465 | 0.433 along `knee → ankle` |
+| foot (each side) | 0.0145 | 0.5 along `ankle → foot_index` |
+
+* **No `foot_index`** (Apple Vision reports no toes): the foot is zero-length
+  and its CoM is the ankle's.
+* **No nose**: the head's CoM goes 0.5 of the way from the shoulder midpoint
+  towards the body's axis extended past the shoulder —
+  `shoulder_mid + 0.5 (shoulder_mid − hip_mid)`, which in a handstand is where
+  the head hangs. An estimated head is not a missing head: `com_complete`
+  stays true.
+* **One side's segment missing**: the other side's *coordinates* are used
+  (mirror-free — in a side view the two sides overlap, so there is nothing to
+  mirror). **Both sides missing**: that mass is dropped, the rest are
+  renormalised to sum to 1, and the frame is flagged `com_complete = false`.
+* **Nothing visible at all** (or no body frame to place): `com_u`, `com_v`,
+  `com_forward` are NaN and `com_complete` is false.
+
+### Per-frame columns
+
+| column | type | meaning |
+|---|---|---|
+| `com_u`, `com_v` | float64 | the CoM in the body frame, in body lengths `L` |
+| `facing_sign` | float64 | `+1` if the athlete faces `+u`, `-1` if `-u`, NaN without a nose: the nose's side of the `shoulder_mid → hip_mid` line (in a handstand the fingers point the way the chest faces), taken **per hold by majority** so one noisy frame cannot flip a hold |
+| `com_forward` | float64 | `com_u × facing_sign`, in `L`: positive towards the fingers (overbalance), negative towards the heel of the hand (underbalance), so a clip shot from the other side reads the same sign |
+| `com_complete` | bool | every segment of the model was there; false when masses were renormalised |
+| `balance_zone` | str | `under` if `com_forward < -0.03`, `over` if `> 0.06`, else `ok`; NaN where there is no CoM |
+
+The two zone edges are **approximate** (`handstand.com.BASE_BACK`,
+`BASE_FRONT`): the base of support runs from the heel of the hand to the
+fingertips, roughly 0.03 `L` behind the wrist midpoint and 0.06 `L` in front of
+it, and they are asymmetric because a hand is — there is more room towards the
+fingers.
+
+### Per-hold columns
+
+Added to `hold_summary.csv`, computed over the hold's measurable frames with a
+finite `com_forward`:
+
+| column | meaning |
+|---|---|
+| `com_forward_median` | where the CoM sat through the hold, in `L` |
+| `com_sway_sd` | how far it wandered: the population SD of `com_forward` |
+| `com_sway_range` | the same wander as p95 − p5, which one spike cannot inflate |
+| `com_speed_rms` | how fast it moved: the RMS of `d com_forward/dt` in `L/s`, differences taken over the real `t_ms` gap (these clips are variable frame rate) |
+| `hip_angle_sd`, `shoulder_angle_sd` | how much each joint was correcting — the hip strategy against the shoulder strategy |
+| `pct_over`, `pct_under` | the percentage of the hold's frames past the fingertips or behind the heel of the hand |
+
+A spread needs two frames, so the SDs, the range and the speed are NaN on a
+one-frame hold; the median and the percentages are defined on one.
+
 ## Joint names
 
 The 33 MediaPipe pose landmarks, snake_case, in model order (this is the
