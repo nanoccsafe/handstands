@@ -314,17 +314,33 @@ instead still works — the converter finds each frame again from the
 `<clip_id>_<frame_idx>` tail of the name either way — but then you click all
 15 joints on all 300 frames, which is the work this step exists to avoid.
 
-The file uses `file://` URIs, so Label Studio has to be allowed to read local
-files. Start it with:
+Label Studio cannot open `file://` URIs in the browser. Serve the frames through its local-files feature:
 
 ```bash
-export LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true
-export LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=$(realpath ../data/label_frames)
+# 1. rewrite the image URIs (the converter matches frames by file name, so nothing else changes)
+python3 - <<'PY'
+import json
+t = json.load(open("data/label_studio_prelabels.json"))
+pre = "file:///mnt/sharedOs/handstand-workspace/data/"
+for task in t:
+    task["data"]["image"] = "/data/local-files/?d=" + task["data"]["image"][len(pre):]
+json.dump(t, open("data/label_studio_prelabels_ls.json", "w"))
+PY
+# 2. start Label Studio with local files enabled, rooted at data/
+LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED=true \
+LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/mnt/sharedOs/handstand-workspace/data \
+label-studio start --port 8080 --internal-host 0.0.0.0 --no-browser
 ```
 
-If you would rather serve the frames over HTTP, re-run the pre-labeller with
-`--image-base http://localhost:8080/frames` and the URIs come out that way
-instead.
+3. In the project: **Settings → Cloud Storage → Add Source Storage → Local files**, path
+   `/mnt/sharedOs/handstand-workspace/data/label_frames`, file filter `.*jpg`. Save it but do **not** sync it
+   (syncing would create 300 duplicate tasks without pre-labels). Label Studio refuses to serve
+   `/data/local-files/` URLs for a project without such a storage.
+4. Import `data/label_studio_prelabels_ls.json` (not the `file://` version).
+
+On the workstation this is already set up: Label Studio runs in the tmux session `tools` (window
+`labelstudio`), the login is in `~/.config/handstand/label-studio.env`, and the project is
+`handstand-keypoints` with the 300 tasks and pre-labels imported.
 
 Check the pre-labels arrived by opening one task: it should show a skeleton
 already drawn. A blank task is expected on 19 of the 300 frames — the
