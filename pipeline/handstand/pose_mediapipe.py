@@ -21,6 +21,33 @@ Rotation modes (``--rotate``):
     landmarker instances — one that only ever sees upright frames and one that
     only ever sees rotated frames — and each tracker therefore observes a
     consistent orientation.
+``best`` (recommended)
+    Run **both** orientations on every frame, map the rotated result back, and
+    keep the one whose body the model is more sure of: the higher mean
+    visibility over the 12 main joints (:data:`MAIN_JOINTS`). ``auto`` decides
+    from the previous frame's skeleton, which is a trap: once MediaPipe has
+    misread an inverted body as a standing person the wrists look *higher* than
+    the ankles, "not inverted" is concluded and the frame is never rotated again,
+    however wrong that read was (chainlink #79). ``best`` looks at the frame
+    itself, so the trap cannot close. In VIDEO mode it owns the same two
+    trackers as ``auto`` so each one still sees a consistent orientation; in
+    IMAGE mode there is no tracker state to keep consistent and one landmarker
+    serves both passes.
+
+    A body's orientation does not change from one frame to the next, so the
+    per-frame scores are not read one frame at a time: the margin
+    ``score_rotated - score_upright`` is averaged over a centred
+    :data:`ORIENT_WINDOW_S` window of **clip time** (these clips are variable
+    frame rate) and the orientation only switches once that smoothed margin has
+    held the other sign, by more than :data:`ORIENT_MARGIN`, for
+    :data:`ORIENT_MIN_SWITCH_S` (:func:`choose_orientations`). A tie, a margin
+    inside the margin band, a frame neither pass could score and a one- or
+    two-frame confident-but-wrong read all keep the orientation the clip is
+    already in.
+
+    A ``best`` run writes two extra columns, ``score_upright`` and
+    ``score_rotated``, next to ``rotated``: the two numbers the choice was made
+    on, so a frame's orientation can be re-decided or questioned later.
 
 People per frame (``--num-poses``):
 
@@ -41,10 +68,10 @@ People per frame (``--num-poses``):
     frame); a frame with nobody in it keeps a single NaN block with
     ``person_idx = -1`` and ``detected = false``, so every frame is still
     represented. Picking the athlete out of the people is a *later* step —
-    this module only keeps them all (``handstand.athlete``). In ``auto`` mode
-    the rotation decision is taken from the person whose wrists are lowest in
-    the image (largest mean wrist y), i.e. whoever is most likely the one on
-    their hands.
+    this module only keeps them all (``handstand.athlete``). The rotation
+    decision, whichever mode makes one, is taken from the person whose wrists
+    are lowest in the image (largest mean wrist y), i.e. whoever is most likely
+    the one on their hands.
 
 Detector settings (``--running-mode``, ``--min-detection``, ``--min-presence``,
 ``--min-tracking``):
@@ -79,7 +106,7 @@ CLI::
     uv run python scripts/download_models.py
     uv run python -m handstand.pose_mediapipe --rotate auto --limit 3
     uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
-    uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \\
+    uv run python -m handstand.pose_mediapipe --num-poses 3 \\
         --running-mode image --min-detection 0.2 --min-presence 0.2
 """
 
@@ -115,15 +142,23 @@ __all__ = [
     "DEFAULT_RUNNING_MODE",
     "RUNNING_MODES",
     "JOINT_NAMES",
+    "MAIN_JOINTS",
     "MAX_NUM_POSES",
     "MODEL_FILENAME",
     "MODEL_URL",
     "MULTI_OUTPUT_DIRNAME",
     "NO_PERSON_IDX",
+    "ORIENT_MARGIN",
+    "ORIENT_MIN_SWITCH_S",
+    "ORIENT_WINDOW_S",
     "PARQUET_COLUMNS",
+    "PARQUET_COLUMNS_BEST",
+    "PARQUET_COLUMNS_BEST_MULTI",
     "PARQUET_COLUMNS_MULTI",
     "PERSON_COLUMN",
+    "RECOMMENDED_ROTATE",
     "ROTATE_MODES",
+    "SCORE_COLUMNS",
     "SINGLE_OUTPUT_DIRNAME",
     "ClipReport",
     "DetectorSettings",
@@ -133,13 +168,17 @@ __all__ = [
     "LandmarkerLike",
     "apply_display_rotation",
     "build_arg_parser",
+    "choose_orientations",
     "collect_clips",
+    "default_rotate_mode",
     "display_orientation",
+    "frame_margin",
     "is_inverted",
     "load_catalogue",
     "lowest_wrist_pose",
     "main",
     "make_landmarker_factory",
+    "mean_main_visibility",
     "mean_wrist_y",
     "mediapipe_version",
     "normalized_to_pixels",
@@ -147,6 +186,7 @@ __all__ = [
     "people_histogram",
     "resolve_clip_id",
     "run_clip",
+    "smooth_margin",
 ]
 
 #: Model downloaded by ``scripts/download_models.py`` (git-ignored).
@@ -158,8 +198,17 @@ MODEL_URL = (
 #: ``pipeline/models/<MODEL_FILENAME>``, relative to this file, not to the cwd.
 DEFAULT_MODEL_PATH = pathlib.Path(__file__).resolve().parents[1] / "models" / MODEL_FILENAME
 
-#: ``--rotate`` choices; also the name of the output sub-directory.
-ROTATE_MODES: tuple[str, ...] = ("none", "180", "auto")
+#: ``--rotate`` choices; also the name of the output sub-directory. ``best`` is
+#: the recommended mode: it reads every frame's orientation off the frame itself
+#: rather than off its predecessor, so it cannot be trapped by a misread
+#: skeleton the way ``auto`` can (chainlink #79).
+ROTATE_MODES: tuple[str, ...] = ("none", "180", "auto", "best")
+
+#: The rotation mode the rest of the pipeline reads: what ``--rotate`` falls
+#: back to for a multi-person run (:func:`default_rotate_mode`), what
+#: ``handstand.athlete`` and every stage after it default to, and what
+#: ``docs/keypoint_schema.md`` calls recommended.
+RECOMMENDED_ROTATE = "best"
 
 #: People per frame: the default is one body, multi-person runs are opt-in.
 DEFAULT_NUM_POSES = 1
@@ -226,6 +275,27 @@ JOINT_INDEX: dict[str, int] = {name: index for index, name in enumerate(JOINT_NA
 WRIST_JOINTS = ("left_wrist", "right_wrist")
 ANKLE_JOINTS = ("left_ankle", "right_ankle")
 
+#: The 12 main joints: shoulders, elbows, wrists, hips, knees, ankles. The same
+#: set, in the same order, as :data:`handstand.athlete.MAIN_JOINTS` — the
+#: orientation score of ``--rotate best`` is that visibility term, and no face
+#: or finger score may carry a body the model is unsure of.
+MAIN_JOINTS: tuple[str, ...] = (
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+)
+#: Landmark indices of :data:`MAIN_JOINTS`, in the same order.
+MAIN_JOINT_INDEX: tuple[int, ...] = tuple(JOINT_INDEX[name] for name in MAIN_JOINTS)
+
 #: Column order of the output parquet (see ``docs/keypoint_schema.md``).
 PARQUET_COLUMNS: tuple[str, ...] = (
     "frame_idx",
@@ -240,16 +310,52 @@ PARQUET_COLUMNS: tuple[str, ...] = (
     "detected",
 )
 
+#: ``--rotate best`` adds these two columns: the mean visibility of the
+#: :data:`MAIN_JOINTS` the upright pass and the rotated pass each reported for
+#: the frame's lowest-wrist person. They are the numbers ``rotated`` was decided
+#: on, so a frame can be re-decided or questioned without re-running the model.
+SCORE_COLUMNS: tuple[str, ...] = ("score_upright", "score_rotated")
+#: :data:`PARQUET_COLUMNS` with :data:`SCORE_COLUMNS` in, right after ``rotated``
+#: — the flag they justify.
+PARQUET_COLUMNS_BEST: tuple[str, ...] = (
+    *PARQUET_COLUMNS[: PARQUET_COLUMNS.index("rotated") + 1],
+    *SCORE_COLUMNS,
+    *PARQUET_COLUMNS[PARQUET_COLUMNS.index("rotated") + 1 :],
+)
+
 #: ``--num-poses > 1`` adds this column: which person of the frame a row is
-#: about (0..P-1, ``NO_PERSON_IDX`` on the empty block of an undetected frame).
+#: about (0..P-1, :data:`NO_PERSON_IDX` on the empty block of an undetected frame).
 PERSON_COLUMN = "person_idx"
 #: :data:`PARQUET_COLUMNS` plus the per-person label.
 PARQUET_COLUMNS_MULTI: tuple[str, ...] = (*PARQUET_COLUMNS, PERSON_COLUMN)
+#: ``--num-poses > 1`` with ``--rotate best``: the multi schema plus the scores.
+PARQUET_COLUMNS_BEST_MULTI: tuple[str, ...] = (*PARQUET_COLUMNS_BEST, PERSON_COLUMN)
 #: ``person_idx`` of the single NaN block written for a frame with nobody in it.
 NO_PERSON_IDX = -1
 
 #: ``(x, y, z, visibility, presence)`` per landmark.
 _LANDMARK_FIELDS = 5
+
+# --------------------------------------------------------------------------- #
+# --rotate best: reading one frame's orientation without letting it flicker
+# --------------------------------------------------------------------------- #
+
+#: Width of the centred window, in **seconds of clip time**, that a frame's
+#: orientation margin is averaged over before it is read. Time, not frames:
+#: these clips are variable frame rate. Half a second is several frames of a
+#: handstand and short enough to follow a real change, which is what leaves a
+#: confident one-frame misread with no weight to speak for.
+ORIENT_WINDOW_S = 0.5
+#: How much surer of the rotated pass the model has to be before the margin
+#: counts as a preference at all. Visibility differences below this are inside
+#: the model's own noise on a single frame, so they neither start a switch nor
+#: hold one open.
+ORIENT_MARGIN = 0.05
+#: How long such a preference has to hold, in seconds, before the orientation
+#: actually switches. A quarter of a second of clip time: shorter than anything
+#: a person does getting onto their hands and off them again, longer than the
+#: isolated misreads that made the per-frame rule flicker.
+ORIENT_MIN_SWITCH_S = 0.3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -513,6 +619,26 @@ def mean_wrist_y(landmarks_px: np.ndarray) -> float:
     return float(wrists.mean())
 
 
+def _lowest_wrist_index(poses_px: np.ndarray) -> int:
+    """Index of the person whose wrists sit lowest, out of a ``(P, 33, >=2)`` frame.
+
+    The rule itself, as an index rather than a copy, so a caller that only wants
+    to know *which* person it is (the ``--rotate best`` score) does not have to
+    take the whole pose out of the array. An empty frame has no person to pick
+    and raises, so check ``P`` first.
+    """
+    pts = np.asarray(poses_px, dtype=np.float64)
+    if pts.ndim != 3 or pts.shape[0] < 1 or pts.shape[1] != len(JOINT_NAMES) or pts.shape[2] < 2:
+        raise ValueError(f"expected (P, {len(JOINT_NAMES)}, >=2) poses, got {pts.shape}")
+    if pts.shape[0] == 1:
+        return 0
+    scores = [mean_wrist_y(pose) for pose in pts]
+    rankable = [index for index, score in enumerate(scores) if np.isfinite(score)]
+    if not rankable:
+        return 0
+    return max(rankable, key=lambda index: scores[index])
+
+
 def lowest_wrist_pose(poses_px: np.ndarray) -> np.ndarray | None:
     """Of several people in a frame, the one whose wrists sit lowest.
 
@@ -525,17 +651,43 @@ def lowest_wrist_pose(poses_px: np.ndarray) -> np.ndarray | None:
     when nobody can be (or when there is only one person) the first person is
     returned, so a single-person frame is judged exactly as it always was. An
     empty ``(0, 33, 2)`` array has no person to pick and raises.
+
+    It is also the person ``--rotate best`` scores (:func:`mean_main_visibility`)
+    and the person both rotation rules judge a frame by.
     """
     pts = np.asarray(poses_px, dtype=np.float64)
-    if pts.ndim != 3 or pts.shape[0] < 1 or pts.shape[1] != len(JOINT_NAMES) or pts.shape[2] < 2:
-        raise ValueError(f"expected (P, {len(JOINT_NAMES)}, >=2) poses, got {pts.shape}")
-    if pts.shape[0] == 1:
-        return pts[0]
-    scores = [mean_wrist_y(pose) for pose in pts]
-    rankable = [index for index, score in enumerate(scores) if np.isfinite(score)]
-    if not rankable:
-        return pts[0]
-    return pts[max(rankable, key=lambda index: scores[index])]
+    return pts[_lowest_wrist_index(pts)]
+
+
+def mean_main_visibility(poses_px: np.ndarray) -> float:
+    """Mean visibility of the :data:`MAIN_JOINTS` of a frame's lowest-wrist person.
+
+    This is the score ``--rotate best`` compares the two orientations of a frame
+    on: the body the model is more sure of is the body it read the right way
+    round, so a handstand that only looks like a handstand once it has been
+    turned wins. Only the 12 main joints count, so a confidently detected nose
+    cannot carry a skeleton the model has the rest of wrong, and only the scores
+    that exist are averaged (NaN when the model reported none) — exactly what
+    :func:`handstand.athlete.mean_visibility` does, which is the same term under
+    the same constant.
+
+    ``poses_px`` is shaped ``(P, 33, 5)`` in display-frame pixels; the person
+    whose wrists are lowest in the image is the one scored
+    (:func:`lowest_wrist_pose`), so a frame with a trainer in it is judged on the
+    athlete. A frame with nobody in it has nothing to score and returns NaN.
+    """
+    pts = np.asarray(poses_px, dtype=np.float64)
+    if pts.ndim != 3 or pts.shape[1:] != (len(JOINT_NAMES), _LANDMARK_FIELDS):
+        raise ValueError(
+            f"expected (P, {len(JOINT_NAMES)}, {_LANDMARK_FIELDS}) poses, got {pts.shape}"
+        )
+    if pts.shape[0] == 0:
+        return float("nan")
+    scores = pts[_lowest_wrist_index(pts)][list(MAIN_JOINT_INDEX), 3]
+    usable = scores[np.isfinite(scores)]
+    if not usable.size:
+        return float("nan")
+    return float(usable.mean())
 
 
 def _detect_pose(
@@ -574,6 +726,160 @@ def _detect_pose(
         [[[lm.x, lm.y, lm.z, lm.visibility, lm.presence] for lm in pose] for pose in poses],
         dtype=np.float64,
     )
+
+
+def _display_pixels(
+    pose_norm: np.ndarray,
+    inference_frame: np.ndarray,
+    rotated: bool,
+    display_width: int,
+    display_height: int,
+) -> np.ndarray:
+    """Normalised landmarks -> display-frame pixels, undoing a 180° map-back.
+
+    ``pose_norm`` is one frame's ``(P, 33, 5)`` detection, ``x``/``y`` still
+    normalised to the frame the model *saw* (``inference_frame``, which is the
+    display frame itself unless the frame was turned). ``x``/``y`` are scaled to
+    pixel indices of that frame and, when the frame was rotated 180°, mirrored
+    back into display coordinates. ``z``/``visibility``/``presence`` pass
+    through untouched, so this is the only place rotated coordinates exist.
+    """
+    pose_px = pose_norm.copy()
+    pose_px[..., :2] = normalized_to_pixels(
+        pose_norm[..., :2],
+        inference_frame.shape[1],
+        inference_frame.shape[0],
+    )
+    if rotated:
+        pose_px[..., :2] = inverse_rotate_points(
+            pose_px[..., :2], 180, display_width, display_height
+        )
+    return pose_px
+
+
+def frame_margin(score_upright: Sequence[float], score_rotated: Sequence[float]) -> np.ndarray:
+    """``score_rotated - score_upright`` per frame: which pass the model is surer of.
+
+    A frame one pass found nobody in has **no** margin, not a margin of ``inf``:
+    there is no body to be surer of, and the two numbers would not be comparable.
+    Those frames come out NaN, which is what makes them ignorable rather than
+    decisive.
+    """
+    upright = np.asarray(score_upright, dtype=np.float64).reshape(-1)
+    rotated = np.asarray(score_rotated, dtype=np.float64).reshape(-1)
+    if upright.size != rotated.size:
+        raise ValueError(
+            f"expected one score per frame, got {upright.size} upright and {rotated.size} rotated"
+        )
+    margin = rotated - upright
+    return np.where(np.isfinite(margin), margin, np.nan)
+
+
+def smooth_margin(
+    t_ms: Sequence[float],
+    margin: Sequence[float],
+    window_s: float = ORIENT_WINDOW_S,
+) -> np.ndarray:
+    """A centred moving average of :func:`frame_margin`, in **clip time**.
+
+    ``t_ms`` is the frame timestamps in milliseconds, strictly increasing as
+    :class:`DisplayVideo` guarantees; the window is ``window_s`` seconds wide and
+    centred on each frame, so the smoothing is symmetric and a frame is read from
+    the same amount of clip on either side of it. These clips are variable frame
+    rate, so the window is counted in milliseconds and not in frames.
+
+    NaN margins (a frame one or both passes could not score) are skipped rather
+    than counted as zero: a frame the model found nobody in says nothing about
+    which way round the body is. A frame with no scorable neighbour inside its
+    window stays NaN, and the caller reads that as "no evidence here".
+    """
+    times = np.asarray(t_ms, dtype=np.float64).reshape(-1)
+    values = np.asarray(margin, dtype=np.float64).reshape(-1)
+    if times.size != values.size:
+        raise ValueError(
+            f"expected one margin per frame, got {values.size} for {times.size} frames"
+        )
+    smoothed = np.full(times.size, np.nan)
+    # The window is in seconds, the timestamps in milliseconds.
+    half_ms = max(float(window_s), 0.0) * 1000.0 / 2.0
+    for index, t in enumerate(times):
+        first = int(np.searchsorted(times, t - half_ms, side="left"))
+        last = int(np.searchsorted(times, t + half_ms, side="right"))
+        window = values[first:last]
+        usable = window[np.isfinite(window)]
+        if usable.size:
+            smoothed[index] = float(usable.mean())
+    return smoothed
+
+
+def _opening_orientation(times: np.ndarray, smoothed: np.ndarray) -> bool:
+    """The orientation a clip starts in: the sign of its opening smoothed margin.
+
+    The first :data:`ORIENT_WINDOW_S` of the clip, which is long enough that one
+    confused frame cannot start the clip the wrong way round. A tie, no evidence
+    at all, or a first window that ends before any frame is scored all start the
+    clip **upright**, the same as ``auto``'s first frame.
+    """
+    first = int(np.searchsorted(times, times[0] + ORIENT_WINDOW_S * 1000.0, side="right"))
+    opening = smoothed[:first]
+    usable = opening[np.isfinite(opening)]
+    if not usable.size:
+        return False
+    return bool(usable.mean() > 0.0)
+
+
+def choose_orientations(
+    t_ms: Sequence[float],
+    score_upright: Sequence[float],
+    score_rotated: Sequence[float],
+) -> np.ndarray:
+    """``--rotate best``'s decision: one ``rotated`` flag per frame, over the clip.
+
+    Mean visibility is a weak signal — the model can be surer of the *wrong* read
+    of a handstand for a frame or two — so the orientation is not decided frame
+    by frame. A body does not turn upside down between two frames, and reading
+    each frame on its own let confident-but-wrong frames flip the reading back
+    and forth: over the 180 clips that was most changes in runs of one or two
+    frames, in both directions (chainlink #79, lead review). So:
+
+    1. the per-frame margin :func:`frame_margin` is smoothed over a centred
+       :data:`ORIENT_WINDOW_S` window of clip time (:func:`smooth_margin`);
+    2. the clip starts in the orientation that window implies over its first
+       :data:`ORIENT_WINDOW_S` (:func:`_opening_orientation`);
+    3. and the orientation only **switches** once the smoothed margin has held
+       the other sign, by more than :data:`ORIENT_MARGIN`, for
+       :data:`ORIENT_MIN_SWITCH_S` — the hysteresis that keeps a one-frame
+       confident mistake, a tie and a frame nobody was found in from moving
+       anything.
+
+    The sustained runs still switch, and they switch on the frame where the
+    preference has held long enough, not afterwards: that is what fixes the
+    ``auto`` trap (``438c3693d6d7`` frame 138) rather than damping it.
+
+    Returns a bool per frame, in frame order, matching the ``rotated`` column.
+    """
+    times = np.asarray(t_ms, dtype=np.float64).reshape(-1)
+    smoothed = smooth_margin(times, frame_margin(score_upright, score_rotated))
+    if smoothed.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    rotated = _opening_orientation(times, smoothed)
+    choices = np.zeros(smoothed.size, dtype=bool)
+    #: The orientation a switch is currently being tested for, and the time the
+    #: test started; ``None`` while there is no switch in the offing.
+    pending: bool | None = None
+    pending_since = 0.0
+    for index, value in enumerate(smoothed):
+        wants_rotation = bool(value > 0.0)
+        if np.isfinite(value) and abs(value) > ORIENT_MARGIN and wants_rotation != rotated:
+            if pending is None or pending != wants_rotation:
+                pending, pending_since = wants_rotation, float(times[index])
+            elif float(times[index]) - pending_since >= ORIENT_MIN_SWITCH_S * 1000.0:
+                rotated, pending = pending, None
+        else:
+            pending = None
+        choices[index] = rotated
+    return choices
 
 
 def _close(landmarker: LandmarkerLike | None) -> None:
@@ -628,11 +934,16 @@ def _single_table(
     frame_t_ms: Sequence[int],
     frame_rotated: Sequence[bool],
     poses: Sequence[np.ndarray],
+    scores: Sequence[tuple[float, float]] | None = None,
 ) -> pd.DataFrame:
     """One row per (frame, joint): the single-person schema, no ``person_idx``.
 
     ``--num-poses 1`` means the model reported at most one person per frame, so
     person 0 is simply that person's pose and the layout is unchanged.
+
+    ``scores`` is one ``(upright, rotated)`` pair per frame, written out as
+    :data:`SCORE_COLUMNS`; ``--rotate best`` passes it, every other mode leaves
+    it out so its table stays the ten columns it has always been.
     """
     frame_count = len(poses)
     landmark_data = np.full((frame_count, len(JOINT_NAMES), _LANDMARK_FIELDS), np.nan)
@@ -644,20 +955,23 @@ def _single_table(
             detected[index] = True
 
     joints = np.asarray(JOINT_NAMES)
-    return pd.DataFrame(
-        {
-            "frame_idx": np.repeat(np.asarray(frame_idx, dtype=np.int64), len(JOINT_NAMES)),
-            "t_ms": np.repeat(np.asarray(frame_t_ms, dtype=np.int64), len(JOINT_NAMES)),
-            "joint": np.tile(joints, frame_count),
-            "x": landmark_data[..., 0].reshape(-1),
-            "y": landmark_data[..., 1].reshape(-1),
-            "z": landmark_data[..., 2].reshape(-1),
-            "visibility": landmark_data[..., 3].reshape(-1),
-            "presence": landmark_data[..., 4].reshape(-1),
-            "rotated": np.repeat(np.asarray(frame_rotated, dtype=bool), len(JOINT_NAMES)),
-            "detected": np.repeat(detected, len(JOINT_NAMES)),
-        }
-    )
+    columns: dict[str, Any] = {
+        "frame_idx": np.repeat(np.asarray(frame_idx, dtype=np.int64), len(JOINT_NAMES)),
+        "t_ms": np.repeat(np.asarray(frame_t_ms, dtype=np.int64), len(JOINT_NAMES)),
+        "joint": np.tile(joints, frame_count),
+        "x": landmark_data[..., 0].reshape(-1),
+        "y": landmark_data[..., 1].reshape(-1),
+        "z": landmark_data[..., 2].reshape(-1),
+        "visibility": landmark_data[..., 3].reshape(-1),
+        "presence": landmark_data[..., 4].reshape(-1),
+        "rotated": np.repeat(np.asarray(frame_rotated, dtype=bool), len(JOINT_NAMES)),
+    }
+    if scores is not None:
+        pairs = np.asarray(scores, dtype=np.float64).reshape(-1, 2)
+        columns[SCORE_COLUMNS[0]] = np.repeat(pairs[:, 0], len(JOINT_NAMES))
+        columns[SCORE_COLUMNS[1]] = np.repeat(pairs[:, 1], len(JOINT_NAMES))
+    columns["detected"] = np.repeat(detected, len(JOINT_NAMES))
+    return pd.DataFrame(columns)
 
 
 def _multi_table(
@@ -665,11 +979,15 @@ def _multi_table(
     frame_t_ms: Sequence[int],
     frame_rotated: Sequence[bool],
     poses: Sequence[np.ndarray],
+    scores: Sequence[tuple[float, float]] | None = None,
 ) -> pd.DataFrame:
     """One 33-row block per person: :data:`PARQUET_COLUMNS_MULTI`.
 
     Rows are ordered by ``frame_idx``, then ``person_idx`` (0..P-1, the order
-    MediaPipe returned the people in), then landmark index.
+    MediaPipe returned the people in), then landmark index. ``scores`` is the
+    same per-frame ``(upright, rotated)`` pair :func:`_single_table` takes, and
+    like ``rotated`` it describes the **frame**, so it repeats across the blocks
+    of that frame.
     """
     joints = np.asarray(JOINT_NAMES)
     landmark_blocks: list[np.ndarray] = []
@@ -688,21 +1006,24 @@ def _multi_table(
 
     stacked = np.concatenate(landmark_blocks, axis=0)
     repeat = np.asarray(rows_per_frame, dtype=np.int64)
-    return pd.DataFrame(
-        {
-            "frame_idx": np.repeat(np.asarray(frame_idx, dtype=np.int64), repeat),
-            "t_ms": np.repeat(np.asarray(frame_t_ms, dtype=np.int64), repeat),
-            "joint": np.concatenate(joint_blocks),
-            "x": stacked[:, 0],
-            "y": stacked[:, 1],
-            "z": stacked[:, 2],
-            "visibility": stacked[:, 3],
-            "presence": stacked[:, 4],
-            "rotated": np.repeat(np.asarray(frame_rotated, dtype=bool), repeat),
-            "detected": np.concatenate(detected_blocks),
-            PERSON_COLUMN: np.concatenate(person_blocks),
-        }
-    )
+    columns: dict[str, Any] = {
+        "frame_idx": np.repeat(np.asarray(frame_idx, dtype=np.int64), repeat),
+        "t_ms": np.repeat(np.asarray(frame_t_ms, dtype=np.int64), repeat),
+        "joint": np.concatenate(joint_blocks),
+        "x": stacked[:, 0],
+        "y": stacked[:, 1],
+        "z": stacked[:, 2],
+        "visibility": stacked[:, 3],
+        "presence": stacked[:, 4],
+        "rotated": np.repeat(np.asarray(frame_rotated, dtype=bool), repeat),
+    }
+    if scores is not None:
+        pairs = np.asarray(scores, dtype=np.float64).reshape(-1, 2)
+        columns[SCORE_COLUMNS[0]] = np.repeat(pairs[:, 0], repeat)
+        columns[SCORE_COLUMNS[1]] = np.repeat(pairs[:, 1], repeat)
+    columns["detected"] = np.concatenate(detected_blocks)
+    columns[PERSON_COLUMN] = np.concatenate(person_blocks)
+    return pd.DataFrame(columns)
 
 
 # --------------------------------------------------------------------------- #
@@ -780,16 +1101,27 @@ def run_clip(
     Clips whose parquet already exists are skipped unless ``overwrite`` is true.
 
     ``landmarker_factory`` is called once per needed tracker: once for
-    ``none``/``180``, twice for ``auto`` (upright tracker + rotated tracker).
-    Tests pass a factory that returns a stub detector instead of loading the
-    model. The factory is what actually builds the landmarker, so ``settings``
-    (running mode + score thresholds) is handed to it, not used here beyond
-    validation and the sidecar.
+    ``none``/``180``, twice for ``auto`` (upright tracker + rotated tracker),
+    and twice for ``best`` in VIDEO mode — a tracker that had seen upright and
+    rotated frames of the same clip would carry state from one into the other.
+    ``best`` in IMAGE mode keeps one landmarker, because the detector runs on
+    each image afresh and has no state to keep consistent. Tests pass a factory
+    that returns a stub detector instead of loading the model. The factory is
+    what actually builds the landmarker, so ``settings`` (running mode + score
+    thresholds) is handed to it, not used here beyond validation and the
+    sidecar.
 
     ``num_poses`` is how many people per frame the landmarker was asked for.
     With ``1`` the output is exactly the single-person schema and the file
     lands under the single-person root; above ``1`` every detected person gets
-    their own 33-row block labelled by ``person_idx``.
+    their own 33-row block labelled by ``person_idx``. ``rotate_mode`` ``best``
+    adds :data:`SCORE_COLUMNS` to whichever of the two schemas it writes; the
+    other modes write the columns they have always written.
+
+    ``best`` is the one mode that cannot decide a frame until it has seen the
+    clip: both passes of every frame are kept, the orientation comes out of
+    :func:`choose_orientations`, and the keypoints of the chosen pass are what
+    the table holds.
     """
     video_path = pathlib.Path(video_path)
     if rotate_mode not in ROTATE_MODES:
@@ -798,6 +1130,7 @@ def run_clip(
         raise ValueError(f"num_poses must be between 1 and {MAX_NUM_POSES}, got {num_poses}")
     settings.validate()
     multi = num_poses > 1
+    best = rotate_mode == "best"
 
     out_dir = pathlib.Path(out_root) / rotate_mode
     parquet_path = out_dir / f"{clip_id}.parquet"
@@ -818,15 +1151,20 @@ def run_clip(
         )
 
     started = time.perf_counter()
-    if rotate_mode == "auto":
-        upright_landmarker: LandmarkerLike | None = landmarker_factory()
+    if rotate_mode == "180":
+        upright_landmarker: LandmarkerLike | None = None
         rotated_landmarker: LandmarkerLike | None = landmarker_factory()
-    elif rotate_mode == "180":
-        upright_landmarker = None
-        rotated_landmarker = landmarker_factory()
     else:
         upright_landmarker = landmarker_factory()
-        rotated_landmarker = None
+        # A tracker is per orientation whenever the mode runs both of them *and*
+        # the model carries state between frames. `best` in IMAGE mode runs both
+        # off the one landmarker it has: the detector sees each image afresh, so
+        # there is no state for an orientation to be inconsistent with.
+        rotated_landmarker = (
+            landmarker_factory()
+            if rotate_mode == "auto" or (best and settings.running_mode != "image")
+            else None
+        )
 
     frame_idx: list[int] = []
     frame_t_ms: list[int] = []
@@ -834,55 +1172,100 @@ def run_clip(
     #: One ``(P, 33, 5)`` array of display-pixel poses per frame, ``P == 0``
     #: when nobody was detected.
     poses: list[np.ndarray] = []
+    #: ``best`` only: both orientations of every frame, because which one is kept
+    #: is not known until the whole clip has been scored.
+    upright_poses: list[np.ndarray] = []
+    rotated_poses: list[np.ndarray] = []
+    #: One ``(upright, rotated)`` visibility pair per frame, ``best`` only.
+    frame_scores: list[tuple[float, float]] = []
     display_width = display_height = 0
 
     try:
         with DisplayVideo(video_path) as video:
             display_width = video.display_width
             display_height = video.display_height
+
+            def detect(
+                landmarker: LandmarkerLike | None,
+                frame: np.ndarray,
+                t_ms: int,
+                rotated: bool,
+            ) -> np.ndarray:
+                """``(P, 33, 5)`` display pixels for one pass over one frame."""
+                assert landmarker is not None  # mode/instance pairing above
+                inference_frame = apply_display_rotation(frame, 180) if rotated else frame
+                pose_norm = _detect_pose(
+                    landmarker, inference_frame, t_ms, video_path, settings.running_mode
+                )
+                return _display_pixels(
+                    pose_norm, inference_frame, rotated, display_width, display_height
+                )
+
             rotate_next = False  # first frame is never rotated
             for packet in video:
-                rotated = rotate_mode == "180" or (rotate_mode == "auto" and rotate_next)
-                landmarker = rotated_landmarker if rotated else upright_landmarker
-                assert landmarker is not None  # mode/instance pairing above
-
-                inference_frame = (
-                    apply_display_rotation(packet.frame, 180) if rotated else packet.frame
-                )
-                pose_norm = _detect_pose(
-                    landmarker, inference_frame, packet.t_ms, video_path, settings.running_mode
-                )
-
-                # (P, 33, 5): scale x/y to pixel indices of the frame the model
-                # saw, then map back into display pixels; z/visibility/
-                # presence pass through untouched.
-                pose_px = pose_norm.copy()
-                pose_px[..., :2] = normalized_to_pixels(
-                    pose_norm[..., :2],
-                    inference_frame.shape[1],
-                    inference_frame.shape[0],
-                )
-                if rotated:
-                    pose_px[..., :2] = inverse_rotate_points(
-                        pose_px[..., :2], 180, display_width, display_height
+                if best:
+                    # Both orientations, every frame: the model is surer of one
+                    # of them, and which one is decided over the whole clip
+                    # rather than inherited from the frame before — the decision
+                    # `auto` makes is the one that can get stuck, and deciding it
+                    # one frame at a time is what let it flicker. In IMAGE mode
+                    # the rotated pass runs on the same landmarker, which has
+                    # nothing to carry over from the upright pass.
+                    upright_px = detect(upright_landmarker, packet.frame, packet.t_ms, False)
+                    rotated_px = detect(
+                        rotated_landmarker or upright_landmarker, packet.frame, packet.t_ms, True
                     )
+                    upright_poses.append(upright_px)
+                    rotated_poses.append(rotated_px)
+                    frame_scores.append(
+                        (mean_main_visibility(upright_px), mean_main_visibility(rotated_px))
+                    )
+                else:
+                    rotated = rotate_mode == "180" or (rotate_mode == "auto" and rotate_next)
+                    pose_px = detect(
+                        rotated_landmarker if rotated else upright_landmarker,
+                        packet.frame,
+                        packet.t_ms,
+                        rotated,
+                    )
+                    poses.append(pose_px)
+                    frame_rotated.append(rotated)
+                    if rotate_mode == "auto" and pose_px.shape[0]:
+                        # Decide from the PREVIOUS frame, in display
+                        # coordinates, from the person whose wrists are lowest in
+                        # the image — the one most likely to be the athlete on
+                        # their hands. A frame we failed to detect keeps the
+                        # previous decision.
+                        rotate_next = is_inverted(lowest_wrist_pose(pose_px))
 
                 frame_idx.append(packet.frame_idx)
                 frame_t_ms.append(packet.t_ms)
-                frame_rotated.append(rotated)
-                poses.append(pose_px)
-
-                if rotate_mode == "auto" and pose_px.shape[0]:
-                    # Decide from the PREVIOUS frame, in display coordinates,
-                    # from the person whose wrists are lowest in the image —
-                    # the one most likely to be the athlete on their hands. A
-                    # frame we failed to detect keeps the previous decision.
-                    rotate_next = is_inverted(lowest_wrist_pose(pose_px))
     finally:
         _close(upright_landmarker)
         _close(rotated_landmarker)
 
-    if not poses:
+    if best:
+        if not upright_poses:
+            raise RuntimeError(f"{video_path.name}: no frames decoded")
+        # The orientation is a property of the clip, not of one frame: both
+        # passes of every frame are in, so the choice is made over the whole
+        # sequence (`choose_orientations`) and the winning pass's keypoints are
+        # the ones written out.
+        frame_rotated = [
+            bool(rotated)
+            for rotated in choose_orientations(
+                frame_t_ms,
+                [pair[0] for pair in frame_scores],
+                [pair[1] for pair in frame_scores],
+            )
+        ]
+        poses = [
+            turned if rotated else upright
+            for upright, turned, rotated in zip(
+                upright_poses, rotated_poses, frame_rotated, strict=True
+            )
+        ]
+    elif not poses:
         raise RuntimeError(f"{video_path.name}: no frames decoded")
 
     frame_count = len(poses)
@@ -890,11 +1273,12 @@ def run_clip(
     detected_frames = sum(people > 0 for people in people_per_frame)
     rotated_frames = sum(frame_rotated)
     frames_by_people = people_histogram(people_per_frame) if multi else {}
+    scores: Sequence[tuple[float, float]] | None = frame_scores if best else None
 
     table = (
-        _multi_table(frame_idx, frame_t_ms, frame_rotated, poses)
+        _multi_table(frame_idx, frame_t_ms, frame_rotated, poses, scores)
         if multi
-        else _single_table(frame_idx, frame_t_ms, frame_rotated, poses)
+        else _single_table(frame_idx, frame_t_ms, frame_rotated, poses, scores)
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1024,6 +1408,26 @@ def output_dirname(num_poses: int = DEFAULT_NUM_POSES) -> str:
     return MULTI_OUTPUT_DIRNAME if num_poses > 1 else SINGLE_OUTPUT_DIRNAME
 
 
+def default_rotate_mode(num_poses: int = DEFAULT_NUM_POSES) -> str:
+    """The ``--rotate`` mode a run gets when the flag is not given.
+
+    A **multi-person** run gets :data:`RECOMMENDED_ROTATE` (``best``), the mode
+    the rest of the pipeline — ``handstand.athlete`` and every stage after it —
+    reads by default: an inverted body is what the model is worst at, and `best`
+    is the mode that reads each frame off itself instead of off its predecessor,
+    so it cannot get stuck reading a handstand as a person standing on their
+    head (chainlink #79).
+
+    A **single-person** run keeps ``none``, which is what the flag defaulted to
+    before the multi-person keypoints existed, so the historical output stays
+    byte-identical. ``none``, ``180``, ``auto`` and ``best`` all stay selectable
+    either way; this is only about what a command line gets for free.
+    """
+    if not 1 <= num_poses <= MAX_NUM_POSES:
+        raise ValueError(f"num_poses must be between 1 and {MAX_NUM_POSES}, got {num_poses}")
+    return RECOMMENDED_ROTATE if num_poses > 1 else "none"
+
+
 def make_landmarker_factory(
     model_path: str | pathlib.Path,
     num_poses: int = DEFAULT_NUM_POSES,
@@ -1095,8 +1499,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rotate",
         choices=ROTATE_MODES,
-        default="none",
-        help="frame rotation fed to the model (default: none)",
+        default=None,
+        help=(
+            "frame rotation fed to the model: none, 180, auto (rotated when the "
+            "*previous* frame read upside down) or best (both orientations of "
+            "every frame, the one the model is surer of kept, decided over the "
+            "whole clip so it cannot flicker, plus the score_upright/score_rotated "
+            "columns it was decided on); default: best with --num-poses > 1, "
+            f"none otherwise ({RECOMMENDED_ROTATE} is what the rest of the "
+            "pipeline reads)"
+        ),
     )
     parser.add_argument(
         "--num-poses",
@@ -1186,6 +1598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
 
+    rotate = args.rotate if args.rotate is not None else default_rotate_mode(args.num_poses)
     clips = collect_clips(args.clips, videos_dir())
     if args.limit is not None:
         clips = clips[: args.limit]
@@ -1198,7 +1611,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_root = data_dir() / "keypoints" / output_dirname(args.num_poses)
     model_name = pathlib.Path(args.model).name
     print(
-        f"rotate={args.rotate} num_poses={args.num_poses} running_mode={settings.running_mode} "
+        f"rotate={rotate} num_poses={args.num_poses} running_mode={settings.running_mode} "
         f"min_detection={settings.min_detection} min_presence={settings.min_presence} "
         f"min_tracking={settings.min_tracking} model={model_name} "
         f"clips={len(clips)} out={out_root}"
@@ -1211,7 +1624,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = run_clip(
                 path,
                 clip_id=clip_id,
-                rotate_mode=args.rotate,
+                rotate_mode=rotate,
                 out_root=out_root,
                 landmarker_factory=landmarker_factory,
                 overwrite=args.overwrite,

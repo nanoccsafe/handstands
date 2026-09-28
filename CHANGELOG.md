@@ -7,6 +7,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- `--rotate best`, the recommended rotation mode: every frame is run in **both**
+  orientations and the one the model is more sure of is kept, which breaks the
+  `auto` trap of reading an inverted body as a standing person and then never
+  rotating again because the misread says the body is upright (chainlink #79).
+  The choice is temporal, because a body does not turn upside down between two
+  frames: the per-frame margin `score_rotated - score_upright` is averaged over a
+  centred 0.5 s window of clip time (VFR aware, NaN frames skipped) and the
+  orientation only switches once that smoothed margin has held the other sign, by
+  more than 0.05, for 0.3 s. Over the 180 clips that is 95 orientation changes in
+  275 runs, of which **2** are three frames or shorter, against `auto`'s 3,639
+  changes in 3,819 runs of which 3,112 are three frames or shorter and the
+  per-frame rule's 16,418 — the flicker that made the per-frame version of this
+  mode unusable is gone and the sustained runs still switch. Against `auto` on
+  the frames both modes detected: 382 frames fixed and 567 broken (the lead
+  measured the per-frame rule at 381/255; excluding `55ce46938d00`, which the
+  model reads confidently and wrongly the other way round and which a clip-level
+  decision therefore commits to for 687 of its 743 frames, it is 382/286). The
+  stuck trap of the finding is fixed — `438c3693d6d7` frame 138 is written as
+  the handstand it is (wrist y 749, ankle y 326) instead of a person standing on
+  the mat (wrist y 427, ankle y 733), and `651b0b5783cc` goes from 81.1 % to
+  100 % of its frames read as a handstand. Both scores are written out as
+  `score_upright`/`score_rotated` next to the `rotated` flag they decided, so a
+  frame's choice can be re-decided later without re-running the model
+- `uv run python -m handstand.orient_measure`, the measurement behind the
+  `--rotate best` numbers: it reads the keypoints of two rotation modes and the
+  later stages' own outputs, and reports the orientation each mode used and how
+  often it changed, the frames each read as a handstand, the frames one fixed
+  and broke against the other with the run lengths of those changes, the clips
+  that moved, and the usable clips, holds and trainer presence the chain found.
+  It runs no model and writes nothing, so the tables in
+  `docs/keypoint_schema.md` can be produced again rather than taken on trust
+  (#79)
 - Phase segmentation: `uv run python -m handstand.phases --all` labels every
   frame of a clip `pre`, `kickup`, `hold`, `exit`, `post` or `unknown` and
   numbers the holds, so scoring reads only the hold frames and hand steps
@@ -75,6 +107,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- The multi-person pipeline defaults to `--rotate best` (chainlink #79):
+  `pose_mediapipe` with `--num-poses > 1`, and `handstand.athlete`,
+  `handstand.postprocess` and `handstand.trainer_report` (phases and features
+  read the post-processed trajectory, which has no rotation mode of its own).
+  `none`, `180`, `auto` and `best` all stay selectable, a single-person
+  `pose_mediapipe` run still defaults to `none`, and the modes other than
+  `best` are byte-identical to what they wrote before
 - FeatureExtractor: stacking offsets, joint angles, line and leg-shape features per frame (#22)
 - PhaseSegmenter: pre / kick-up / hold / exit / post per frame, with hold segments (#21)
 - Keypoint post-processing: gating, outlier removal, gap fill, One-Euro smoothing, body length (#20)

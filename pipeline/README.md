@@ -91,6 +91,25 @@ the share of frames the selection dropped, and the catalogue's `notes`. The
 markdown summary turns that into the dataset-level answer. Both files are derived
 data and are never committed. See `docs/keypoint_schema.md` for every column.
 
+## Rotation measure
+
+What a rotation mode changed over the dataset, read off the keypoints and the
+later stages' own outputs. Nothing is run and nothing is written: it is how the
+numbers in `docs/keypoint_schema.md` are produced, so they can be produced again.
+
+```sh
+cd pipeline
+uv run python -m handstand.orient_measure                 # best against auto, on the athlete pick
+uv run python -m handstand.orient_measure --pick multi     # on every person of the frame
+uv run python -m handstand.orient_measure --clips 438c3693d6d7 --no-chain
+```
+
+It reports the orientation each mode used and how often it changed (the flicker),
+the frames each mode read as a handstand, the frames one mode fixed and broke
+against the other with the run lengths of those changes, the clips that moved,
+and — from `processed/`, `phases/` and `reports/trainer_report.csv` — the usable
+clips and frames, the holds and the trainer presence the chain found.
+
 ## Keypoint post-processing
 
 The trajectory every later stage measures: the athlete keypoints gated, de-spiked,
@@ -103,8 +122,9 @@ uv run python -m handstand.postprocess --source vision --all
 uv run python -m handstand.postprocess --clips 6508f9b355bd --overwrite
 ```
 
-Reads `keypoints/mediapipe_athlete/auto/` (`--source vision` reads
-`vision_athlete/`) and writes one parquet and one sidecar per clip under
+Reads `keypoints/mediapipe_athlete/best/` (`--source vision` reads
+`vision_athlete/`; `--rotate auto` reads the `auto` keypoints the dataset was
+first measured with) and writes one parquet and one sidecar per clip under
 `$HANDSTAND_DATA/processed/<source>/`. The parquet keeps the input's long schema
 and rows, with `x`/`y` processed and NaN where there is no position, plus
 `x_raw`/`y_raw` (what the model said), `valid` and `filled` — so

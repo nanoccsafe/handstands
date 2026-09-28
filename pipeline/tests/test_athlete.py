@@ -1935,4 +1935,7 @@ def test_the_vision_missing_input_names_the_import(
     assert athlete.main(["--source", "vision", "--data", str(tmp_path / "empty")]) == 2
     captured = capsys.readouterr().out
     assert "no multi-person keypoints" in captured
-    assert "uv run python -m handstand.vision_import --rotate auto" in captured
+    # The command it names is the one for the mode the CLI defaults to, which is
+    # the recommended `best` (#79) and not the `auto` of the first dataset run.
+    assert athlete.DEFAULT_ROTATE == "best"
+    assert f"uv run python -m handstand.vision_import --rotate {athlete.DEFAULT_ROTATE}" in captured

@@ -19,9 +19,9 @@ expensive one: a multi-person run over the whole dataset takes tens of minutes,
 while the report on outputs that already exist takes seconds. ``--generate``
 writes exactly what the two CLIs write —
 
-    uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \\
+    uv run python -m handstand.pose_mediapipe --num-poses 3 \\
         --running-mode image --min-detection 0.2 --min-presence 0.2
-    uv run python -m handstand.athlete --rotate auto
+    uv run python -m handstand.athlete --rotate best
 
 — by calling the two ``run_clip`` functions those CLIs call, one clip at a time, so
 a run that is interrupted half way is resumed by simply running it again: both
@@ -734,9 +734,9 @@ def generate_clip(
     frame in :data:`DETECTOR_SETTINGS`, then :func:`handstand.athlete.run_clip` —
     so this writes exactly what::
 
-        uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \\
+        uv run python -m handstand.pose_mediapipe --num-poses 3 \\
             --running-mode image --min-detection 0.2 --min-presence 0.2 --clips VIDEO
-        uv run python -m handstand.athlete --rotate auto --clips CLIP_ID
+        uv run python -m handstand.athlete --rotate best --clips CLIP_ID
 
     write, in one process instead of two and one clip at a time. Both stages skip
     a clip whose parquet already exists unless ``overwrite``, which is what makes

@@ -155,8 +155,9 @@ decide the same way for both models whatever it is.
 CLI::
 
     cd pipeline
-    uv run python -m handstand.athlete --rotate auto
-    uv run python -m handstand.athlete --rotate auto --clips 6508f9b355bd
+    uv run python -m handstand.athlete                  # --rotate best, the default
+    uv run python -m handstand.athlete --clips 6508f9b355bd
+    uv run python -m handstand.athlete --rotate auto    # the dataset as first measured
     uv run python -m handstand.athlete --source vision --rotate auto
 """
 
@@ -180,6 +181,7 @@ from handstand.pose_mediapipe import (
     JOINT_NAMES,
     PARQUET_COLUMNS,
     PERSON_COLUMN,
+    RECOMMENDED_ROTATE,
     ROTATE_MODES,
     people_histogram,
 )
@@ -537,8 +539,13 @@ HEAD_JOINTS: tuple[str, ...] = (
 #: ``(x, y, z, visibility, presence)`` per landmark, as the runner writes them.
 LANDMARK_FIELDS = 5
 
-#: Rotation mode the CLI uses when ``--rotate`` is not given: the recommended one.
-DEFAULT_ROTATE = "auto"
+#: Rotation mode the CLI uses when ``--rotate`` is not given: the recommended
+#: one, which is what ``handstand.pose_mediapipe`` writes for a multi-person run
+#: (:data:`handstand.pose_mediapipe.RECOMMENDED_ROTATE`) — the mode whose
+#: keypoints are read correctly, with a handstand no longer stuck as a person
+#: standing on their head (chainlink #79). ``auto`` is still selectable and is
+#: what the dataset was first measured with.
+DEFAULT_ROTATE = RECOMMENDED_ROTATE
 
 
 def _indices(joint_names: Sequence[str]) -> tuple[int, ...]:

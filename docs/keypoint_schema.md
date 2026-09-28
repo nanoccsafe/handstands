@@ -25,9 +25,10 @@ same columns, same types, same coordinate conventions.
 
 * `<data_dir>` = `handstand.paths.data_dir()` (default
   `/mnt/sharedOs/handstand-workspace/data`, override with `$HANDSTAND_DATA`).
-* `<rotate>` = the rotation mode the file was produced with: `none`, `180` or
-  `auto`. The three modes are independent outputs of the same clip, never
-  merged — compare them side by side.
+* `<rotate>` = the rotation mode the file was produced with: `none`, `180`,
+  `auto` or `best` (the recommended one — see
+  [Rotation modes](#rotation-modes)). The modes are independent outputs of the
+  same clip, never merged — compare them side by side.
 * `mediapipe_multi` only exists for `--num-poses > 1`. A multi-person run
   writes to its own root, so it can never overwrite the single-person
   parquets the other stages read.
@@ -54,13 +55,20 @@ Generate the model first with `cd pipeline && uv run python scripts/download_mod
 cd pipeline
 uv run python -m handstand.pose_mediapipe --rotate none --limit 3
 uv run python -m handstand.pose_mediapipe --rotate auto --limit 3
-uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
+uv run python -m handstand.pose_mediapipe --rotate best --limit 3
 
 # the recommended multi-person setting, then the athlete selection on top of it
-uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \
+# (--rotate best is the default of both, so it does not have to be given)
+uv run python -m handstand.pose_mediapipe --num-poses 3 \
     --running-mode image --min-detection 0.2 --min-presence 0.2
-uv run python -m handstand.athlete --rotate auto
+uv run python -m handstand.athlete
 uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
+
+# auto-vs-best on one clip, two panels side by side
+uv run python -m handstand.overlay --clip 438c3693d6d7 --modes auto best
+
+# and what that difference is over the whole dataset
+uv run python -m handstand.orient_measure
 
 # the same selection over the Apple Vision keypoints (chainlink #16's bake-off)
 uv run python -m handstand.athlete --source vision --rotate auto
@@ -88,6 +96,11 @@ a block per person; see [Several people per frame](#several-people-per-frame---n
 
 Rows are ordered by `frame_idx`, then by landmark index (the order of the
 table below).
+
+A `--rotate best` run adds two more columns, `score_upright` and
+`score_rotated`, between `rotated` and `detected` (see
+[`--rotate best`](#rotate-best)). Every other mode writes exactly the ten
+columns above, byte-for-byte as it always did.
 
 ### Coordinates are always display-frame pixels
 
@@ -120,6 +133,14 @@ point and its mirrored normalised coordinates map to the same display pixel:
 the `none` and `auto` outputs of a clip agree to the model's own accuracy
 rather than being offset by a pixel.
 
+Worth remembering what "rotated" means for the *pose*: turned 180°, a
+handstand looks like a person standing with their arms up, which is the pose
+the model is good at. So a correctly read handstand has its **wrists below its
+ankles in the display frame** (`mean wrist y > mean ankle y`) whichever of the
+two passes found it, because the map-back puts the hands back on the floor.
+`is_inverted` — that one comparison — is the measure the phases stage and the
+#79 measurement both use.
+
 `z` is depth along the camera axis, which an in-plane 180° rotation does not
 touch, so it passes through unchanged.
 
@@ -139,7 +160,7 @@ them; the runner never picks the athlete — that is a later step, reading the
 `person_idx` column described here.
 
 ```
-uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
+uv run python -m handstand.pose_mediapipe --rotate best --num-poses 3
 ```
 
 * Output root: `keypoints/mediapipe_multi/<rotate>/<clip_id>.{parquet,json}`.
@@ -159,7 +180,9 @@ uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
   placeholder the single-person schema uses, so a frame is never missing from
   the file. `person_idx = -1` therefore means "no person", never "person -1".
 * `frame_idx`, `t_ms` and `rotated` describe the *frame*, so they repeat
-  across the blocks of that frame.
+  across the blocks of that frame. So do `score_upright`/`score_rotated` in a
+  `--rotate best` run: one pair of scores per frame, repeated over that frame's
+  blocks.
 * Coordinates are display-frame pixels, as above; `z`, `visibility` and
   `presence` are that person's own scores.
 
@@ -204,10 +227,16 @@ stage keeps working unchanged.
 
 ```sh
 cd pipeline
-uv run python -m handstand.athlete --rotate auto
-uv run python -m handstand.athlete --rotate auto --clips 6508f9b355bd
+uv run python -m handstand.athlete                       # --rotate best, the default
+uv run python -m handstand.athlete --clips 6508f9b355bd
+uv run python -m handstand.athlete --rotate auto         # the dataset as first measured
 uv run python -m handstand.athlete --source vision --rotate auto   # Apple Vision
 ```
+
+`--rotate` takes any of the four modes and defaults to `best`, the recommended
+one (chainlink #79), so a run without it works on the `best` keypoints; `auto`
+is what the dataset was first measured with and is still one flag away. The
+selection itself does not know or care which mode it is reading.
 
 `--source {mediapipe,vision}` (default `mediapipe`, whose output is unchanged)
 picks the pair of directories to work on and nothing else: the same rules, the
@@ -414,8 +443,8 @@ uv run python -m handstand.postprocess --clips 6508f9b355bd --overwrite
 ```
 
 Note that unlike `keypoints/` there is no rotation-mode directory: one clip has
-one processed trajectory, the recommended `auto` mode, and re-running a clip in
-another mode needs `--overwrite`.
+one processed trajectory, and re-running a clip in another mode needs
+`--overwrite`.
 
 | column | type | meaning |
 |---|---|---|
@@ -620,11 +649,11 @@ The authoritative list in code is `handstand.pose_mediapipe.JOINT_NAMES`.
 | `clip_id` | id used in the file names |
 | `source_file` | basename of the input video |
 | `model` | model file name (not the full path) |
-| `rotate` | `none`, `180` or `auto` |
+| `rotate` | `none`, `180`, `auto` or `best` |
 | `display_width`, `display_height` | size of the frames the coordinates refer to |
 | `frame_count` | decoded frames (rows / 33) |
 | `detected_frame_count` | frames with at least one pose |
-| `rotated_frame_count` | frames fed to the model rotated 180°: `frame_count` for mode `180`, `0` for mode `none`, and in `auto` the number of frames the previous frame's judgement switched on |
+| `rotated_frame_count` | frames fed to the model rotated 180°: `frame_count` for mode `180`, `0` for mode `none`, in `auto` the number of frames the previous frame's judgement switched on, and in `best` the frames whose rotated read won on score |
 | `mediapipe_version` | version used for the run |
 | `runtime_seconds` | wall-clock seconds for the whole clip, including writing the parquet |
 
@@ -675,18 +704,264 @@ selection instead:
 | `none` | as displayed | all false |
 | `180` | every frame rotated 180° | all true |
 | `auto` | 180° when the *previous* frame's result was inverted — mean y of both wrists greater (lower in the image) than mean y of both ankles, computed in display coordinates; the first frame is never rotated; a frame with no detection keeps the previous decision | true on rotated frames |
+| `best` | **both** orientations of every frame; the orientation is decided over the whole clip ([below](#rotate-best-reads-the-whole-clip-not-one-frame)) and the read it picks is the one kept | true where the clip was read rotated |
 
-`auto` owns two landmarker instances (one that only ever sees upright frames,
-one that only ever sees rotated frames) so each MediaPipe VIDEO-mode tracker
-observes a consistent orientation.
+**`best` is the recommended mode**, and it is the default of the multi-person
+setting of `pose_mediapipe` and of `handstand.athlete` and every stage after it;
+`auto` is kept, one `--rotate auto` away, because it is what the dataset was
+measured with first. The reason is a trap `auto` cannot get out of
+(chainlink #79). `auto` decides each frame from the **previous** frame's
+skeleton: once MediaPipe has misread an inverted body as a standing person, the
+wrists are *above* the ankles, "not inverted" is concluded, and no frame is ever
+rotated again — however wrong that read was. It is self-reinforcing, and in
+`438c3693d6d7` frame 138 (wrist y 427, ankle y 733) the athlete is written down
+as a person standing on their head for the rest of the clip.
 
-With `--num-poses > 1` the `auto` judgement is taken from **the person whose
-wrists are lowest in the image** of the previous frame — the largest mean wrist
-`y` — because that is the one most likely to be the athlete on their hands.
-People whose wrists are not both visible cannot be ranked and are skipped; if
-no person can be ranked the first person is judged instead, which for a
-single-person frame is exactly the rule above. A frame where nobody was
-detected at all still keeps the previous decision.
+### `--rotate best` reads the whole clip, not one frame
+
+Per frame, `best` runs **both** orientations and scores them, as it always did:
+
+1. Run the landmarker on the frame **as displayed** and on the **same frame
+   rotated 180°**, and map the rotated result back into display pixels.
+2. Score each of the two by the **mean visibility of the 12 main joints**
+   (shoulders, elbows, wrists, hips, knees, ankles — the same set, in the same
+   order, as `handstand.athlete.MAIN_JOINTS`, so a confidently detected nose
+   cannot carry a body the model has the rest of wrong). Only the scores the
+   model actually reported are averaged; a frame with nobody in it scores NaN.
+3. Write **both** scores out as `score_upright` and `score_rotated` next to the
+   `rotated` flag they decided, so any frame's choice can be re-examined later
+   without re-running the model.
+
+What changed is step 4, the choice itself. A body's orientation does not change
+between two frames, and reading each frame's scores on its own let the model flip
+the reading back and forth: over the 180 clips the per-frame rule made **16,418**
+orientation changes, and most of them were one or two frames long, **in both
+directions**. So the choice is now temporal
+(`pose_mediapipe.choose_orientations`):
+
+1. The per-frame **margin** `score_rotated - score_upright` is NaN wherever a
+   pass found nobody: a pass with no body in it has no score to compare.
+2. The margin is averaged over a centred window of `ORIENT_WINDOW_S` = **0.5 s
+   of clip time** — these clips are variable frame rate, so the window is counted
+   in milliseconds and not in frames — ignoring the NaN frames.
+3. The clip **opens** in the orientation the sign of that smoothed margin gives
+   over its first 0.5 s. A tie, or no evidence at all in that window, opens it
+   upright, which is `auto`'s first frame.
+4. After that the orientation only **switches** once the smoothed margin has held
+   the other sign, by more than `ORIENT_MARGIN` = **0.05**, for
+   `ORIENT_MIN_SWITCH_S` = **0.3 s** — and the switch happens on the frame where
+   that has held long enough. A tie, a margin inside the band, a frame neither
+   pass could score and a one- or two-frame confident-but-wrong read all keep
+   the clip where it is.
+
+That is **95** orientation changes over the 180 clips instead of 16,418, and the
+sustained runs still switch: the stuck trap is not damped away, it is the only
+kind of change left. (`auto` switches 3,639 times over the same clips — it
+follows the previous frame too — so the temporal rule is 38 times steadier than
+the mode it replaces and 173 times steadier than the per-frame one; both counts
+and their run lengths are in the tables
+[below](#what-it-cost-and-what-it-bought-over-the-180-clips).) The opening is a
+plain **sign**, not a sign past the band,
+because the window is centred and 89 % of the clips' opening mean margin is
+inside the band — for those clips the opening window is the only decision there
+is, and gating it as well would read them all upright, including the ones the
+mode fixes.
+
+With `--num-poses > 1` each of the two scores is taken from **the person whose
+wrists are lowest in the image** of that pass (the largest mean wrist `y`,
+`pose_mediapipe.lowest_wrist_pose`), the one most likely to be the athlete on
+their hands — the same person `auto` judges, and the same rule
+`vision_import` applies to pick the single person out of a Vision frame.
+
+`auto` and `best` own two landmarker instances in **VIDEO** mode (one that only
+ever sees upright frames, one that only ever sees rotated frames) so each
+MediaPipe tracker observes a consistent orientation. In **IMAGE** mode `best`
+keeps one landmarker: the detector runs on every image with no state to carry
+over, so there is nothing for an orientation to be inconsistent with.
+
+```python
+import pandas as pd
+
+best = pd.read_parquet(".../keypoints/mediapipe_multi/best/1a2b3c4d5e6f.parquet")
+# the frames where the two passes were close enough to be worth a look
+close = best[(best["score_rotated"] - best["score_upright"]).abs() < 0.05]
+close[["frame_idx", "rotated", "score_upright", "score_rotated"]].drop_duplicates()
+```
+
+### What it cost and what it bought, over the 180 clips
+
+Every number in this section comes out of one command, which reads the keypoints
+and the chain's own outputs and writes nothing::
+
+    cd pipeline
+    uv run python -m handstand.orient_measure               # best against auto
+    uv run python -m handstand.orient_measure --pick multi   # every person, not the athlete
+    uv run python -m handstand.orient_measure --clips 438c3693d6d7 --no-chain
+
+`handstand.orient_measure` counts the frames whose skeleton reads as a handstand
+(mean wrist `y` greater than mean ankle `y`) per mode, the frames one mode fixed
+and broke against the other, and the runs of frames the changes come in, plus
+the usable clips, holds and trainer presence the later stages produced. The
+counts it uses are fixed: the **athlete pick** (one body per frame — the
+skeleton everything downstream uses, `keypoints/mediapipe_athlete/<mode>/`, or
+with `--pick multi` the person whose wrists are lowest in the image of
+`keypoints/mediapipe_multi/<mode>/`), a mode's share over **the frames it
+detected**, and fixed/broken over **the frames both modes detected**.
+
+`--num-poses 3 --running-mode image --min-detection 0.2 --min-presence 0.2`
+(`--rotate best` is the default of a multi-person run) over all 180 clips costs
+**57.0 min** of model time against `auto`'s 30.0 min — it
+runs the model on every frame twice, and the decision itself (both scores over
+the whole clip) is milliseconds. It finds a body in **98.7 %** of frames against
+`auto`'s 98.2 %; the per-frame version of this mode, measured before the keypoints
+were re-run, found a body in 99.4 %, and the frames it gains back are ones on
+which the orientation the clip is
+committed to found nobody while the other pass found a body — a frame written as
+"no body" rather than as the other orientation's skeleton, which is the price of
+holding one orientation over a clip.
+
+**The flicker is what the temporal rule is for, and it is the one thing it
+fixes.** `auto` follows the previous frame's skeleton, and the model makes that
+decision change its mind constantly:
+
+| over the 180 clips | `auto` | `best` |
+|---|---|---|
+| orientation switches | **3,639** | **95** |
+| runs of one orientation | 3,819 | 275 |
+| … median / p90 / longest run, in frames | 1 / 13 / 1,646 | 185 / 543 / 1,245 |
+| runs of 3 frames or less (flicker) | 3,112 of 3,819 (81 %) | **2 of 275** |
+
+So 3,112 of the 3,819 stretches `auto` is read in last three frames or less. A
+body does not do that; the per-frame rule, which made 16,418 orientation changes
+over the same clips, is that behaviour plus a stronger dose of it.
+
+What it bought, on the frames it judged:
+
+| athlete pick, over the 180 clips | `auto` | `best` |
+|---|---|---|
+| frames read as a handstand | 59,553 of 63,610 detected (93.6 %) | 59,963 of 64,586 detected (92.8 %) |
+| frames fixed against `auto` | — | **382** |
+| frames broken against `auto` | — | **567** |
+| runs of fixed frames | — | 226, median 1, p90 2, longest 52; 96.0 % of them ≤ 3 frames |
+| runs of broken frames | — | 158, median 1, p90 3, longest 198; 89.9 % of them ≤ 3 frames |
+| clips better / worse / unchanged | — | 29 / 27 / 124 |
+| clips moving more than 10 points | — | 6 |
+
+Over the multi-person keypoints — the person whose wrists are lowest, i.e. the
+athlete candidate, before the athlete rules pick between bodies — the same
+picture: 89.8 % of 66,669 frames read as a handstand under `auto` against 89.9 %
+of 67,012 under `best`, 1,134 frames fixed against 973 broken, 32 clips better,
+30 worse, 118 unchanged, 10 moving by more than 10 points.
+
+**This is a worse trade than the per-frame rule made, and the losses are one
+clip.** The lead's review measured the per-frame version of this mode at 381
+frames fixed against 255 broken (its keypoints have since been overwritten, so
+that row is quoted, not re-measured); the temporal rule fixes 382 and breaks
+567. 281 of those broken frames are `55ce46938d00`, and the rest are the same
+kind of clip. What happens there is the price of a consistent decision: the
+model is *surer* of the rotated read (mean score margin +0.043, outside the
+±0.05 band on 59 % of its frames) and the skeleton that read gives back is a
+person standing on the mat, so the clip is committed to it for 687 of its 743
+frames and 281 of them are lost at once, where a per-frame rule would have read
+a share of them correctly by luck. Excluding that one clip the temporal rule
+fixes 382 and breaks 286, i.e. the same fixes as the per-frame rule and barely
+more losses — the switch is not what costs, the commitment is.
+
+That is the trade the temporal rule makes, and the reason it is worth making
+here is the first table: 3,112 flicker runs of `auto` (and 16,418 orientation
+changes of the per-frame rule) become 2, while the long runs — the ones that are
+a real change of orientation — survive, up to 1,245 frames long.
+
+Clips: 29 improve, 27 get worse, 124 are unchanged, and 6 move by more than 10
+points:
+
+| clip | `auto` | `best` | frames fixed | frames broken |
+|---|---|---|---|---|
+| `55ce46938d00` | 95.6 % | 13.1 % | 0 | 281 |
+| `938484a5fa21` | 84.5 % | 57.2 % | 1 | 21 |
+| `651b0b5783cc` | 81.1 % | 100.0 % | 52 | 0 |
+| `13479d9e86a6` | 48.8 % | 65.4 % | 11 | 6 |
+| `42fe106ae68e` | 22.3 % | 35.9 % | 24 | 2 |
+| `cd1402aa803a` | 60.1 % | 70.6 % | 15 | 7 |
+
+Of the three clips the finding named, two behave as it says they should — but
+the first of them not for the reason one would guess — and the third does not move
+at all.
+`438c3693d6d7` goes from 98.7 % to 99.7 % read as a handstand, and its frame 138
+— the one in the issue, where `auto` reads the athlete as a person standing on
+the mat with their hands at chest height (wrist y 427, ankle y 733) — is read as
+the handstand it is (wrist y 749, ankle y 326). That frame is *not* one of the 26
+the new rule rotates (it rotates frames 576–601, where the model is surer of the
+rotated read): the trap there was that `auto` fed that frame turned and got one
+person back, a person standing. The upright pass of the same frame reports the
+athlete on their hands as well, and the athlete selection picks them, so the
+skeleton is right without the frame being turned at all. `651b0b5783cc` is the
+opposite case and the rule's own doing: the clip is read rotated from its first
+frame to its last (one run of 275), and its first 52 frames are the ones `auto`
+read as a standing person (wrist y 390, ankle y 664) and `best` reads as a
+handstand (wrist y 662, ankle y 375) — 52 frames fixed, in one run, and none
+broken. `5050dcb30e08` does not move at all: 0 frames fixed and 0 broken, because
+every frame of it reads the same under both modes, even though the two modes
+disagree about the orientation in 76 of its 190 frames and the clip's share goes
+80.7 % → 81.3 % on the frames `best` found a body in.
+
+What else changes: over the dataset the athlete selection flags 13,940 → 14,973
+trainer-contact frames and 73 → 74 clips with a trainer in them (`--rotate best`
+through `handstand.trainer_report`), and the frames with a person in them at all
+go 66,669 → 67,012.
+
+`score_upright`/`score_rotated` are what make the losses diagnosable: they say
+per frame how sure the model was of each read, so a clip like `55ce46938d00`
+can be re-decided on a different rule without re-running the model. The `rotated`
+column of every `best` run can be recomputed from the two score columns and
+`t_ms` alone, which is what makes that checkable: over the 180 clips,
+`choose_orientations` on the file's own scores reproduces the file's `rotated`
+column in every frame.
+
+### What the chain does with it
+
+Re-running the chain on the new keypoints (`handstand.athlete`, `postprocess`,
+`phases`, `features`, `trainer_report`, all with their defaults) against the same
+chain on `auto`. The `best` column is what
+`uv run python -m handstand.orient_measure` reads back off disk; the `auto`
+column is the changelog of #20, #21 and #69, which is the check that the two are
+counted the same way (the `auto` outputs are one `--rotate` away and have been
+overwritten); the per-frame column was measured on the earlier per-frame run,
+whose keypoints no longer exist, and is quoted, not re-measured:
+
+| | `auto` | `best`, per frame | `best`, over the clip |
+|---|---|---|---|
+| usable clips (a body length was measurable) | 178 | 177 | 177 |
+| usable frames | 67,603 | 67,220 | 67,431 |
+| clips with at least one hold | 166 | 165 | 163 |
+| hold time, seconds | 1,467.0 | 1,457.1 | 1,439.1 |
+| clips with a trainer in them | 73 | 76 | 74 |
+
+The temporal rule gives up three clips' worth of hold and 28 s of hold time
+against `auto`, and one clip and 10 s against the per-frame rule, on the strength
+of two clips: one whose skeletons are read the wrong way round for most of their
+length, and one whose skeletons are read right and then thrown away.
+`651b0b5783cc` is the second, and it is the clip this mode reads best — the
+athlete selection flags trainer contact on 268 of its 275 frames (against 244
+under `auto`), the post-processor gates all of them out, no body length is
+measurable on it, and it drops out of the 177 usable clips with its hold with it.
+That is the shape of the cost of reading a clip correctly: the skeleton the model
+returns for a handstand is long and thin in a way the trainer-contact rules read
+as a second person in it. None of the five numbers above says the keypoints are
+better, and none of them is what the mode is for: they are what the mode costs.
+
+Watching it settles the argument either way — `uv run python -m handstand.overlay
+--clip 438c3693d6d7 --source athlete --modes auto best` writes the two panels
+side by side (`<data_dir>/overlays/438c3693d6d7_athlete_auto-vs-best.mp4`),
+one rotation mode per panel, with the trainer-contact frames bordered in red. In
+`438c3693d6d7` frame 138 the `auto` panel draws a person standing on the mat with
+their hands at chest height, over an athlete whose head is on the mat; in the
+`best` panel the skeleton runs the length of the body, hands on the mat, feet at
+the ceiling. In `651b0b5783cc` the same thing happens over the first 52 frames
+and the two panels are identical after that, both modes having settled on the
+rotated read. In `5050dcb30e08` the two panels draw the same skeleton throughout,
+because every frame of it reads the same under both modes, even though the two
+modes feed the model different orientations in 76 of its 190 frames.
 
 ## Apple Vision
 
@@ -756,6 +1031,12 @@ next frame when the **previous** frame's body had its wrists below its ankles,
 judged from the person whose wrists are lowest, with the first frame never
 turned and a frame with nobody in it keeping the previous decision. Both
 implementations have to agree or the two runs are not comparable at all.
+
+**`best` is MediaPipe-only so far.** The Vision runner (`swift/VisionPose`,
+`handstand.vision_import`) still offers `none`, `180` and `auto`; the same two
+landmarker instances and the same 12-joint visibility score are what it would
+need, and until then a Vision run can only be compared against MediaPipe's
+`auto`.
 
 ### Vision joint names
 

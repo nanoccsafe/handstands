@@ -73,10 +73,12 @@ class StubLandmark:
     presence: float
 
 
-def make_pose(x: float = 0.5, y: float = 0.5, **overrides: float) -> list[StubLandmark]:
+def make_pose(
+    x: float = 0.5, y: float = 0.5, visibility: float = 0.9, **overrides: float
+) -> list[StubLandmark]:
     """33 stub landmarks; ``overrides`` sets y per joint name (e.g. left_wrist=0.9)."""
     return [
-        StubLandmark(x=x, y=overrides.get(name, y), z=-0.1, visibility=0.9, presence=0.8)
+        StubLandmark(x=x, y=overrides.get(name, y), z=-0.1, visibility=visibility, presence=0.8)
         for name in pm.JOINT_NAMES
     ]
 
@@ -91,15 +93,20 @@ def inverted_pose(x: float = 0.5) -> list[StubLandmark]:
     return handstand_pose(ankles_y=0.1, wrists_y=0.9, x=x)
 
 
-def handstand_pose(ankles_y: float, wrists_y: float, x: float = 0.5) -> list[StubLandmark]:
+def handstand_pose(
+    ankles_y: float, wrists_y: float, x: float = 0.5, visibility: float = 0.9
+) -> list[StubLandmark]:
     """Pose with both wrists at ``wrists_y`` and both ankles at ``ankles_y``.
 
     Everything else sits at ``y = 0.5``, so only the wrist/ankle comparison
     decides :func:`pm.is_inverted`. ``wrists_y > ankles_y`` is a handstand.
+    ``visibility`` is every joint's score, which is what ``--rotate best``
+    compares the two orientations of a frame on.
     """
     return make_pose(
         x=x,
         y=0.5,
+        visibility=visibility,
         left_wrist=wrists_y,
         right_wrist=wrists_y,
         left_ankle=ankles_y,
@@ -193,6 +200,22 @@ def people_script(
     return list(people_per_frame)
 
 
+def best_script(
+    *frames: tuple[list[list[StubLandmark]] | None, list[list[StubLandmark]] | None],
+) -> list[list[list[StubLandmark]] | None]:
+    """Script a ``--rotate best`` run: per frame, the upright pass then the rotated.
+
+    ``best`` runs both orientations of every frame, and the stub factory hands
+    every landmarker it creates the same counter, so a two-tracker VIDEO run
+    consumes the script in exactly this order (upright, rotated, upright, ...).
+    """
+    script: list[list[list[StubLandmark]] | None] = []
+    for upright, rotated in frames:
+        script.append(upright)
+        script.append(rotated)
+    return script
+
+
 def raw_display_frame(video_path: pathlib.Path, index: int) -> np.ndarray:
     """Decode frame ``index`` with plain OpenCV auto-orientation (ground truth)."""
     capture = cv2.VideoCapture(str(video_path))
@@ -284,6 +307,101 @@ def stub_video(monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
     return pathlib.Path("synthetic.mp4")
 
 
+#: A white pixel painted into the top-left corner of every frame, so a landmarker
+#: stub can tell the two orientations apart by looking at what it was handed.
+CORNER_MARK = 255
+
+
+class MarkedStubVideo(StubVideo):
+    """:class:`StubVideo` with a white pixel in the top-left corner of each frame.
+
+    A 180° rotation moves that pixel to the bottom-right corner, which is how
+    :class:`OrientationAwareLandmarker` knows whether it was fed the frame as
+    displayed or turned.
+    """
+
+    def __iter__(self):
+        for packet in super().__iter__():
+            frame = packet.frame.copy()
+            frame[0, 0] = CORNER_MARK
+            yield pm.FramePacket(frame_idx=packet.frame_idx, t_ms=packet.t_ms, frame=frame)
+
+
+@pytest.fixture
+def marked_video(monkeypatch: pytest.MonkeyPatch) -> pathlib.Path:
+    """Like :func:`stub_video`, but the frames carry :data:`CORNER_MARK`."""
+    monkeypatch.setattr(pm, "DisplayVideo", MarkedStubVideo)
+    return pathlib.Path("synthetic.mp4")
+
+
+class OrientationAwareLandmarker:
+    """Answers differently depending on the orientation of the image it is fed.
+
+    This is the model of the bug chainlink #79 found: an inverted body handed to
+    it as displayed reads as a *standing* person — wrists above the ankles — and
+    it is confident about that reading, so ``auto`` concludes "not inverted" and
+    never rotates again. Handed the same frame turned 180° it reads the
+    handstand correctly, and is slightly more confident still, which is what
+    ``best`` scores.
+    """
+
+    def __init__(
+        self,
+        upright_people: list[list[StubLandmark]],
+        rotated_people: list[list[StubLandmark]],
+    ) -> None:
+        self._upright = upright_people
+        self._rotated = rotated_people
+        self.timestamps: list[int] = []
+        self.detect_calls = 0
+        self.fed_upright: list[bool] = []
+        self.closed = False
+
+    def _answer(self, image: object) -> SimpleNamespace:
+        upright = int(np.asarray(image.numpy_view())[0, 0, 0]) == CORNER_MARK
+        self.fed_upright.append(upright)
+        people = self._upright if upright else self._rotated
+        return SimpleNamespace(pose_landmarks=list(people))
+
+    def detect_for_video(self, image: object, timestamp_ms: int) -> SimpleNamespace:
+        self.timestamps.append(timestamp_ms)
+        return self._answer(image)
+
+    def detect(self, image: object) -> SimpleNamespace:
+        self.detect_calls += 1
+        return self._answer(image)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def orientation_factory(
+    upright_people: list[list[StubLandmark]],
+    rotated_people: list[list[StubLandmark]],
+) -> tuple[object, list[OrientationAwareLandmarker]]:
+    """``(factory, created)`` for :class:`OrientationAwareLandmarker`, as :func:`stub_factory`."""
+    created: list[OrientationAwareLandmarker] = []
+
+    def factory() -> OrientationAwareLandmarker:
+        landmarker = OrientationAwareLandmarker(upright_people, rotated_people)
+        created.append(landmarker)
+        return landmarker
+
+    return factory, created
+
+
+#: The upright pass's read of a handstand: the model calls it a standing person,
+#: arms hanging (wrists y=0.2, ankles y=0.8) and *confident* about it at
+#: visibility 0.9 — which is what closes the ``auto`` trap.
+MISREAD_STANDING = handstand_pose(ankles_y=0.8, wrists_y=0.2, visibility=0.9)
+#: The rotated pass's read of the same handstand, in the rotated frame's own
+#: coordinates: turned 180°, a handstand *is* a person standing with their arms
+#: up (wrists y=0.1, ankles y=0.9), which is what the model is good at, and it
+#: is surer of it still (0.95). Mapped back into display pixels this becomes the
+#: handstand the frame actually shows: wrists at the floor, ankles above them.
+CORRECT_TURNED_READ = handstand_pose(ankles_y=0.9, wrists_y=0.1, visibility=0.95)
+
+
 # --------------------------------------------------------------------------- #
 # Pure helpers
 # --------------------------------------------------------------------------- #
@@ -320,6 +438,229 @@ def test_multi_schema_is_the_single_schema_plus_person_idx() -> None:
     assert pm.NO_PERSON_IDX == -1
     assert pm.DEFAULT_NUM_POSES == 1
     assert pm.MAX_NUM_POSES == 5
+
+
+def test_best_mode_is_a_choice_and_adds_both_scores() -> None:
+    """``best`` is a ``--rotate`` choice and its schema is the old one plus the scores."""
+    assert pm.ROTATE_MODES == ("none", "180", "auto", "best")
+    assert pm.SCORE_COLUMNS == ("score_upright", "score_rotated")
+    assert pm.PARQUET_COLUMNS_BEST == (
+        "frame_idx",
+        "t_ms",
+        "joint",
+        "x",
+        "y",
+        "z",
+        "visibility",
+        "presence",
+        "rotated",
+        "score_upright",
+        "score_rotated",
+        "detected",
+    )
+    assert pm.PARQUET_COLUMNS_BEST_MULTI == (*pm.PARQUET_COLUMNS_BEST, pm.PERSON_COLUMN)
+    # The scores describe the frame, like `rotated`, and sit right after it.
+    assert pm.PARQUET_COLUMNS_BEST.index("rotated") + 1 == pm.PARQUET_COLUMNS_BEST.index(
+        "score_upright"
+    )
+    # Every other mode keeps the ten columns it has always written.
+    assert "score_upright" not in pm.PARQUET_COLUMNS
+    assert "score_upright" not in pm.PARQUET_COLUMNS_MULTI
+
+
+def test_main_joints_are_the_twelve_a_handstand_is_made_of() -> None:
+    """The orientation score is the athlete selection's own visibility term."""
+    from handstand import athlete
+
+    assert pm.MAIN_JOINTS == athlete.MAIN_JOINTS
+    assert len(pm.MAIN_JOINTS) == 12
+    assert pm.MAIN_JOINT_INDEX == tuple(pm.JOINT_INDEX[name] for name in pm.MAIN_JOINTS)
+    assert all(name in pm.JOINT_NAMES for name in pm.MAIN_JOINTS)
+
+
+def test_mean_main_visibility_averages_only_the_main_joints() -> None:
+    """A confident face cannot carry a body the model has wrong."""
+    # Every joint at 0.6, so the mean of the 12 main joints is 0.6 too.
+    assert pm.mean_main_visibility(np.stack([landmark_array(make_pose(visibility=0.6))])) == (
+        pytest.approx(0.6)
+    )
+
+    # The nose is not one of the 12, so its score is not counted.
+    confident_nose = make_pose(visibility=0.2)
+    confident_nose[pm.JOINT_INDEX["nose"]] = dataclasses.replace(
+        confident_nose[pm.JOINT_INDEX["nose"]], visibility=1.0
+    )
+    assert pm.mean_main_visibility(np.stack([landmark_array(confident_nose)])) == pytest.approx(0.2)
+
+    # A joint the model reported no score for is skipped, not averaged in as NaN.
+    missing = make_pose(visibility=0.8)
+    missing[pm.JOINT_INDEX["left_knee"]] = dataclasses.replace(
+        missing[pm.JOINT_INDEX["left_knee"]], visibility=float("nan")
+    )
+    assert pm.mean_main_visibility(np.stack([landmark_array(missing)])) == pytest.approx(0.8)
+
+    # A frame with nobody in it has nothing to score.
+    assert np.isnan(pm.mean_main_visibility(np.empty((0, len(pm.JOINT_NAMES), 5))))
+    # Nor has a body the model reported no visibility for at all.
+    unscored = make_pose(visibility=float("nan"))
+    assert np.isnan(pm.mean_main_visibility(np.stack([landmark_array(unscored)])))
+
+    with pytest.raises(ValueError, match="poses"):
+        pm.mean_main_visibility(np.zeros((2, 12, 5)))
+
+
+def test_mean_main_visibility_scores_the_lowest_wrist_person() -> None:
+    """A frame with a trainer in it is scored on the athlete, whoever MediaPipe listed first."""
+    trainer = make_pose(x=0.2, y=0.5, visibility=0.3, left_wrist=0.2, right_wrist=0.2)
+    athlete = make_pose(x=0.8, y=0.5, visibility=0.9, left_wrist=0.9, right_wrist=0.9)
+    poses = np.stack([landmark_array(trainer), landmark_array(athlete)])
+    assert pm.mean_main_visibility(poses) == pytest.approx(0.9)
+    assert pm.mean_main_visibility(poses[::-1]) == pytest.approx(0.9)
+
+
+@pytest.mark.parametrize(
+    ("upright", "rotated", "expected"),
+    [
+        (0.9, 0.95, 0.05),  # the rotated pass is surer
+        (0.95, 0.9, -0.05),  # the upright pass is surer
+        (0.9, 0.9, 0.0),  # a tie: a zero margin, which moves nothing
+    ],
+)
+def test_frame_margin_is_the_score_difference(
+    upright: float, rotated: float, expected: float
+) -> None:
+    assert pm.frame_margin([upright], [rotated])[0] == pytest.approx(expected)
+
+
+def test_frame_margin_marks_every_frame_one_pass_found_nobody_in_as_nan() -> None:
+    """A pass with no body has no score, so the frame has no margin at all."""
+    margin = pm.frame_margin([0.9, float("nan"), 0.9], [0.4, 0.4, float("nan")])
+    assert margin[0] == pytest.approx(-0.5)
+    assert np.isnan(margin[1:]).all()
+    assert np.isnan(pm.frame_margin([float("nan")], [float("nan")]))[0]
+    assert np.isnan(pm.frame_margin([float("inf")], [0.4]))[0]
+    with pytest.raises(ValueError, match="one score per frame"):
+        pm.frame_margin([0.9, 0.9], [0.4])
+
+
+def test_smooth_margin_averages_over_a_centred_window_of_clip_time() -> None:
+    """The window is time-based (VFR aware) and skips the frames with no margin."""
+    times = [0, 100, 200, 300, 400, 500, 600]
+    margin = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    smoothed = pm.smooth_margin(times, margin, window_s=0.5)
+    # +-250 ms, so five frames at 100 ms: the single non-zero margin is a fifth
+    # of every window it is in and nothing at all outside them.
+    assert smoothed.tolist() == pytest.approx([1 / 3, 0.25, 0.2, 0.2, 0.2, 0.0, 0.0])
+
+    # A NaN margin is skipped, not counted as a zero, so a hole in the scores
+    # does not drag the frames around it towards zero.
+    holed = pm.smooth_margin([0, 100, 200], [1.0, float("nan"), 1.0], window_s=0.5)
+    assert holed.tolist() == pytest.approx([1.0, 1.0, 1.0])
+    # A frame whose whole window is unscored keeps no smoothed value at all.
+    empty = pm.smooth_margin(
+        [0, 100, 200, 300, 400], [float("nan"), float("nan"), float("nan"), 1.0, float("nan")], 0.1
+    )
+    assert np.isnan(empty[1]) and np.isnan(empty[2])
+    assert empty[3] == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="one margin per frame"):
+        pm.smooth_margin([0, 100], [0.5])
+    assert pm.smooth_margin([], []).size == 0
+
+
+def test_smooth_margin_window_is_measured_in_time_not_in_frames() -> None:
+    """A variable frame rate must not change the window a frame is read over."""
+    slow = pm.smooth_margin([0, 200, 400], [0.0, 1.0, 0.0], window_s=0.5)
+    fast = pm.smooth_margin([0, 20, 40], [0.0, 1.0, 0.0], window_s=0.5)
+    # +-250 ms reaches the neighbouring 200 ms frame, and not the 20 ms one.
+    assert slow.tolist() == pytest.approx([0.5, 1 / 3, 0.5])
+    assert fast.tolist() == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+
+
+def test_choose_orientations_reads_the_whole_clip_not_one_frame_at_a_time() -> None:
+    """A sustained preference switches; a one-frame confident mistake does not."""
+    times = [100 * index for index in range(40)]  # 100 ms a frame
+    upright = [0.9] * 40
+    # Frames 12-15: the rotated pass is suddenly and confidently surer.
+    rotated = [0.9] * 40
+    for index in (12, 13, 14, 15):
+        rotated[index] = 0.99
+
+    chosen = pm.choose_orientations(times, upright, rotated)
+    assert chosen.dtype == bool
+    # The four confident-wrong frames are 300 ms of evidence, so the switch
+    # happens on the last of them and never comes back.
+    assert chosen.tolist() == [False] * 15 + [True] * 25
+
+    # Two frames (200 ms) of the opposite preference are not enough to switch
+    # back: smoothed over half a second neither of them outweighs its
+    # neighbours, so the orientation the clip switched into stays.
+    flickered = list(rotated)
+    for index in (20, 21):
+        flickered[index] = 0.81
+    assert pm.choose_orientations(times, upright, flickered).tolist() == [False] * 15 + [True] * 25
+
+
+def test_choose_orientations_ignores_a_margin_inside_the_band() -> None:
+    """Inside ``ORIENT_MARGIN`` the two passes are a tie, and a tie moves nothing."""
+    times = [100 * index for index in range(40)]
+    # The clip opens clearly upright, so the question is only whether a
+    # difference too small to act on can move the orientation.
+    for gap in (0.0, 0.01, 0.049):
+        upright = [0.9] * 40
+        rotated = [0.9] * 10 + [0.9 + gap] * 30
+        assert not pm.choose_orientations(times, upright, rotated).any(), gap
+    # A difference past the band, held for the whole of the second half, is a
+    # preference: the switch happens 0.3 s into it.
+    rotating = pm.choose_orientations(times, [0.9] * 40, [0.9] * 10 + [0.99] * 30)
+    assert rotating.tolist() == [False] * 13 + [True] * 27
+    assert pm.ORIENT_MARGIN == 0.05
+
+
+def test_choose_orientations_starts_from_the_first_half_second() -> None:
+    """The clip's opening orientation is the sign of the opening smoothed margin."""
+    times = [100 * index for index in range(40)]
+    # Upright for the first second, then confidently rotated for the rest: the
+    # smoothed margin has to cross the margin and hold it for 0.3 s.
+    upright = [0.9] * 40
+    rotated = [0.9] * 10 + [0.99] * 30
+    chosen = pm.choose_orientations(times, upright, rotated)
+    assert chosen.tolist() == [False] * 13 + [True] * 27
+
+    # The same clip the other way round: rotated first, upright later.
+    flipped = pm.choose_orientations(times, [0.9] * 30 + [0.99] * 10, [0.99] * 30 + [0.9] * 10)
+    assert flipped.tolist() == [True] * 34 + [False] * 6
+
+    # The opening is a plain sign, margin band and all: a clip the model is
+    # barely surer of the rotated read in the first half second, and never
+    # decisively surer of after, is a clip it read rotated. For 89 % of the 180
+    # dataset clips the opening mean margin is inside the band, so this is where
+    # most of them are decided, and the hysteresis is what then holds them there.
+    assert pm.choose_orientations(times, [0.9] * 40, [0.91] * 40).all()
+    assert not pm.choose_orientations(times, [0.91] * 40, [0.9] * 40).any()
+
+    # Nothing to score at all: the clip is read upright, like `auto`'s first frame.
+    assert not pm.choose_orientations(times, [float("nan")] * 40, [float("nan")] * 40).any()
+    assert pm.choose_orientations([], [], []).size == 0
+
+
+def test_choose_orientations_keeps_its_orientation_through_unscored_frames() -> None:
+    """A frame one pass found nobody in has no margin, and moves nothing."""
+    times = [100 * index for index in range(40)]
+    upright = [0.9] * 40
+    rotated = [0.99] * 40
+    for index in (20, 21, 22, 23):
+        upright[index] = float("nan")
+    # The hole is not evidence against the rotated pass, and the evidence
+    # around it is what the orientation comes from: the whole clip, hole
+    # included, is read rotated.
+    assert pm.choose_orientations(times, upright, rotated).all()
+
+    # A clip that opens with nothing scorable starts upright — the same first
+    # frame `auto` takes — and switches once there is a margin to switch on.
+    late = pm.choose_orientations(
+        times, [float("nan")] * 10 + [0.9] * 30, [float("nan")] * 10 + [0.99] * 30
+    )
+    assert late.tolist() == [False] * 11 + [True] * 29
 
 
 def test_multi_person_runs_get_their_own_output_root() -> None:
@@ -716,6 +1057,249 @@ def test_auto_mode_keeps_the_last_decision_when_detection_is_lost(
     table = pd.read_parquet(out_dir / "clip0000000001.parquet")
     rotated_by_frame = table.groupby("frame_idx")["rotated"].first().tolist()
     assert rotated_by_frame == [False, True, True, True] + [False] * (FRAME_COUNT - 4)
+
+
+# --------------------------------------------------------------------------- #
+# Runner: --rotate best
+# --------------------------------------------------------------------------- #
+
+
+def test_auto_mode_gets_stuck_when_the_model_misreads_an_inverted_body(
+    marked_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The trap chainlink #79 is about, reproduced: auto never leaves the wrong read.
+
+    Every frame is a handstand, and the landmarker reads the handstand as a
+    standing person when it is fed the frame as displayed — with high scores, so
+    nothing looks wrong. ``auto`` decides from that: the wrists are *above* the
+    ankles, "not inverted", and no frame is ever rotated. The frames it writes
+    are the misread, upside-down-free skeleton, for the whole clip.
+    """
+    factory, created = orientation_factory([MISREAD_STANDING], [CORRECT_TURNED_READ])
+    report, out_dir = run(marked_video, tmp_path, factory, rotate_mode="auto")
+
+    assert report.rotated_frames == 0
+    table = pd.read_parquet(out_dir / "clip0000000001.parquet")
+    assert table["detected"].all()
+    assert not table["rotated"].any()
+    # The upright tracker saw every frame; the rotated tracker saw none of them.
+    assert [marker.fed_upright for marker in created] == [[True] * STUB_VIDEO_FRAMES, []]
+
+    # And the written skeleton is the misread: wrists above the ankles, i.e. a
+    # handstand the model has turned into a standing person.
+    for frame_idx in range(STUB_VIDEO_FRAMES):
+        block = table[table["frame_idx"] == frame_idx].set_index("joint")
+        assert block.loc["left_wrist", "y"] < block.loc["left_ankle", "y"], frame_idx
+
+
+def test_best_mode_breaks_the_stuck_trap_by_scoring_both_orientations(
+    marked_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Same frames, same model: ``best`` rotates every one of them.
+
+    The upright pass is read with confidence (0.9), the rotated pass read
+    correctly and slightly more confidently (0.95), so the surer body wins on
+    every frame — including the first, which is the frame ``auto`` gets wrong
+    and then has no way back from.
+    """
+    factory, created = orientation_factory([MISREAD_STANDING], [CORRECT_TURNED_READ])
+    report, out_dir = run(marked_video, tmp_path, factory, rotate_mode="best")
+
+    assert report.frame_count == STUB_VIDEO_FRAMES
+    assert report.detected_frames == STUB_VIDEO_FRAMES
+    assert report.rotated_frames == STUB_VIDEO_FRAMES
+    # Both trackers saw every frame: upright on one, rotated on the other.
+    assert [marker.fed_upright for marker in created] == [
+        [True] * STUB_VIDEO_FRAMES,
+        [False] * STUB_VIDEO_FRAMES,
+    ]
+    assert all(marker.closed for marker in created)
+
+    table = pd.read_parquet(out_dir / "clip0000000001.parquet")
+    assert list(table.columns) == list(pm.PARQUET_COLUMNS_BEST)
+    assert table["rotated"].all()
+    # The scores that decided it are in the file, one pair per frame.
+    scores = table.groupby("frame_idx")[list(pm.SCORE_COLUMNS)].first()
+    assert np.allclose(scores["score_upright"], 0.9)
+    assert np.allclose(scores["score_rotated"], 0.95)
+
+    # The keypoints kept are the rotated pass mapped back: a handstand, wrists
+    # below the ankles in display coordinates (the read itself is a person
+    # standing with their arms up, which is the same thing turned 180°).
+    for frame_idx in range(STUB_VIDEO_FRAMES):
+        block = table[table["frame_idx"] == frame_idx].set_index("joint")
+        assert block.loc["left_wrist", "y"] == pytest.approx((STUB_VIDEO_HEIGHT - 1) * (1 - 0.1))
+        assert block.loc["left_ankle", "y"] == pytest.approx((STUB_VIDEO_HEIGHT - 1) * (1 - 0.9))
+        assert block.loc["left_wrist", "y"] > block.loc["left_ankle", "y"]
+
+
+def test_best_mode_runs_both_orientations_of_every_frame(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The model really sees each frame twice: once as displayed, once turned."""
+    script = best_script(*[([make_pose()], [make_pose()])] * FRAME_COUNT)
+    factory, created, fed_images = stub_factory(script)
+    report, _ = run(synthetic_video, tmp_path, factory, rotate_mode="best")
+
+    assert report.frame_count == FRAME_COUNT
+    assert len(fed_images) == 2 * FRAME_COUNT
+    for frame_idx in range(FRAME_COUNT):
+        upright = cv2.cvtColor(raw_display_frame(synthetic_video, frame_idx), cv2.COLOR_BGR2RGB)
+        turned = cv2.cvtColor(
+            cv2.rotate(raw_display_frame(synthetic_video, frame_idx), cv2.ROTATE_180),
+            cv2.COLOR_BGR2RGB,
+        )
+        assert np.array_equal(fed_images[2 * frame_idx], upright), frame_idx
+        assert np.array_equal(fed_images[2 * frame_idx + 1], turned), frame_idx
+
+
+def test_best_mode_keeps_two_trackers_in_video_mode_and_one_in_image_mode(
+    stub_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A tracker must not carry state from one orientation into the other.
+
+    VIDEO mode tracks between frames, so the two orientations get a landmarker
+    each, exactly as ``auto`` does. IMAGE mode runs the detector on every image
+    with nothing to carry over, so one landmarker serves both passes.
+    """
+    video_factory, video_created, _ = stub_factory(
+        best_script(*[([make_pose()], [make_pose()])] * STUB_VIDEO_FRAMES)
+    )
+    run(stub_video, tmp_path, video_factory, rotate_mode="best", clip_id="clipvideo")
+    assert len(video_created) == 2
+    assert sum(len(marker.timestamps) for marker in video_created) == 2 * STUB_VIDEO_FRAMES
+    assert all(marker.detect_calls == 0 for marker in video_created)
+    assert all(marker.closed for marker in video_created)
+
+    image_factory, image_created, _ = stub_factory(
+        best_script(*[([make_pose()], [make_pose()])] * STUB_VIDEO_FRAMES)
+    )
+    run(
+        stub_video,
+        tmp_path,
+        image_factory,
+        rotate_mode="best",
+        clip_id="clipimage",
+        settings=IMAGE_SETTINGS,
+    )
+    assert len(image_created) == 1
+    assert image_created[0].detect_calls == 2 * STUB_VIDEO_FRAMES
+    assert image_created[0].closed
+
+
+def test_best_mode_switches_on_a_sustained_margin_and_ignores_a_tie_or_a_flicker(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A body does not turn upside down between two frames, so neither does the mode.
+
+    The clip is 20 frames at 10 fps, i.e. 2 s of clip time. Frames 0-7 are tied,
+    so the clip opens upright (a tie is not a preference). Frames 8-12 are 0.09
+    in favour of the rotated pass, which is enough for the smoothed margin to
+    clear the band from frame 8 on, so the switch happens 0.3 s later, on frame
+    11. Frames 13-19 are tied again, which is not evidence either way and so
+    leaves the orientation where it is; frames 15-16 are two frames of confident
+    *upright* scores, 200 ms of noise that must not flip a clip back.
+    """
+    # The upright read at 0.9 and the rotated read at 0.9: nothing to choose between.
+    tied = ([MISREAD_STANDING], [handstand_pose(0.9, 0.1, visibility=0.9)])
+    preferring_rotated = ([MISREAD_STANDING], [handstand_pose(0.9, 0.1, visibility=0.99)])
+    preferring_upright = ([MISREAD_STANDING], [handstand_pose(0.9, 0.1, visibility=0.81)])
+    script = best_script(*([tied] * 8))
+    script += best_script(*[preferring_rotated] * 5)
+    script += best_script(*([tied] * 2), preferring_upright, preferring_upright)
+    script += best_script(*([tied] * 3))
+    factory, created, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="best")
+
+    assert report.rotated_frames == FRAME_COUNT - 11
+    table = pd.read_parquet(out_dir / "clip0000000001.parquet")
+    assert table.groupby("frame_idx")["rotated"].first().tolist() == [False] * 11 + [True] * 9
+    # The frame the switch happened on is written out with the scores behind it.
+    scores = table.groupby("frame_idx")[["score_upright", "score_rotated"]].first()
+    assert np.allclose(scores.loc[11], [0.9, 0.99])
+    # The two confident-but-wrong frames are still written as scored, orientation
+    # unchanged: the scores say what the model said, `rotated` says what the clip
+    # decided.
+    assert np.allclose(scores.loc[15:16], [0.9, 0.81])
+
+
+def test_best_mode_writes_a_frame_nobody_was_found_in_as_nan_scores(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Nobody in either orientation: the frame is kept, its scores are NaN."""
+    script = best_script(([MISREAD_STANDING], [CORRECT_TURNED_READ]), (None, None))
+    script += best_script(*[([make_pose()], [make_pose()])] * (FRAME_COUNT - 2))
+    factory, _, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="best")
+
+    table = pd.read_parquet(out_dir / "clip0000000001.parquet")
+    lost = table[table["frame_idx"] == 1]
+    assert len(lost) == len(pm.JOINT_NAMES)
+    assert not lost["detected"].any()
+    assert lost[list(pm.SCORE_COLUMNS)].isna().all().all()
+    # A frame nothing could be scored in keeps the orientation of the frame
+    # before it, so a clip's two orientations do not flicker on missing frames.
+    assert lost["rotated"].all()
+    assert report.detected_frames == FRAME_COUNT - 1
+
+
+def test_best_mode_writes_the_scores_once_per_frame_of_a_multi_person_run(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The scores describe the frame, so they repeat across that frame's blocks."""
+    # Two people in both passes. The athlete's wrists (y=0.9) sit lower in the
+    # image than the trainer's (y=0.2), so the athlete is the one scored, and
+    # the trainer's lower score never enters the comparison.
+    upright = [
+        handstand_pose(0.1, 0.9, x=0.25, visibility=0.9),
+        make_pose(x=0.75, y=0.3, visibility=0.5, left_wrist=0.2, right_wrist=0.2),
+    ]
+    turned = [
+        # Rotated-frame coordinates: mapped back into display pixels these are
+        # the same two bodies, wrists at 0.9 and 0.2.
+        handstand_pose(0.9, 0.1, x=0.25, visibility=0.95),
+        make_pose(x=0.75, y=0.7, visibility=0.4, left_wrist=0.8, right_wrist=0.8),
+    ]
+    script = best_script(*[(upright, turned)] * FRAME_COUNT)
+    factory, created, _ = stub_factory(script)
+    report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="best", num_poses=3)
+
+    assert out_dir == tmp_path / "keypoints" / "mediapipe_multi" / "best"
+    table = pd.read_parquet(report.parquet_path)
+    assert list(table.columns) == list(pm.PARQUET_COLUMNS_BEST_MULTI)
+    assert table["score_upright"].dtype == "float64"
+    assert table["score_rotated"].dtype == "float64"
+    assert len(created) == 2  # VIDEO mode keeps a tracker per orientation
+    assert report.rotated_frames == FRAME_COUNT
+
+    # Both people of frame 0 are written, with one score pair over both blocks.
+    frame0 = table[table["frame_idx"] == 0]
+    assert sorted(frame0["person_idx"].unique()) == [0, 1]
+    assert frame0.groupby("person_idx").size().tolist() == [len(pm.JOINT_NAMES)] * 2
+    assert frame0["score_upright"].nunique() == 1
+    assert frame0["score_rotated"].nunique() == 1
+    assert np.allclose(frame0["score_upright"], 0.9)  # the athlete's, not the trainer's
+    assert np.allclose(frame0["score_rotated"], 0.95)
+    assert frame0["rotated"].all()
+
+
+def test_only_best_mode_writes_the_score_columns(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """none / 180 / auto keep the exact schema they had, scores and all."""
+    for rotate_mode in ("none", "180", "auto"):
+        factory, _, _ = stub_factory(default_script())
+        report, out_dir = run(
+            synthetic_video,
+            tmp_path / rotate_mode,
+            factory,
+            rotate_mode=rotate_mode,
+            num_poses=2,
+        )
+        table = pd.read_parquet(report.parquet_path)
+        assert list(table.columns) == list(pm.PARQUET_COLUMNS_MULTI), rotate_mode
+        assert not set(pm.SCORE_COLUMNS) & set(table.columns), rotate_mode
+        assert out_dir.name == rotate_mode
 
 
 # --------------------------------------------------------------------------- #
@@ -1280,7 +1864,10 @@ def test_unknown_rotate_mode_is_rejected(
 def test_cli_parser_defaults_and_choices() -> None:
     parser = pm.build_arg_parser()
     args = parser.parse_args([])
-    assert args.rotate == "none"
+    # The rotation mode depends on --num-poses, so the parser leaves it unset and
+    # `default_rotate_mode` fills it in (see the two tests below).
+    assert args.rotate is None
+    assert pm.default_rotate_mode(args.num_poses) == "none"
     assert args.num_poses == pm.DEFAULT_NUM_POSES == 1
     assert args.running_mode == pm.DEFAULT_RUNNING_MODE == "video"
     assert args.min_detection == pm.DEFAULT_MIN_DETECTION_CONFIDENCE
@@ -1326,6 +1913,25 @@ def test_cli_parser_defaults_and_choices() -> None:
             parser.parse_args(["--num-poses", out_of_range])
 
 
+def test_a_multi_person_run_defaults_to_best_and_a_single_person_one_to_none() -> None:
+    """The multi-person setting is what the rest of the pipeline reads (#79).
+
+    ``--num-poses > 1`` falls back to ``best``: an inverted body is what MediaPipe
+    is worst at, and ``best`` is the only mode that reads each frame off itself
+    instead of off its predecessor. A single-person run keeps ``none``, which is
+    what the flag defaulted to before the multi-person keypoints existed, so the
+    historical output stays byte-identical.
+    """
+    assert pm.RECOMMENDED_ROTATE == "best"
+    assert pm.default_rotate_mode() == "none"
+    assert pm.default_rotate_mode(1) == "none"
+    for num_poses in (2, 3, pm.MAX_NUM_POSES):
+        assert pm.default_rotate_mode(num_poses) == "best"
+    for invalid in (0, 6, -1):
+        with pytest.raises(ValueError, match="num_poses"):
+            pm.default_rotate_mode(invalid)
+
+
 def test_cli_routes_each_num_poses_to_its_own_output_root(
     synthetic_video: pathlib.Path,
     tmp_path: pathlib.Path,
@@ -1358,16 +1964,23 @@ def test_cli_routes_each_num_poses_to_its_own_output_root(
     assert single.is_file()
     assert list(pd.read_parquet(single).columns) == list(pm.PARQUET_COLUMNS)
 
+    # A multi-person run without --rotate is the recommended `best` mode.
     assert pm.main(["--num-poses", "2", *common]) == 0
     assert requested == [1, 2]
-    multi = tmp_path / "keypoints" / "mediapipe_multi" / "none" / f"{clip_id}.parquet"
+    multi = tmp_path / "keypoints" / "mediapipe_multi" / "best" / f"{clip_id}.parquet"
     assert multi.is_file()
     table = pd.read_parquet(multi)
-    assert list(table.columns) == list(pm.PARQUET_COLUMNS_MULTI)
+    assert list(table.columns) == list(pm.PARQUET_COLUMNS_BEST_MULTI)
     assert json.loads(multi.with_suffix(".json").read_text())["num_poses"] == 2
 
+    # Every mode is still selectable, and each writes its own root and schema.
+    assert pm.main(["--num-poses", "2", "--rotate", "none", *common]) == 0
+    multi_none = tmp_path / "keypoints" / "mediapipe_multi" / "none" / f"{clip_id}.parquet"
+    assert list(pd.read_parquet(multi_none).columns) == list(pm.PARQUET_COLUMNS_MULTI)
+
     printed = capsys.readouterr().out
-    assert "num_poses=2" in printed
+    assert "rotate=best num_poses=2" in printed
+    assert "rotate=none num_poses=2" in printed
     assert "people[0:3 1:17]" in printed
 
 
