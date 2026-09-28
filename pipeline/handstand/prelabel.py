@@ -57,6 +57,17 @@ the one person the labelling config forbids. A frame where a reference exists an
 *every* detected body is far from it gets **no** pre-label at all, because
 "the nearest of the wrong bodies" is not a useful thing to hand a labeler.
 
+Keypoints are only comparable when both bodies are read the same way up, so
+keypoint agreement is the decision only while the reference and the candidate
+agree on **inversion** (:func:`pose_inverted`). When they disagree, one of the
+two readings is upside down and the reference's joint positions say nothing
+useful about that candidate: the inverted body whose box overlaps the reference's
+best is taken instead, when the overlap is above
+:data:`MIN_ORIENTATION_FALLBACK_IOU` (:data:`MATCH_ORIENTATION_FALLBACK`). The
+direction matters — a body that stands *while the reference is inverted* is
+still refused, because that is the trainer standing next to a handstand. Which
+rule decided each frame is the review queue's ``match_rule`` column.
+
 **Points RTMPose scored below** :data:`SCORE_THRESHOLD` are **not** written.
 A guessed point is worse than no point: the labelling rule asks a labeler to
 place nothing rather than guess, and a low-scoring pre-label would fight that.
@@ -123,7 +134,13 @@ from handstand.overlay import (
     panel_parquet_path,
 )
 from handstand.paths import data_dir
-from handstand.pose_mediapipe import JOINT_INDEX, JOINT_NAMES, apply_display_rotation
+from handstand.pose_mediapipe import (
+    ANKLE_JOINTS,
+    JOINT_INDEX,
+    JOINT_NAMES,
+    WRIST_JOINTS,
+    apply_display_rotation,
+)
 from handstand.rotation import inverse_rotate_points
 
 __all__ = [
@@ -139,7 +156,12 @@ __all__ = [
     "JOINT_SEPARATOR",
     "LABEL_COLUMNS",
     "LOW_SCORE_WEIGHT",
+    "MATCH_KEYPOINT_GAP",
+    "MATCH_NONE",
+    "MATCH_ORIENTATION_FALLBACK",
+    "MATCH_RULES",
     "MAX_REFERENCE_GAP",
+    "MIN_ORIENTATION_FALLBACK_IOU",
     "MIN_SHARED_JOINTS",
     "MODES",
     "MODELS_DIRNAME",
@@ -171,6 +193,7 @@ __all__ = [
     "mean_score",
     "person_box",
     "pixels_to_percent",
+    "pose_inverted",
     "predict_frame",
     "prelabel",
     "rotate_box_180",
@@ -301,6 +324,14 @@ PRELABELS_FILENAME = "label_studio_prelabels.json"
 REVIEW_FILENAME = "review_queue.csv"
 
 #: Full CSV header of the review queue, in order. Part of the contract.
+#:
+#: ``match_rule`` says which rule took the body that was pre-labelled:
+#: :data:`MATCH_KEYPOINT_GAP` (the reference's own joints agreed),
+#: :data:`MATCH_ORIENTATION_FALLBACK` (the reference read the body the other way
+#: up, so box overlap took the inverted one) or :data:`MATCH_NONE` (nobody was
+#: taken — there was no reference, or no candidate passed one). Rows this run did
+#: not touch leave the cell empty: an empty cell means "not re-evaluated", which
+#: is a fact about the row rather than a fourth rule.
 LABEL_COLUMNS: tuple[str, ...] = (
     "image",
     "clip_id",
@@ -310,6 +341,7 @@ LABEL_COLUMNS: tuple[str, ...] = (
     "worst_joint",
     "low_score_joints",
     "rotated_used",
+    "match_rule",
 )
 
 #: Separator of the ``low_score_joints`` cell; ``;`` because a CSV cell is read
@@ -329,6 +361,30 @@ FALSE = "false"
 #: ``Detection.person_index`` when nobody was detected at all. Distinct from
 #: :data:`NO_MATCH`, which means a reference existed and rejected every body.
 NO_PERSON = -1
+
+#: The values of the review queue's ``match_rule`` column — which rule decided
+#: which body (if any) became this frame's pre-label. They are the contract
+#: between :func:`select_person` and the queue, so a labeler can tell an empty
+#: pre-label that means "the reference refused every body" from one that means
+#: "there was no reference to refuse anybody".
+#:
+#: ``MATCH_KEYPOINT_GAP``
+#:     The reference's own joints agreed with the taken body
+#:     (:data:`MAX_REFERENCE_GAP`); the ordinary rule.
+#: ``MATCH_ORIENTATION_FALLBACK``
+#:     The reference and the body read the picture the other way up, so the
+#:     reference's joints were not used and box overlap took the inverted body
+#:     (:data:`MIN_ORIENTATION_FALLBACK_IOU`).
+#: ``MATCH_NONE``
+#:     Nobody was taken under any rule: either there was no reference at all
+#:     (the most confident body is taken, which is a pre-label rather than a
+#:     match) or no candidate passed one. Also what a row this run never
+#:     evaluated carries — see :data:`LABEL_COLUMNS`.
+MATCH_KEYPOINT_GAP = "keypoint_gap"
+MATCH_ORIENTATION_FALLBACK = "orientation_fallback"
+MATCH_NONE = "none"
+MATCH_RULES: tuple[str, ...] = (MATCH_KEYPOINT_GAP, MATCH_ORIENTATION_FALLBACK, MATCH_NONE)
+
 #: A body length that came out at the floor was never measured; see
 #: :func:`handstand.athlete.body_length`.
 UNMEASURED_BODY_LENGTH = athlete_module.MIN_BODY_LENGTH_PIXELS
@@ -636,11 +692,17 @@ def _map_back(points: np.ndarray, width: int, height: int) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class Detection:
-    """The people found in one orientation, and which of them was taken."""
+    """The people found in one orientation, and which of them was taken.
+
+    ``match_rule`` records *why* that person was taken (or nobody was): the
+    value the review queue writes into its ``match_rule`` column, from
+    :data:`MATCH_RULES`.
+    """
 
     people: tuple[PersonPose, ...]
     person_index: int
     athlete_reference: bool
+    match_rule: str = MATCH_NONE
 
     @property
     def pose(self) -> PersonPose | None:
@@ -681,16 +743,18 @@ class Detection:
 def rotate_box_180(
     box: tuple[float, float, float, float] | None, width: int, height: int
 ) -> tuple[float, float, float, float] | None:
-    """A box turned 180°, which is what the rotated pass has to be matched against.
+    """A box turned 180°, from display pixels into the frame a rotated pass saw.
 
     A 180° turn swaps the two ends of both axes, so ``x0`` and ``x1`` exchange
     places and so do ``y0`` and ``y1``. ``None`` goes through: a frame with no
     reference has no rotated reference either.
 
-    The reference is measured in the frame the labeler sees, while the rotated
-    pass has to be matched in the frame the model saw, and those are the same
-    picture turned over. Comparing a rotated pose against an unrotated reference
-    would score the athlete's own body as a complete mismatch.
+    :func:`predict_frame` maps the rotated pass's bodies home rather than
+    turning the reference over, so this is not on that path any more; it stays
+    for callers that do work in the model's own frame, and it is pinned by its
+    own tests because a turn that swapped only one axis would leave a box that
+    looks valid while :func:`handstand.athlete.box_iou` compares it against the
+    wrong rectangle.
     """
     if box is None:
         return None
@@ -703,27 +767,25 @@ def rotate_box_180(
     )
 
 
-def _into_display(detection: Detection, width: int, height: int) -> Detection:
-    """A detection whose people are back in display-frame pixels.
+def _map_back_people(
+    people: Sequence[PersonPose], width: int, height: int
+) -> tuple[PersonPose, ...]:
+    """Every body of the rotated pass, back in display-frame pixels.
 
-    The rotated pass is *selected* in the frame the model saw and only mapped
-    back afterwards, so a :class:`Detection` always speaks the frame the labeler
-    is looking at and two of them can be compared. The choice of person, and
-    whether the reference decided it, both carry over untouched: the map-back is
-    the same 180° on every body, so it cannot change which one overlapped.
+    The rotated pass is mapped home **before** it is matched, so both passes are
+    matched against the reference as the labeler sees it. The map-back is a 180°
+    point reflection: it leaves every distance and every box exactly where it
+    was, so the keypoint comparison is the same either way round — what it does
+    change is which way up a body reads, and that is the one thing
+    :func:`pose_inverted` must read in the frame the labeler is looking at. A
+    trainer standing on the mat is standing whatever the rotated pass's own
+    coordinates call them.
     """
-    if not detection.people:
-        return detection
-    mapped = tuple(
+    return tuple(
         PersonPose(
             joints=_map_back_joints(pose.joints, width, height), scores=dict(pose.scores)
         )
-        for pose in detection.people
-    )
-    return Detection(
-        people=mapped,
-        person_index=detection.person_index,
-        athlete_reference=detection.athlete_reference,
+        for pose in people
     )
 
 
@@ -751,8 +813,19 @@ MIN_SHARED_JOINTS = 4
 #: body lengths, is not accepted as a match however well its box overlaps. Below
 #: that bar the reference is treated as having identified nobody, and a frame
 #: with a reference but no match writes **no** pre-label rather than the most
-#: confident body — see :func:`select_person`.
+#: confident body — see :func:`select_person`. The one door out of that refusal
+#: is :data:`MIN_ORIENTATION_FALLBACK_IOU`, and it only opens when the reference
+#: and the candidate do not even agree on which way up the body is.
 MAX_REFERENCE_GAP = 0.35
+#: How much the inverted candidate's box must overlap the reference's before the
+#: orientation fallback may take it, in :func:`handstand.athlete.box_iou`. Small
+#: on purpose: the fallback is used precisely where the reference's *joints*
+#: cannot vouch for anybody, so the box is the only evidence left, and a body
+#: that merely shares a corner of the frame with the athlete is not a match.
+#: Above this bar the overlap is compared with the reference's own box, which is
+#: how the trainer standing beside the athlete loses to the athlete's own
+#: skeleton.
+MIN_ORIENTATION_FALLBACK_IOU = 0.1
 #: ``Detection.person_index`` when a reference existed and rejected every body.
 #: Distinct from :data:`NO_PERSON` ("nobody was detected") and from a real index.
 NO_MATCH = -2
@@ -794,17 +867,84 @@ def keypoint_gap(pose: PersonPose, reference: PersonPose, length: float) -> floa
 
 
 def rotate_pose_180(pose: PersonPose | None, width: int, height: int) -> PersonPose | None:
-    """A reference pose turned 180°, for matching the rotated pass.
+    """A pose turned 180°, from the frame the labeler sees into the one a rotated
+    pass saw (or back: the map is its own inverse).
 
-    The reference is measured in the frame the labeler sees and the rotated pass
-    is matched in the frame the model saw, so the reference has to be turned with
-    the picture. Rotating a pose is the same map-back the points themselves get.
+    Matching the rotated pass does not need it any more — :func:`predict_frame`
+    maps the pass's own bodies home instead, which is the same comparison — but
+    it is the way to *build* a display-frame pose out of joints measured in a
+    rotated frame, and the same map-back the points themselves get.
     """
     if pose is None:
         return None
     return PersonPose(
         joints=_map_back_joints(pose.joints, width, height), scores=dict(pose.scores)
     )
+
+
+def pose_inverted(pose: PersonPose) -> bool | None:
+    """Is this body upside down — a handstand: wrists lower than ankles?
+
+    The ``--rotate auto`` rule of :mod:`handstand.pose_mediapipe` read off a
+    pose: y grows downwards, so a body on its hands has both wrists *below*
+    both ankles and a standing body has the ankles below the wrists. The mean is
+    over the wrists and the ankles that were actually measured
+    (:meth:`PersonPose.point`, so a wrist the model was unsure about is not
+    evidence about which way up the body is), which needs at least one of each.
+
+    ``None`` when the pose cannot be judged at all — no usable wrist or no
+    usable ankle, or a non-finite mean. The distinction matters more than the
+    boolean: "not inverted" is a claim, and :func:`select_person` must not read
+    a pose it knows nothing about as a claim the other body contradicts.
+    """
+    wrists = [point for name in WRIST_JOINTS if (point := pose.point(name)) is not None]
+    ankles = [point for name in ANKLE_JOINTS if (point := pose.point(name)) is not None]
+    if not wrists or not ankles:
+        return None
+    mean_wrist = sum(y for _, y in wrists) / len(wrists)
+    mean_ankle = sum(y for _, y in ankles) / len(ankles)
+    if not (math.isfinite(mean_wrist) and math.isfinite(mean_ankle)):
+        return None
+    return mean_wrist > mean_ankle
+
+
+def _orientation_fallback_index(
+    people: Sequence[PersonPose],
+    reference: PersonPose,
+    reference_box: tuple[float, float, float, float] | None,
+) -> int:
+    """The inverted body whose box overlaps the reference's best, or ``NO_MATCH``.
+
+    The door out of a keypoint refusal, and only that door: this is called once
+    :func:`keypoint_gap` has refused every body, and only when the reference and
+    the candidate then disagree about which way up the body is. The reference's
+    joints are then saying nothing about the candidate — one of the two readings
+    is upside down — so the box is the evidence that is left
+    (:data:`MIN_ORIENTATION_FALLBACK_IOU`).
+
+    Two things it deliberately will not do. It will not take a body that reads
+    **upright while the reference reads inverted**: that is the trainer standing
+    on the mat next to the handstand, and the refusal stands. And it will not
+    take anything when the reference's own orientation is unknown
+    (:func:`pose_inverted` returned ``None``) or the reference has no box,
+    because "the two disagree" is then not something anybody established.
+    """
+    if reference_box is None or pose_inverted(reference) is not False:
+        return NO_MATCH
+    best_index = NO_MATCH
+    best_overlap = MIN_ORIENTATION_FALLBACK_IOU
+    for index, person in enumerate(people):
+        if pose_inverted(person) is not True:
+            continue
+        box = person_box(person.joints, person.scores)
+        if box is None:
+            continue
+        overlap = athlete_module.box_iou(box, reference_box)
+        # Strictly above the bar, and ties keep the model's own order.
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_index = index
+    return best_index
 
 
 def select_person(
@@ -828,21 +968,40 @@ def select_person(
     feet are side by side on the floor and the athlete's are 320 px apart, and
     no amount of box overlap hides it.
 
-    ``reference_box`` is the athlete's bounding box, kept for the tie-break.
+    ``reference_box`` is the athlete's bounding box: the tie-break of the
+    ordinary rule, and the whole evidence of the fallback below.
 
-    A reference that *no* candidate's keypoints come close to is a different
-    failure from having no reference at all, and it is not papered over. When the
-    MediaPipe athlete exists and every body RTMPose found is further than
-    :data:`MAX_REFERENCE_GAP` from it, nobody is taken: ``person_index`` is -1, so
-    :func:`build_task` writes an empty result and the frame is asked for by hand
-    rather than pre-labelled with a body the labelling config forbids. That
-    happens when RTMPose's detector found only the trainer — 14 of the 17
-    wrong-body frames on the 300-frame sample — and the honest answer is "this
-    frame has no usable pre-label", not "here is the most confident person, who
-    is the wrong person". A frame with no reference at all still falls back to the
-    most confident body, because there is nothing there to contradict.
+    Keypoints are only worth comparing when both bodies are read the same way
+    up, though, and MediaPipe does not always read them that way (the ``auto``
+    rotation trap of chainlink #79). When the reference and a candidate disagree
+    on :func:`pose_inverted`, one of the two is upside down and the reference's
+    joint positions are unreliable *for that candidate* — the distance between
+    them measures the disagreement about orientation, not which body is which.
+    So a disagreement does not refuse: the **inverted** candidate whose box
+    overlaps the reference's best is taken instead, when that overlap is above
+    :data:`MIN_ORIENTATION_FALLBACK_IOU` (:data:`MATCH_ORIENTATION_FALLBACK`).
+    The direction is the point. A candidate that reads upright while the
+    reference reads inverted is still refused — that is usually the trainer
+    standing while the athlete is on their hands — and so is a candidate the
+    fallback cannot place inside the reference's box at all.
 
-    Ties keep the model's own order, so the choice is deterministic.
+    A reference that *no* candidate's keypoints come close to, and that no
+    candidate can rescue by orientation either, is a different failure from
+    having no reference at all, and it is not papered over. When the MediaPipe
+    athlete exists and every body RTMPose found is further than
+    :data:`MAX_REFERENCE_GAP` from it, nobody is taken: ``person_index`` is
+    :data:`NO_MATCH`, so :func:`build_task` writes an empty result and the frame
+    is asked for by hand rather than pre-labelled with a body the labelling
+    config forbids. That happens when RTMPose's detector found only the trainer —
+    14 of the 17 wrong-body frames on the 300-frame sample — and the honest
+    answer is "this frame has no usable pre-label", not "here is the most
+    confident person, who is the wrong person". A frame with no reference at all
+    still falls back to the most confident body, because there is nothing there
+    to contradict.
+
+    Ties keep the model's own order, so the choice is deterministic. Whatever is
+    taken (or refused) is reported as ``match_rule``, the review queue's account
+    of which rule decided the frame.
     """
     if not people:
         return Detection(people=(), person_index=NO_PERSON, athlete_reference=False)
@@ -866,8 +1025,29 @@ def select_person(
             ranked.sort()
             best_gap, _, best = ranked[0]
             if best_gap <= MAX_REFERENCE_GAP:
-                return Detection(people=tuple(people), person_index=best, athlete_reference=True)
-            return Detection(people=tuple(people), person_index=NO_MATCH, athlete_reference=False)
+                return Detection(
+                    people=tuple(people),
+                    person_index=best,
+                    athlete_reference=True,
+                    match_rule=MATCH_KEYPOINT_GAP,
+                )
+            # Every body is too far for the reference's joints to vouch for it.
+            # Before calling that "no pre-label", ask whether the reference and
+            # any of them even read the picture the same way up.
+            fallback = _orientation_fallback_index(people, reference, reference_box)
+            if fallback != NO_MATCH:
+                return Detection(
+                    people=tuple(people),
+                    person_index=fallback,
+                    athlete_reference=True,
+                    match_rule=MATCH_ORIENTATION_FALLBACK,
+                )
+            return Detection(
+                people=tuple(people),
+                person_index=NO_MATCH,
+                athlete_reference=False,
+                match_rule=MATCH_NONE,
+            )
 
     best_confident = max(range(len(people)), key=lambda index: (people[index].mean_score, -index))
     return Detection(people=tuple(people), person_index=best_confident, athlete_reference=False)
@@ -903,12 +1083,20 @@ def predict_frame(
     coordinates.
 
     ``reference`` is the athlete as a pose in **display** pixels, and it is the
-    only reference the caller supplies. Each pass is matched against the
-    reference *as it appears in the frame that pass was given* — the upright one
-    against the pose, the rotated one against :func:`rotate_pose_180` of it — and
-    the rotated poses are only mapped home afterwards. Matching a rotated pose
-    against an unrotated reference would put the athlete's own body nowhere near
-    it, and say they were the same person in the wrong place.
+    only reference the caller supplies. The rotated pass's bodies are mapped
+    home first and then matched against that reference untouched, which is the
+    same comparison as turning the reference over and matching in the model's
+    own frame: the map-back is a 180° point reflection, and a reflection
+    preserves every distance and every box, so :func:`keypoint_gap` and
+    :func:`handstand.athlete.box_iou` answer the same numbers either way round.
+
+    What a reflection does *not* preserve is which way up a body reads, and
+    that is why the mapping happens before the match rather than after.
+    :func:`select_person`'s orientation rule has to be read in the frame the
+    labeler sees — the trainer standing on the mat is standing there, whatever
+    the rotated picture calls them — and a rule applied in the model's own
+    frame would flip over with the pass and end up preferring the trainer on
+    exactly the frames it exists to fix.
     """
     height, width = int(image.shape[0]), int(image.shape[1])
     rotated_image = apply_display_rotation(image, 180)
@@ -917,13 +1105,8 @@ def predict_frame(
     upright = select_person(upright_people, reference, reference_box)
 
     rotated_people, _ = run_model(model, rotated_image)
-    rotated_box = rotate_box_180(reference_box, width, height)
-    rotated = _into_display(
-        select_person(
-            rotated_people, rotate_pose_180(reference, width, height), rotated_box
-        ),
-        width,
-        height,
+    rotated = select_person(
+        _map_back_people(rotated_people, width, height), reference, reference_box
     )
     return choose_orientation(upright, rotated)
 
@@ -949,6 +1132,9 @@ class ImagePrediction:
     athlete_reference: bool
     n_people: int
     runtime_seconds: float = 0.0
+    #: Which rule took this frame's body (or took none): the review queue's
+    #: ``match_rule`` cell, from :data:`MATCH_RULES`.
+    match_rule: str = MATCH_NONE
 
     @property
     def mean_score(self) -> float:
@@ -1332,6 +1518,39 @@ def _as_float(value: object) -> float:
     return number if math.isfinite(number) else 0.0
 
 
+def _read_review_rows(path: str | pathlib.Path) -> list[dict[str, str]]:
+    """An existing review queue read back as rows, ``[]`` when there is none yet.
+
+    ``None`` cells (a row shorter than the header, from a queue written before
+    a column was added) become ``""``, which is what the writer puts in a cell
+    nobody filled anyway.
+    """
+    path = pathlib.Path(path)
+    if not path.is_file():
+        return []
+    with path.open(encoding="utf-8", newline="") as handle:
+        return [
+            {str(key): "" if value is None else value for key, value in row.items()}
+            for row in csv.DictReader(handle)
+        ]
+
+
+def _merge_review_rows(
+    existing: Sequence[Mapping[str, str]], fresh: Sequence[Mapping[str, str]]
+) -> list[dict[str, str]]:
+    """``fresh``'s rows, replacing the ``existing`` rows of the same image.
+
+    A subset run re-measures the frames it predicted and must leave every other
+    row of the queue exactly as it was — including its empty ``match_rule``,
+    because nothing in this run looked at it. The order does not matter: the
+    writer sorts the queue into the order a labeler works in anyway.
+    """
+    merged = {str(row.get("image", "")): dict(row) for row in existing}
+    for row in fresh:
+        merged[str(row.get("image", ""))] = dict(row)
+    return list(merged.values())
+
+
 def _split_joints(value: object) -> list[str]:
     """Read a ``low_score_joints`` cell back into a list."""
     return [part for part in str(value or "").split(JOINT_SEPARATOR) if part]
@@ -1363,6 +1582,11 @@ class PrelabelReport:
     mode: str = DEFAULT_MODE
     no_pose: int = 0
     with_disagreement: int = 0
+    #: Frames whose pre-label came from the orientation fallback: the reference
+    #: read the body the other way up, so box overlap took the inverted candidate
+    #: instead (:data:`MATCH_ORIENTATION_FALLBACK`). The rest of
+    #: :attr:`with_reference` was decided by the reference's own keypoints.
+    orientation_fallback: int = 0
 
     @property
     def rotated_percent(self) -> float:
@@ -1407,6 +1631,24 @@ def write_json(payload: Any, path: str | pathlib.Path) -> pathlib.Path:
     return path
 
 
+def _only_entries(
+    entries: Sequence[Mapping[str, str]], only: Sequence[str]
+) -> list[dict[str, str]]:
+    """The manifest rows named by ``only``, still in manifest order.
+
+    An unknown name raises: a subset run that silently predicts fewer frames
+    than it was asked for writes a file which looks complete and is not, and
+    the one thing a "re-run these frames" flag must never do is quietly drop a
+    frame nobody will know is missing.
+    """
+    wanted = {str(name) for name in only}
+    known = {str(row.get("image", "")) for row in entries}
+    unknown = sorted(wanted - known)
+    if unknown:
+        raise ValueError(f"not in the manifest: {', '.join(unknown)}")
+    return [dict(row) for row in entries if str(row.get("image", "")) in wanted]
+
+
 def prelabel(
     *,
     model: PoseModel,
@@ -1420,6 +1662,8 @@ def prelabel(
     read_image: Callable[[pathlib.Path], np.ndarray | None] | None = None,
     progress: Callable[[str], None] | None = None,
     mode: str = DEFAULT_MODE,
+    only: Sequence[str] | None = None,
+    merge_review: bool = False,
 ) -> PrelabelReport:
     """Predict every sampled frame and write the pre-labels and the review queue.
 
@@ -1429,6 +1673,20 @@ def prelabel(
     defaults to OpenCV; a frame that will not load is reported in
     :attr:`PrelabelReport.failures` and left out rather than aborting the run,
     so one damaged JPEG does not cost the other 299 pre-labels.
+
+    ``only`` narrows the run to the named images of the manifest, in manifest
+    order — the way to re-run a handful of frames (after a fix to the selection
+    rule, say) without touching the rest. A name that is not in the manifest is
+    an error rather than a silently shorter run: predicting 18 of the 19 frames
+    asked for and writing a file that looks complete is the failure this
+    guards. ``merge_review`` writes the review queue by **replacing** the rows
+    of the images this run predicted and keeping every other row that is
+    already there, so a subset run updates its own frames instead of shrinking
+    the queue to them; rows the run never touched keep their old numbers and
+    leave ``match_rule`` empty (see :data:`LABEL_COLUMNS`). The report still
+    carries only *this run's* rows — the file is the merged queue, the report is
+    what was produced — so a summary or a contact sheet drawn from it stays
+    about the frames that were actually re-run.
 
     The images are predicted in manifest order and the outputs are written only
     at the end, so a run either produces both files or produces neither.
@@ -1448,6 +1706,8 @@ def prelabel(
     say = progress or (lambda message: None)
 
     entries = [row for row in load_manifest(manifest_path) if str(row.get("image", "")).strip()]
+    if only is not None:
+        entries = _only_entries(entries, only)
     if limit is not None:
         entries = entries[: max(0, limit)]
     cache = PanelCache(rotate, data=root)
@@ -1458,7 +1718,7 @@ def prelabel(
     predictions: list[ImagePrediction] = []
     failures: list[tuple[str, str]] = []
     detected = rotated = with_reference = with_disagreement = no_pose = 0
-    rejected = 0
+    rejected = orientation_fallback = 0
 
     for index, row in enumerate(entries, start=1):
         name = str(row["image"])
@@ -1496,6 +1756,7 @@ def prelabel(
             athlete_reference=detection.athlete_reference,
             n_people=detection.n_people,
             runtime_seconds=time.perf_counter() - frame_started,
+            match_rule=detection.match_rule,
         )
         predictions.append(prediction)
         tasks.append(build_task(name, image_uri(path, image_base), prediction))
@@ -1504,6 +1765,7 @@ def prelabel(
         rejected += int(detection.rejected)
         rotated += int(rotated_used)
         with_reference += int(detection.athlete_reference)
+        orientation_fallback += int(detection.match_rule == MATCH_ORIENTATION_FALLBACK)
 
         disagreement, worst_joint = _disagreement_row(prediction, cache)
         with_disagreement += int(bool(worst_joint))
@@ -1517,6 +1779,7 @@ def prelabel(
                 "worst_joint": worst_joint,
                 "low_score_joints": JOINT_SEPARATOR.join(prediction.low_score_joints),
                 "rotated_used": TRUE if rotated_used else FALSE,
+                "match_rule": prediction.match_rule,
             }
         )
         if index % PROGRESS_EVERY == 0 or index == len(entries):
@@ -1524,7 +1787,14 @@ def prelabel(
 
     runtime = time.perf_counter() - started
     write_json(tasks, prelabels_out)
-    write_review_queue(rows, review_out)
+    # The report describes *this run*'s rows; the file it writes may be a merged
+    # queue, and handing a caller the whole queue as "what the run produced"
+    # would make a 19-frame re-run report on 300 frames (and draw a contact
+    # sheet of them).
+    write_review_queue(
+        _merge_review_rows(_read_review_rows(review_out), rows) if merge_review else rows,
+        review_out,
+    )
     return PrelabelReport(
         tasks=tasks,
         rows=rows,
@@ -1540,6 +1810,7 @@ def prelabel(
         mode=mode,
         no_pose=no_pose,
         with_disagreement=with_disagreement,
+        orientation_fallback=orientation_fallback,
     )
 
 
@@ -1563,14 +1834,15 @@ def contact_sheet(
     read_image: Callable[[pathlib.Path], np.ndarray | None] | None = None,
     columns: int = CONTACT_SHEET_COLUMNS,
     rows_wanted: int = CONTACT_SHEET_ROWS,
+    include_empty: bool = False,
 ) -> pathlib.Path | None:
     """Draw a grid of pre-labelled frames, worst-queue-first, as one JPEG.
 
     The frames come off the *sorted* review queue, so the sheet shows what the
     labeler sees first: the frames whose pre-labels most likely need correcting.
     Each tile carries the frame's own caption (its image name, whether the
-    rotated pass was used, and its disagreement), which is what makes a
-    surprising skeleton explainable.
+    rotated pass was used, its disagreement, and which rule took its body),
+    which is what makes a surprising skeleton explainable.
 
     Queued frames with **no** pre-label are skipped rather than drawn as blank
     tiles. They now sort to the very top of the queue (see :func:`_review_key`),
@@ -1578,6 +1850,12 @@ def contact_sheet(
     say nothing about pre-label quality. A tile is a demonstration of a
     pre-label, and a frame without one demonstrates nothing. How many were
     skipped is the run's ``no_pose`` line, which reports the same count.
+
+    ``include_empty=True`` keeps them instead, captioned as having no
+    pre-label — for a sheet drawn of a *named* set of frames (the 19 that got
+    none, after the rule that was supposed to rescue them was changed) the
+    absence is the subject, and a sheet that quietly drops half the frames it
+    was asked to show would hide exactly what is being looked at.
 
     Returns ``None`` when there is nothing to draw, rather than writing an empty
     image nobody asked for.
@@ -1608,9 +1886,11 @@ def contact_sheet(
                 _percent_to_pixels(value["x"], value["y"], image.shape[1], image.shape[0])
             )
             scores[joint] = 1.0
-        if not joints:
+        if joints:
+            image = draw_pose(image, joints, scores, min_visibility=0.0)
+        elif not include_empty:
             continue
-        image = draw_pose(image, joints, scores, min_visibility=0.0)
+        rule = str(row.get("match_rule", "") or MATCH_NONE)
         tiles.append(
             draw_caption(
                 image,
@@ -1620,6 +1900,7 @@ def contact_sheet(
                     f"disagree={row.get('max_disagreement', '')}",
                     f"worst={row.get('worst_joint', '') or '-'} "
                     f"unsure={len(_split_joints(row.get('low_score_joints')))}",
+                    f"rule={rule}" if joints else f"rule={rule} no pre-label",
                 ],
             )
         )
@@ -1733,6 +2014,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"review queue to write (default: <data_dir>/labels/{REVIEW_FILENAME})",
     )
     parser.add_argument(
+        "--only",
+        nargs="+",
+        default=None,
+        metavar="IMAGE",
+        help=(
+            "predict only these images of the manifest (default: every frame); a name "
+            "that is not in the manifest is an error"
+        ),
+    )
+    parser.add_argument(
+        "--merge-review",
+        action="store_true",
+        help=(
+            "update the rows of the predicted frames in an existing review queue and "
+            "keep the rest, instead of replacing the queue with this run's rows"
+        ),
+    )
+    parser.add_argument(
         "--contact-sheet",
         type=int,
         nargs="?",
@@ -1742,6 +2041,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             f"also draw a contact sheet of the N worst-queue frames "
             f"(default when given: {DEFAULT_CONTACT_SHEET})"
+        ),
+    )
+    parser.add_argument(
+        "--contact-sheet-out",
+        type=pathlib.Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "contact sheet to write (default: <data>/overlays/prelabels_contact_sheet.jpg)"
+        ),
+    )
+    parser.add_argument(
+        "--contact-sheet-empty",
+        action="store_true",
+        help=(
+            "draw queued frames with no pre-label as captioned tiles instead of "
+            "skipping them"
         ),
     )
     return parser
@@ -1766,6 +2082,12 @@ def summarise(report: PrelabelReport) -> str:
         )
     else:
         lines.append(f"  {report.no_pose} frame(s) left for the labeler")
+    if report.orientation_fallback:
+        lines.append(
+            f"  {report.orientation_fallback} frame(s) matched by the orientation fallback: "
+            "the reference read the body the other way up, so the inverted candidate with "
+            f"the best box overlap was taken (match_rule={MATCH_ORIENTATION_FALLBACK})"
+        )
     lines += [
         f"  {report.with_disagreement} frame(s) have a measurable disagreement; "
         f"{report.mean_low_score_joints:.1f} joint(s) per frame left for the labeler",
@@ -1803,6 +2125,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_csv=args.out_csv,
             mode=args.mode,
             progress=lambda message: print(message, flush=True),
+            only=args.only,
+            merge_review=args.merge_review,
         )
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as error:
         print(f"prelabel: {error}", file=sys.stderr)
@@ -1811,11 +2135,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.contact_sheet:
         root = pathlib.Path(args.data) if args.data is not None else data_dir()
         frames_dir = args.manifest.parent if args.manifest is not None else root / "label_frames"
+        sheet_path = (
+            args.contact_sheet_out
+            if args.contact_sheet_out is not None
+            else root / "overlays" / "prelabels_contact_sheet.jpg"
+        )
+        # N tiles in the most square grid that holds them: 6 lands on the
+        # standing 3x2, and N is honoured rather than only deciding that a
+        # sheet is drawn at all.
+        columns = math.ceil(math.sqrt(args.contact_sheet))
         sheet = contact_sheet(
             report.tasks,
             report.rows,
-            root / "overlays" / "prelabels_contact_sheet.jpg",
+            sheet_path,
             frames_dir,
+            columns=columns,
+            rows_wanted=math.ceil(args.contact_sheet / columns),
+            include_empty=args.contact_sheet_empty,
         )
         if sheet is not None:
             print(f"  contact sheet: {sheet}")

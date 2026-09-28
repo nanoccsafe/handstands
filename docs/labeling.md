@@ -147,9 +147,13 @@ pre-label is on the handstand next to it.
 * **The athlete, not the trainer.** When RTMPose finds several people, the one
   whose **keypoints** agree with the MediaPipe athlete of the same frame
   (`keypoints/mediapipe_athlete/auto/`) is taken, so the two models are compared
-  on the same body. Where no reference overlaps anybody, the most confident body
-  is taken instead and the frame is marked as having had no reference. **See the
-  limitation below** — this is the one step that can pick the wrong person.
+  on the same body. Where the reference exists but nothing agrees with it, the
+  frame gets **no** pre-label rather than the most confident body — except when
+  the reference and a body simply read the picture the other way up, which is the
+  orientation fallback below. Where there is no reference at all, the most
+  confident body is taken instead and the frame is marked as having had no
+  reference. **See the limitation below** — this is the one step that can pick
+  the wrong person.
 * **The 15 joints the config asks for.** RTMPose's COCO-WholeBody output is
   translated to MediaPipe's names; `foot_index` is COCO-WholeBody's `big_toe`.
   Its 68 face and 42 hand points are ignored.
@@ -191,10 +195,39 @@ trainer. There was no choosing to do — the athlete had never been detected. Th
 is why a frame where the reference athlete exists and *every* detected body is far
 from it now gets **no pre-label at all** rather than the most confident body: an
 empty frame the labeler fills in beats a confident pre-label of the trainer that
-they have to notice and delete. The 19 frames that ended up empty are exactly
+they have to notice and delete. The 19 frames that ended up empty were exactly
 the ones that were wrong, so the trade is 19 frames labelled by hand out of 300
 in exchange for never handing over somebody else's joints. The run reports the
 count on its `rejected` line.
+
+#### The one exception: when the two models read the body the other way up
+
+Keypoints are only worth comparing when both models read the body the same way
+up, and MediaPipe's `auto` rotation used to read a handstand as a standing
+person (#79). Then the distance between a candidate and the reference measures
+the disagreement about **orientation**, not about which body is which, and
+refusing on it is wrong (#78). So a disagreement does not refuse: the candidate
+that is **inverted** while the reference reads it upright — and whose box
+overlaps the reference's by more than 0.1 IoU — is taken instead. The direction
+is the point: a candidate that *stands* while the reference is inverted is still
+refused, because that is usually the trainer.
+
+Which rule took a frame is the queue's `match_rule` column: `keypoint_gap` (the
+reference's own joints agreed), `orientation_fallback` (the exception above), or
+`none` (nobody was taken under any rule — no reference, or none that passed one;
+`none` on a row that *does* have a pre-label means there was no reference to
+match against). A row this run never touched leaves the cell empty.
+
+Re-running the 19 frames against `keypoints/mediapipe_athlete/best/` with this
+rule gave `data/label_studio_prelabels_fix78.json`: **11 of the 19 got a
+pre-label** (6 by the ordinary keypoint rule now that #79 fixed the reference, 2
+by the orientation fallback, 3 because `best` detects no athlete at all in that
+frame and nothing contradicts the most confident body) and **8 are still
+empty** — in every one of those the reference and the only body RTMPose found
+read the picture the *same* way up but sat 0.4 to 1.5 body lengths apart, or the
+body is upright against an inverted reference (the trainer). The three
+`none`-with-a-pre-label rows are the ones worth a second look: with no reference
+nobody can tell the athlete from the trainer.
 
 Two further consequences for you as the labeler:
 
@@ -228,14 +261,16 @@ model change cannot quietly start feeding the labeler the wrong orientation.
 The queue has two classes of frame, and the first one is not about a pre-label
 being *wrong* but about there being none at all.
 
-**Ranks 1 to 19 — no pre-label.** RTMPose found nobody, or the athlete reference
+**Ranks 1 to 8 — no pre-label.** RTMPose found nobody, or the athlete reference
 rejected every body it found. All 15 joints are yours to place by hand. These are
 the frames with the most work on them and the only ones whose pre-label is
 *guaranteed* absent, so they lead. Their row lists all 15 joints in
 `low_score_joints`; a row that names every joint can only mean there is no
-pre-label, which is how you spot one without needing a ninth column.
+pre-label, which is how you spot one without needing a tenth column. (There were
+19 of them before #78 re-ran those frames against `mediapipe_athlete/best`; the
+other 11 now carry a pre-label and are ranked with everybody else.)
 
-**Ranks 20 to 300 — a pre-label that may be wrong.** `max_disagreement` is the
+**Ranks 9 to 300 — a pre-label that may be wrong.** `max_disagreement` is the
 largest distance between any two models' points for the same joint — RTMPose, the
 MediaPipe athlete, and the Vision athlete when its selection exists — divided by
 that frame's body length, so a tall and a short athlete are judged on the same
@@ -259,6 +294,7 @@ and empty columns making them indistinguishable from a clean frame.
 | `worst_joint` | which joint that gap was on; empty when there is no gap |
 | `low_score_joints` | `;`-separated joints you must place: those RTMPose scored below 0.3, **or all 15 on a frame with no pre-label at all** |
 | `rotated_used` | `true` when the rotated pass won |
+| `match_rule` | which rule took this frame's body: `keypoint_gap`, `orientation_fallback` or `none` (no reference, or nobody passed one); **empty on the 281 rows the #78 re-run never looked at** |
 
 The Vision athlete has only been generated for a couple of clips so far, so most
 frames are scored on RTMPose against MediaPipe alone. That is not a problem: a
@@ -347,8 +383,14 @@ already drawn. A blank task is expected on 19 of the 300 frames — the
 pre-labeller wrote no pre-label for those, because RTMPose found nobody or the
 athlete reference refused every body it found. It does not tell you *which* of
 the two happened (nothing in a Label Studio task could), so the review queue
-carries the signal instead: those 19 frames are **ranks 1 and up**, and each row
-lists all 15 joints in `low_score_joints`. Start there.
+carries the signal instead: those frames **lead** it, and each row lists all 15
+joints in `low_score_joints`. Start there.
+
+`data/label_studio_prelabels_fix78.json` is those same 19 frames re-run with the
+orientation fallback (#78), written so it can be imported over them: **11 arrive
+with a pre-label and 8 stay blank**. `data/labels/review_queue.csv` has already
+been updated for it (its `match_rule` column), so the queue now leads with the 8
+frames that are still empty.
 
 ## 5. Label
 
@@ -369,6 +411,13 @@ they are:
 * `stratum` — `trainer_contact` frames are the hard ones by construction.
 * `rotated_used` — the pre-labels came from the model looking at the frame
   upside down, which is the normal case for a hold.
+* `match_rule` — why that body is on the frame at all. `keypoint_gap` means the
+  MediaPipe athlete's own joints agreed with it; `orientation_fallback` means
+  the two models read the body the other way up and the inverted one that
+  overlaps best was taken — worth a look first; `none` means there was **no
+  reference** to match against, so nobody could tell the athlete from the
+  trainer and the most confident body is what you got. Empty on the rows the
+  #78 re-run never touched.
 
 Then do what the pre-labels did not do: for each joint you can see, check the
 point and move it if it is wrong. `left`/`right` is the **athlete's** own left

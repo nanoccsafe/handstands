@@ -80,6 +80,28 @@ def standing_pose(
     )
 
 
+def upside_down(pose: PersonPose) -> PersonPose:
+    """The same body turned 180° about its own box: upright becomes a handstand.
+
+    The joints are the ones the body already had, only read the other way up —
+    which is exactly what MediaPipe's auto-rotation trap did to a reference, and
+    what RTMPose sees right when it reads the handstand as the handstand it is.
+    The box is unchanged (a turn about its own centre maps it onto itself), so
+    a test can move *only* the orientation and leave the geometry it is not
+    about alone.
+    """
+    box = prelabel.person_box(pose.joints, pose.scores)
+    assert box is not None
+    centre_x, centre_y = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+    return PersonPose(
+        joints={
+            name: (2.0 * centre_x - x, 2.0 * centre_y - y)
+            for name, (x, y) in pose.joints.items()
+        },
+        scores=dict(pose.scores),
+    )
+
+
 #: One person as a stub model returns them: their joints and their scores.
 OnePerson = tuple[dict[str, tuple[float, float]], dict[str, float]]
 
@@ -701,6 +723,139 @@ def test_select_person_breaks_a_keypoint_tie_on_box_overlap() -> None:
     # Both are equally near the reference, so the model's own order decides.
     assert detection.person_index in (0, 1)
     assert detection.athlete_reference is True
+    assert detection.match_rule == prelabel.MATCH_KEYPOINT_GAP
+
+
+def _crouching_trainer(reference: PersonPose) -> PersonPose:
+    """An upright body folded into the top of the reference's own box.
+
+    Upright, overlapping the reference's box well (it lives inside it) and far
+    from the reference's keypoints (a joint-by-joint fold moves the lower half
+    of the body a body fraction away). It therefore fails the keypoint rule and
+    would qualify on box overlap alone — the exact body the orientation rule has
+    to keep out, so a test can show that it is the *orientation* excluding it
+    and not the geometry.
+    """
+    box = prelabel.person_box(reference.joints, reference.scores)
+    assert box is not None
+    return PersonPose(
+        joints={
+            name: (x, box[1] + (y - box[1]) * 0.4) for name, (x, y) in reference.joints.items()
+        },
+        scores={name: 0.9 for name in LABEL_JOINTS},
+    )
+
+
+def test_orientation_disagreement_falls_back_to_box_overlap_for_an_inverted_candidate() -> None:
+    """The reference read the handstand as standing, RTMPose read it upside down.
+
+    Then the distance between them measures the disagreement about *orientation*
+    rather than about which body is which, so refusing on it is wrong: the
+    body that is inverted while the reference reads it upright is the athlete
+    (chainlink #78 — 10 of the 19 frames that got no pre-label were refused
+    exactly this way round). The inverted candidate whose box overlaps the
+    reference's best is taken instead, and the upright trainer folded into the
+    same box is not.
+    """
+    from handstand.athlete import body_length
+
+    reference = standing_pose()  # MediaPipe read it as a standing person
+    reference_box = prelabel.person_box(reference.joints, reference.scores)
+    trainer = _crouching_trainer(reference)  # upright, inside the reference's box
+    athlete = upside_down(reference)  # RTMPose sees the handstand it is
+
+    detection = select_person([trainer, athlete], reference, reference_box)
+
+    # Both bodies are past the keypoint bar, so this really is the fallback...
+    length = body_length(reference.to_landmarks())
+    assert prelabel.keypoint_gap(trainer, reference, length) > prelabel.MAX_REFERENCE_GAP
+    assert prelabel.keypoint_gap(athlete, reference, length) > prelabel.MAX_REFERENCE_GAP
+    # ...and the trainer would have won on the box alone, if orientation let it.
+    from handstand.athlete import box_iou
+
+    assert box_iou(
+        prelabel.person_box(trainer.joints, trainer.scores), reference_box
+    ) > prelabel.MIN_ORIENTATION_FALLBACK_IOU
+
+    assert detection.rejected is False
+    assert detection.person_index == 1
+    assert detection.pose is athlete
+    assert detection.athlete_reference is True
+    assert detection.match_rule == prelabel.MATCH_ORIENTATION_FALLBACK
+
+
+def test_an_upright_candidate_against_an_inverted_reference_is_still_refused() -> None:
+    """The other direction: the trainer standing while the athlete is inverted.
+
+    The fallback must not slide into "take whoever overlaps best", which is the
+    rule that pre-labelled the trainer in the first place. Here the reference is
+    upside down — the handstand read correctly — and the candidate standing in
+    its own box is the trainer: the overlap is the whole box, and the refusal
+    still stands.
+    """
+    reference = upside_down(standing_pose())
+    reference_box = prelabel.person_box(reference.joints, reference.scores)
+    trainer = standing_pose()  # upright, the same box, nowhere near the keypoints
+
+    detection = select_person([trainer], reference, reference_box)
+
+    assert detection.rejected is True
+    assert detection.pose is None
+    assert detection.match_rule == prelabel.MATCH_NONE
+
+
+def test_two_bodies_read_the_same_way_up_are_still_judged_on_keypoints() -> None:
+    """No disagreement, no fallback: a far inverted body stays refused.
+
+    The frames where both models see an inverted body a body length apart are
+    not rescued by this rule — there is no orientation excuse there, only
+    distance, and the fallback is not a second chance to take the nearest of
+    them.
+    """
+    reference = upside_down(standing_pose())
+    reference_box = prelabel.person_box(reference.joints, reference.scores)
+    far_and_inverted = PersonPose(
+        joints={
+            name: (x + 40.0, y) for name, (x, y) in upside_down(standing_pose()).joints.items()
+        },
+        scores={name: 0.9 for name in LABEL_JOINTS},
+    )
+    assert prelabel.pose_inverted(far_and_inverted) is True
+
+    detection = select_person([far_and_inverted], reference, reference_box)
+
+    assert detection.rejected is True
+    assert detection.match_rule == prelabel.MATCH_NONE
+
+
+def test_pose_inverted_reads_wrists_below_ankles_and_admits_when_it_cannot() -> None:
+    """The tri-state is the point: "not inverted" is a claim, ``None`` is not.
+
+    A pose without a measured wrist or ankle says nothing about which way up
+    the body is, and reading that silence as "standing" is how an unjudgeable
+    reference would start disagreeing with every candidate it meets.
+    """
+    assert prelabel.pose_inverted(standing_pose()) is False
+    assert prelabel.pose_inverted(upside_down(standing_pose())) is True
+
+    hands_only = PersonPose(
+        joints={
+            "nose": (50.0, 20.0),
+            "left_wrist": (40.0, 140.0),
+            "right_wrist": (60.0, 140.0),
+        },
+        scores={"nose": 0.9, "left_wrist": 0.9, "right_wrist": 0.9},
+    )
+    assert prelabel.pose_inverted(hands_only) is None
+
+    unsure = PersonPose(
+        joints={
+            name: (50.0, 20.0 if index < 6 else 140.0)
+            for index, name in enumerate(LABEL_JOINTS)
+        },
+        scores={name: 0.1 for name in LABEL_JOINTS},
+    )
+    assert prelabel.pose_inverted(unsure) is None
 
 
 def test_rotate_box_180_swaps_both_edges() -> None:
@@ -807,6 +962,36 @@ def test_predict_frame_still_finds_the_athlete_in_the_upright_pass() -> None:
 
     assert rotated_used is False
     assert detection.athlete_reference is True
+
+
+def test_the_orientation_rule_is_read_in_the_display_frame_of_the_rotated_pass() -> None:
+    """The fallback must not flip over with the pass it is asked in.
+
+    The stub reports an upright body in the *rotated* image, which is an
+    upside-down body on screen — the shape of a frame where RTMPose only copes
+    once the picture is turned. In the model's own coordinates the candidate
+    would read "standing against an inverted reference" and be refused (the
+    trainer case); read in the frame the labeler sees, it is the inverted body
+    the upright reference cannot vouch for, and the fallback takes it.
+    """
+    reference = standing_pose()
+    reference_box = prelabel.person_box(reference.joints, reference.scores)
+    model = stub_model({False: [], True: [(reference.joints, reference.scores)]})
+
+    detection, rotated_used = predict_frame(
+        model, make_image(), reference=reference, reference_box=reference_box
+    )
+
+    assert rotated_used is True
+    assert detection.match_rule == prelabel.MATCH_ORIENTATION_FALLBACK
+    pose = detection.pose
+    assert pose is not None
+    assert prelabel.pose_inverted(pose) is True
+    from handstand.athlete import box_iou
+
+    assert box_iou(
+        prelabel.person_box(pose.joints, pose.scores), reference_box
+    ) > prelabel.MIN_ORIENTATION_FALLBACK_IOU
 
 
 def test_rotate_180_preserves_the_pose_because_of_the_map_back() -> None:
@@ -1141,6 +1326,9 @@ def test_run_writes_no_pre_label_where_the_reference_rejects_every_body(
     assert report.detected == 1
     assert report.with_reference == 0
 
+    rows = {row["image"]: row for row in read_review(report.review_path)}
+    assert rows[IMAGE]["match_rule"] == prelabel.MATCH_NONE
+
     by_image = {task["data"]["image"].rsplit("/", 1)[-1]: task for task in
                 json.loads(report.prelabels_path.read_text(encoding="utf-8"))}
     assert by_image[IMAGE]["predictions"][0]["result"] == []
@@ -1186,6 +1374,133 @@ def test_run_respects_the_limit(manifest: pathlib.Path) -> None:
         read_image=lambda path: make_image(),
     )
     assert report.images == 1
+
+
+def test_run_predicts_only_the_named_images(manifest: pathlib.Path) -> None:
+    """``only`` re-runs a subset without touching the frames it was not given."""
+    pose = standing_pose()
+    model = stub_model({False: [(pose.joints, pose.scores)], True: [(pose.joints, pose.scores)]})
+    other = f"{OTHER_CLIP}_3.jpg"
+
+    report = prelabel_run(
+        model=model,
+        data=manifest.parents[1],
+        manifest=manifest,
+        only=[other],
+        read_image=lambda path: make_image(),
+    )
+
+    assert report.images == 1
+    tasks = json.loads(report.prelabels_path.read_text(encoding="utf-8"))
+    assert [task["data"]["image"].rsplit("/", 1)[-1] for task in tasks] == [other]
+    assert [row["image"] for row in read_review(report.review_path)] == [other]
+
+
+def test_run_rejects_a_name_that_is_not_in_the_manifest(manifest: pathlib.Path) -> None:
+    """Dropping a frame silently is worse than failing: the file would look complete."""
+    with pytest.raises(ValueError, match="not in the manifest"):
+        prelabel_run(
+            model=stub_model({False: [], True: []}),
+            data=manifest.parents[1],
+            manifest=manifest,
+            only=["not-a-frame.jpg"],
+            read_image=lambda path: make_image(),
+        )
+
+
+def test_a_subset_run_updates_its_own_rows_and_keeps_the_rest(
+    manifest: pathlib.Path,
+) -> None:
+    """``merge_review`` folds a re-run back into the queue instead of shrinking it."""
+    pose = standing_pose()
+    data = manifest.parents[1]
+    full = stub_model({False: [(pose.joints, pose.scores)], True: [(pose.joints, pose.scores)]})
+    first = prelabel_run(
+        model=full, data=data, manifest=manifest, read_image=lambda path: make_image()
+    )
+    assert len(read_review(first.review_path)) == 2
+
+    # The second run finds nobody at all: only IMAGE was asked for, so only
+    # IMAGE's row may change, and it must change to "no pre-label here".
+    empty = stub_model({False: [], True: []})
+    second = prelabel_run(
+        model=empty,
+        data=data,
+        manifest=manifest,
+        only=[IMAGE],
+        merge_review=True,
+        read_image=lambda path: make_image(),
+    )
+
+    rows = {row["image"]: row for row in read_review(second.review_path)}
+    assert len(rows) == 2
+    # The report is still about the run, not about the merged file: one row.
+    assert [row["image"] for row in second.rows] == [IMAGE]
+    assert rows[IMAGE]["low_score_joints"].split(JOINT_SEPARATOR) == list(LABEL_JOINTS)
+    assert rows[IMAGE]["match_rule"] == prelabel.MATCH_NONE
+    # The frame this run never looked at keeps the row the first run wrote,
+    # pre-label and all: re-running one frame must not re-decide another.
+    assert rows[f"{OTHER_CLIP}_3.jpg"]["low_score_joints"] == ""
+    assert rows[f"{OTHER_CLIP}_3.jpg"]["match_rule"] == prelabel.MATCH_NONE
+
+
+def test_a_merge_into_a_queue_written_before_match_rule_leaves_it_empty(
+    manifest: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The queue on disk predates the column: rows this run did not touch stay empty.
+
+    An empty cell is "not re-evaluated", not a fourth rule, and inventing one
+    for a row nobody measured would read as a measurement.
+    """
+    out_csv = tmp_path / "review_queue.csv"
+    write_review_queue([_queue_row(IMAGE, 0.2, "")], out_csv)
+    pose = standing_pose()
+    model = stub_model({False: [(pose.joints, pose.scores)], True: [(pose.joints, pose.scores)]})
+
+    report = prelabel_run(
+        model=model,
+        data=manifest.parents[1],
+        manifest=manifest,
+        only=[f"{OTHER_CLIP}_3.jpg"],
+        out_csv=out_csv,
+        merge_review=True,
+        read_image=lambda path: make_image(),
+    )
+
+    rows = {row["image"]: row for row in read_review(report.review_path)}
+    assert len(rows) == 2
+    assert rows[IMAGE]["match_rule"] == ""
+    assert rows[f"{OTHER_CLIP}_3.jpg"]["match_rule"] == prelabel.MATCH_NONE
+    assert list(read_review(report.review_path)[0]) == list(LABEL_COLUMNS)
+
+
+def test_run_writes_the_orientation_fallback_into_the_review_queue(
+    manifest: pathlib.Path,
+) -> None:
+    """The rule a frame's pre-label rests on is in the row the labeler reads."""
+    reference = standing_pose()
+    data = manifest.parents[1]
+    # The MediaPipe athlete of this clip, upright and measurable, as the parquet
+    # would hold it...
+    _cache_with_athlete(data, {**_reference_joints(), **reference.joints})
+    # ...and RTMPose's answer: the same body upside down, which is the handstand.
+    athlete = upside_down(reference)
+    model = stub_model({False: [(athlete.joints, athlete.scores)], True: []})
+
+    report = prelabel_run(
+        model=model, data=data, manifest=manifest, read_image=lambda path: make_image()
+    )
+
+    rows = {row["image"]: row for row in read_review(report.review_path)}
+    assert rows[IMAGE]["match_rule"] == prelabel.MATCH_ORIENTATION_FALLBACK
+    assert report.orientation_fallback == 1
+    tasks = {
+        task["data"]["image"].rsplit("/", 1)[-1]: task
+        for task in json.loads(report.prelabels_path.read_text(encoding="utf-8"))
+    }
+    assert tasks[IMAGE]["predictions"][0]["result"]
+    # The other frame has no reference at all: nothing matched anybody.
+    assert rows[f"{OTHER_CLIP}_3.jpg"]["match_rule"] == prelabel.MATCH_NONE
 
 
 def test_image_uri_uses_a_file_uri_by_default(tmp_path: pathlib.Path) -> None:
@@ -1303,3 +1618,50 @@ def test_contact_sheet_draws_a_grid_of_the_worst_frames(
 
 def test_contact_sheet_returns_none_with_nothing_to_draw(tmp_path: pathlib.Path) -> None:
     assert contact_sheet([], [], tmp_path / "sheet.jpg", tmp_path) is None
+
+
+def test_contact_sheet_can_draw_the_frames_that_got_no_prelabel(
+    manifest: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A sheet drawn *of* the frames with no pre-label must not quietly drop them.
+
+    Skipping them is right for the worst-queue sheet of a whole run, where the
+    empty frames would otherwise fill the sheet and say nothing about pre-label
+    quality. It is wrong for a named set whose absence is the subject: there,
+    ``include_empty=True`` keeps the tiles, captioned as having no pre-label.
+    """
+    model = stub_model({False: [], True: []})
+    report = prelabel_run(
+        model=model,
+        data=manifest.parents[1],
+        manifest=manifest,
+        read_image=lambda path: make_image(),
+    )
+    rows = read_review(report.review_path)
+
+    skipped = contact_sheet(
+        report.tasks,
+        rows,
+        tmp_path / "skipped.jpg",
+        manifest.parent,
+        read_image=lambda path: make_image(),
+    )
+    assert skipped is None
+
+    sheet = contact_sheet(
+        report.tasks,
+        rows,
+        tmp_path / "empty.jpg",
+        manifest.parent,
+        read_image=lambda path: make_image(),
+        columns=1,
+        rows_wanted=len(rows),
+        include_empty=True,
+    )
+
+    assert sheet is not None and sheet.is_file()
+    import cv2
+
+    drawn = cv2.imread(str(sheet))
+    assert drawn is not None
+    assert drawn.shape[:2] == (len(rows) * HEIGHT, WIDTH)
