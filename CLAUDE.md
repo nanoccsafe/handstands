@@ -40,10 +40,12 @@ prompt in `docs/prompts/`).
   client is gone). Spawn refuses if a window, worktree, branch or process of that name is left over.
 - Status: `tools/worker/status.sh` shows RUNNING / DONE / STOPPED / ORPHANED, commits, uncommitted files and
   processes still inside the worktree. ORPHANED means it ended without a marker: run `stop.sh` on it.
-  Watch live: `tmux attach -t workers`.
+  Watch live: `tmux -L handstand attach -t workers` (workers run on a private tmux server, `-L handstand`,
+  because other projects share and sometimes kill the default one).
 - Stop: `tools/worker/stop.sh <name>` closes the window, TERMs then KILLs the process tree and anything whose
   cwd is in the worktree, and verifies nothing is left. `--clean` also deletes the worktree, branch, state
   and the worker's OpenCode sessions (only when its work is not wanted). `stop.sh --all [--clean]` for all.
+- Label Studio runs as a systemd user service: `systemctl --user status|restart label-studio`.
 - After a crash/reboot: `/tmp` is wiped (worker state, logs, tmux). Check `git worktree list`, worker commits,
   and processes whose cwd is in a worktree. The shared OpenCode service can resume an interrupted worker session
   on its own when any `opencode` starts; delete such orphan sessions (`opencode session delete <id>`) before

@@ -4,6 +4,8 @@
 REPO="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 WORKER_STATE="${HANDSTAND_WORKERS:-/tmp/handstand-workers}"
 TMUX_SESSION="workers"
+# Private tmux server: other projects on this machine share the default one and may kill it.
+tmux() { command tmux -L handstand "$@"; }
 mkdir -p "$WORKER_STATE"
 
 wt_path()  { echo "$(dirname "$REPO")/wt-$1"; }
