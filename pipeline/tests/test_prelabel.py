@@ -350,7 +350,7 @@ def test_keypoint_result_uses_the_configs_from_and_to_names() -> None:
     result = prelabel.keypoint_result("left_wrist", 30.0, 60.0, WIDTH, HEIGHT)
     assert result["from_name"] == "keypoints"
     assert result["to_name"] == "image"
-    assert result["type"] == "keypoints"
+    assert result["type"] == "keypointlabels"
     assert result["value"]["keypointlabels"] == ["left_wrist"]
 
 

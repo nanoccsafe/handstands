@@ -67,7 +67,7 @@ def manifest(tmp_path: pathlib.Path) -> pathlib.Path:
 def keypoint(label: str, x: float, y: float, **extra: object) -> dict[str, object]:
     """One ``keypoints`` result, in the shape Label Studio writes."""
     result = {
-        "type": "keypoints",
+        "type": "keypointlabels",
         "from_name": "keypoints",
         "to_name": "image",
         "value": {"x": x, "y": y, "width": 1.0, "rotation": 0, "label": label},
@@ -565,3 +565,16 @@ def test_main_rejects_an_export_that_is_not_json(tmp_path: pathlib.Path, capsys)
     path.write_text("{not json", encoding="utf-8")
     assert labels.main(["import", str(path)]) == 2
     assert "labels:" in capsys.readouterr().err
+
+
+def test_legacy_keypoints_type_is_still_read() -> None:
+    """Older hand-trimmed exports may say ``keypoints``; they must not be dropped."""
+    result = {
+        "type": "keypoints",
+        "from_name": "keypoints",
+        "to_name": "image",
+        "value": {"x": 50.0, "y": 25.0, "keypointlabels": ["left_wrist"]},
+    }
+    assert labels._is_keypoint_result(result)
+    assert labels._is_keypoint_result({**result, "type": "keypointlabels"})
+    assert not labels._is_keypoint_result({**result, "type": "choices"})

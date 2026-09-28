@@ -484,12 +484,14 @@ def joint_labels(value: Mapping[str, Any]) -> list[str]:
 def _is_keypoint_result(result: Mapping[str, Any]) -> bool:
     """Is this result a keypoint, whatever the export calls its type?
 
-    The type is ``keypoints`` in every version that writes one; a result with no
-    type at all is still read when it carries coordinates and a label, because an
-    export trimmed by hand is exactly the kind of thing that arrives here.
+    Label Studio exports a ``<KeyPointLabels>`` point with type ``keypointlabels``
+    (verified against a live 1.23 instance); ``keypoint``/``keypoints`` are accepted
+    too. A result with no type at all is still read when it carries coordinates and
+    a label, because an export trimmed by hand is exactly the kind of thing that
+    arrives here.
     """
     kind = str(result.get("type") or "").lower()
-    if kind in ("keypoints", "keypoint"):
+    if kind in ("keypointlabels", "keypoints", "keypoint"):
         return True
     if kind:
         return False

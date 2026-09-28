@@ -992,7 +992,7 @@ def keypoint_result(
     """
     percent_x, percent_y = pixels_to_percent(x, y, width, height)
     return {
-        "type": "keypoints",
+        "type": "keypointlabels",
         "from_name": "keypoints",
         "to_name": "image",
         "value": {
