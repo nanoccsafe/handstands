@@ -25,9 +25,10 @@ same columns, same types, same coordinate conventions.
 
 * `<data_dir>` = `handstand.paths.data_dir()` (default
   `/mnt/sharedOs/handstand-workspace/data`, override with `$HANDSTAND_DATA`).
-* `<rotate>` = the rotation mode the file was produced with: `none`, `180` or
-  `auto`. The three modes are independent outputs of the same clip, never
-  merged — compare them side by side.
+* `<rotate>` = the rotation mode the file was produced with: `none`, `180`,
+  `auto` or `best` (the recommended one — see
+  [Rotation modes](#rotation-modes)). The modes are independent outputs of the
+  same clip, never merged — compare them side by side.
 * `mediapipe_multi` only exists for `--num-poses > 1`. A multi-person run
   writes to its own root, so it can never overwrite the single-person
   parquets the other stages read.
@@ -54,13 +55,16 @@ Generate the model first with `cd pipeline && uv run python scripts/download_mod
 cd pipeline
 uv run python -m handstand.pose_mediapipe --rotate none --limit 3
 uv run python -m handstand.pose_mediapipe --rotate auto --limit 3
-uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
+uv run python -m handstand.pose_mediapipe --rotate best --limit 3
 
 # the recommended multi-person setting, then the athlete selection on top of it
-uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3 \
+uv run python -m handstand.pose_mediapipe --rotate best --num-poses 3 \
     --running-mode image --min-detection 0.2 --min-presence 0.2
-uv run python -m handstand.athlete --rotate auto
+uv run python -m handstand.athlete --rotate best
 uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
+
+# auto-vs-best on one clip, two panels side by side
+uv run python -m handstand.overlay --clip 438c3693d6d7 --modes auto best
 
 # the same selection over the Apple Vision keypoints (chainlink #16's bake-off)
 uv run python -m handstand.athlete --source vision --rotate auto
@@ -88,6 +92,11 @@ a block per person; see [Several people per frame](#several-people-per-frame---n
 
 Rows are ordered by `frame_idx`, then by landmark index (the order of the
 table below).
+
+A `--rotate best` run adds two more columns, `score_upright` and
+`score_rotated`, between `rotated` and `detected` (see
+[`--rotate best`](#rotate-best)). Every other mode writes exactly the ten
+columns above, byte-for-byte as it always did.
 
 ### Coordinates are always display-frame pixels
 
@@ -120,6 +129,14 @@ point and its mirrored normalised coordinates map to the same display pixel:
 the `none` and `auto` outputs of a clip agree to the model's own accuracy
 rather than being offset by a pixel.
 
+Worth remembering what "rotated" means for the *pose*: turned 180°, a
+handstand looks like a person standing with their arms up, which is the pose
+the model is good at. So a correctly read handstand has its **wrists below its
+ankles in the display frame** (`mean wrist y > mean ankle y`) whichever of the
+two passes found it, because the map-back puts the hands back on the floor.
+`is_inverted` — that one comparison — is the measure the phases stage and the
+#79 measurement both use.
+
 `z` is depth along the camera axis, which an in-plane 180° rotation does not
 touch, so it passes through unchanged.
 
@@ -139,7 +156,7 @@ them; the runner never picks the athlete — that is a later step, reading the
 `person_idx` column described here.
 
 ```
-uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
+uv run python -m handstand.pose_mediapipe --rotate best --num-poses 3
 ```
 
 * Output root: `keypoints/mediapipe_multi/<rotate>/<clip_id>.{parquet,json}`.
@@ -159,7 +176,9 @@ uv run python -m handstand.pose_mediapipe --rotate auto --num-poses 3
   placeholder the single-person schema uses, so a frame is never missing from
   the file. `person_idx = -1` therefore means "no person", never "person -1".
 * `frame_idx`, `t_ms` and `rotated` describe the *frame*, so they repeat
-  across the blocks of that frame.
+  across the blocks of that frame. So do `score_upright`/`score_rotated` in a
+  `--rotate best` run: one pair of scores per frame, repeated over that frame's
+  blocks.
 * Coordinates are display-frame pixels, as above; `z`, `visibility` and
   `presence` are that person's own scores.
 
@@ -204,10 +223,15 @@ stage keeps working unchanged.
 
 ```sh
 cd pipeline
-uv run python -m handstand.athlete --rotate auto
-uv run python -m handstand.athlete --rotate auto --clips 6508f9b355bd
+uv run python -m handstand.athlete --rotate best          # the recommended keypoints
+uv run python -m handstand.athlete --rotate best --clips 6508f9b355bd
+uv run python -m handstand.athlete --rotate auto          # the dataset as measured so far
 uv run python -m handstand.athlete --source vision --rotate auto   # Apple Vision
 ```
+
+`--rotate` takes any of the four modes and defaults to `auto`, so a run without
+it works on the `auto` keypoints the dataset numbers were measured from. The
+selection itself does not know or care which mode it is reading.
 
 `--source {mediapipe,vision}` (default `mediapipe`, whose output is unchanged)
 picks the pair of directories to work on and nothing else: the same rules, the
@@ -414,8 +438,8 @@ uv run python -m handstand.postprocess --clips 6508f9b355bd --overwrite
 ```
 
 Note that unlike `keypoints/` there is no rotation-mode directory: one clip has
-one processed trajectory, the recommended `auto` mode, and re-running a clip in
-another mode needs `--overwrite`.
+one processed trajectory, and re-running a clip in another mode needs
+`--overwrite`.
 
 | column | type | meaning |
 |---|---|---|
@@ -620,11 +644,11 @@ The authoritative list in code is `handstand.pose_mediapipe.JOINT_NAMES`.
 | `clip_id` | id used in the file names |
 | `source_file` | basename of the input video |
 | `model` | model file name (not the full path) |
-| `rotate` | `none`, `180` or `auto` |
+| `rotate` | `none`, `180`, `auto` or `best` |
 | `display_width`, `display_height` | size of the frames the coordinates refer to |
 | `frame_count` | decoded frames (rows / 33) |
 | `detected_frame_count` | frames with at least one pose |
-| `rotated_frame_count` | frames fed to the model rotated 180°: `frame_count` for mode `180`, `0` for mode `none`, and in `auto` the number of frames the previous frame's judgement switched on |
+| `rotated_frame_count` | frames fed to the model rotated 180°: `frame_count` for mode `180`, `0` for mode `none`, in `auto` the number of frames the previous frame's judgement switched on, and in `best` the frames whose rotated read won on score |
 | `mediapipe_version` | version used for the run |
 | `runtime_seconds` | wall-clock seconds for the whole clip, including writing the parquet |
 
@@ -675,18 +699,54 @@ selection instead:
 | `none` | as displayed | all false |
 | `180` | every frame rotated 180° | all true |
 | `auto` | 180° when the *previous* frame's result was inverted — mean y of both wrists greater (lower in the image) than mean y of both ankles, computed in display coordinates; the first frame is never rotated; a frame with no detection keeps the previous decision | true on rotated frames |
+| `best` | **both** orientations of every frame, and the one the model is more sure of is kept | true where the rotated read won |
 
-`auto` owns two landmarker instances (one that only ever sees upright frames,
-one that only ever sees rotated frames) so each MediaPipe VIDEO-mode tracker
-observes a consistent orientation.
+**`best` is the recommended mode**, and `auto` is kept because it is what the
+dataset was measured with so far. The reason is a trap `auto` cannot get out of
+(chainlink #79). `auto` decides each frame from the **previous** frame's
+skeleton: once MediaPipe has misread an inverted body as a standing person, the
+wrists are *above* the ankles, "not inverted" is concluded, and no frame is ever
+rotated again — however wrong that read was. It is self-reinforcing, and in
+`438c3693d6d7` frame 138 (wrist y 427, ankle y 733) the athlete is written down
+as a person standing on their head for the rest of the clip.
 
-With `--num-poses > 1` the `auto` judgement is taken from **the person whose
-wrists are lowest in the image** of the previous frame — the largest mean wrist
-`y` — because that is the one most likely to be the athlete on their hands.
-People whose wrists are not both visible cannot be ranked and are skipped; if
-no person can be ranked the first person is judged instead, which for a
-single-person frame is exactly the rule above. A frame where nobody was
-detected at all still keeps the previous decision.
+`best` looks at the frame itself instead of at its predecessor:
+
+1. Run the landmarker on the frame **as displayed** and on the **same frame
+   rotated 180°**, and map the rotated result back into display pixels.
+2. Score each of the two by the **mean visibility of the 12 main joints**
+   (shoulders, elbows, wrists, hips, knees, ankles — the same set, in the same
+   order, as `handstand.athlete.MAIN_JOINTS`, so a confidently detected nose
+   cannot carry a body the model has the rest of wrong). Only the scores the
+   model actually reported are averaged; a frame with nobody in it scores NaN.
+3. Keep the higher of the two, writing **both** scores out as `score_upright`
+   and `score_rotated` next to the `rotated` flag they decided, so any frame's
+   choice can be re-examined later without re-running the model.
+4. **Tie** — including both-NaN — keeps the **previous frame's choice**, so a
+   frame the model is equally sure of either way does not flip the orientation
+   and hand the tracker a wobble. A pass that found nobody while the other found
+   a body loses outright; a pass cannot win on a body that is not there.
+
+With `--num-poses > 1` each of the two scores is taken from **the person whose
+wrists are lowest in the image** of that pass (the largest mean wrist `y`,
+`pose_mediapipe.lowest_wrist_pose`), the one most likely to be the athlete on
+their hands — the same person `auto` judges, and the same rule
+`vision_import` applies to pick the single person out of a Vision frame.
+
+`auto` and `best` own two landmarker instances in **VIDEO** mode (one that only
+ever sees upright frames, one that only ever sees rotated frames) so each
+MediaPipe tracker observes a consistent orientation. In **IMAGE** mode `best`
+keeps one landmarker: the detector runs on every image with no state to carry
+over, so there is nothing for an orientation to be inconsistent with.
+
+```python
+import pandas as pd
+
+best = pd.read_parquet(".../keypoints/mediapipe_multi/best/1a2b3c4d5e6f.parquet")
+# the frames where the two passes were close enough to be worth a look
+close = best[(best["score_rotated"] - best["score_upright"]).abs() < 0.05]
+close[["frame_idx", "rotated", "score_upright", "score_rotated"]].drop_duplicates()
+```
 
 ## Apple Vision
 
@@ -756,6 +816,12 @@ next frame when the **previous** frame's body had its wrists below its ankles,
 judged from the person whose wrists are lowest, with the first frame never
 turned and a frame with nobody in it keeping the previous decision. Both
 implementations have to agree or the two runs are not comparable at all.
+
+**`best` is MediaPipe-only so far.** The Vision runner (`swift/VisionPose`,
+`handstand.vision_import`) still offers `none`, `180` and `auto`; the same two
+landmarker instances and the same 12-joint visibility score are what it would
+need, and until then a Vision run can only be compared against MediaPipe's
+`auto`.
 
 ### Vision joint names
 
