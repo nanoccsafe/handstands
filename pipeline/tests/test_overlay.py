@@ -732,6 +732,88 @@ def test_render_overlay_needs_a_panel(
         overlay.render_overlay(synthetic_video, [], tmp_path / "x.mp4")
 
 
+def test_render_overlay_adds_the_extra_captions_to_every_panel(
+    flat_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A later stage's per-frame answer is drawn over the clip it came from."""
+    poses = every_frame()
+    left = keypoint_table(range(FRAME_COUNT), poses)
+    right = keypoint_table(range(FRAME_COUNT), poses)
+    left_path, right_path = write_panels(tmp_path / "keypoints", [("none", left), ("auto", right)])
+    # A phase and a hold number on the first two frames, and nothing at all on the
+    # rest: a mapping that covers part of a clip is not an error.
+    extra = {0: ["phase pre", "note walking up"], 1: ["phase hold", "hold 0"]}
+
+    composed = decoded_frames(
+        _render(flat_video, [("none", left_path), ("auto", right_path)], tmp_path, "both", extra)
+    )
+    alone = [
+        decoded_frames(_render(flat_video, [(label, path)], tmp_path, label, extra))
+        for label, path in (("none", left_path), ("auto", right_path))
+    ]
+    # The extra lines go on every panel — they describe the frame, not the pose
+    # source — so each panel of a composed frame is the one-panel render of that
+    # same panel, extra lines and all. The tolerance is the codec: mp4v rings
+    # around the caption's hard edges on a flat background.
+    for panel, single in enumerate(alone):
+        for index in (0, 1, 2):
+            plate = _caption_plate(composed[index], panel).astype(int)
+            one = _caption_plate(single[index], 0).astype(int)
+            assert np.abs(plate - one).max() <= 40
+    # Two extra lines make a taller caption plate than none, on both panels, and
+    # the pose is drawn either way.
+    for panel in (0, 1):
+        assert _text_rows(composed[0], panel) > _text_rows(composed[2], panel)
+        assert _text_rows(composed[1], panel) > _text_rows(composed[2], panel)
+    assert any(is_good(pixel) for pixel in composed[2].reshape(-1, 3))
+
+
+def _render(
+    video: pathlib.Path,
+    panels: Sequence[tuple[str, pathlib.Path]],
+    root: pathlib.Path,
+    name: str,
+    extra_captions: dict[int, list[str]],
+) -> pathlib.Path:
+    """Render ``panels`` under ``root`` with ``extra_captions`` and return the file."""
+    out_path = root / "overlays" / f"{name}.mp4"
+    report = overlay.render_overlay(video, panels, out_path, extra_captions=extra_captions)
+    assert report.frame_count == FRAME_COUNT
+    return out_path
+
+
+def _text_rows(frame: np.ndarray, panel: int) -> int:
+    """How many rows of a panel's top-left corner hold caption text.
+
+    The caption is the only white thing in that corner of a flat grey frame: the
+    skeleton is green, and the plate behind the text is a dark grey.
+    """
+    tile = frame[:, :WIDTH] if panel == 0 else frame[:, WIDTH:]
+    white = (tile[:, :, 0] > 200) & (tile[:, :, 1] > 200) & (tile[:, :, 2] > 200)
+    return int(white[:80].any(axis=1).sum())
+
+
+def _caption_plate(frame: np.ndarray, panel: int) -> np.ndarray:
+    """The top-left corner of one panel, where :func:`draw_caption` draws."""
+    tile = frame[:, :WIDTH] if panel == 0 else frame[:, WIDTH:]
+    return tile[:60, :120]
+
+
+def test_render_overlay_takes_an_empty_extra_caption_mapping(
+    synthetic_video: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    table = keypoint_table(range(FRAME_COUNT), every_frame())
+    (path,) = write_panels(tmp_path / "keypoints", [("auto", table)])
+    out_path = tmp_path / "overlays" / "empty.mp4"
+
+    assert (
+        overlay.render_overlay(
+            synthetic_video, [("auto", path)], out_path, extra_captions={}
+        ).frame_count
+        == FRAME_COUNT
+    )
+
+
 def test_render_overlay_rejects_a_negative_frame_budget(
     synthetic_video: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:

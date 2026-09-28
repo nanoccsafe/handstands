@@ -588,6 +588,7 @@ def render_overlay(
     panels: Sequence[tuple[str, str | pathlib.Path]],
     out_path: str | pathlib.Path,
     max_frames: int | None = None,
+    extra_captions: Mapping[int, Sequence[str]] | None = None,
 ) -> OverlayReport:
     """Draw one or more keypoint panels on a clip and write an MP4.
 
@@ -600,6 +601,15 @@ def render_overlay(
     flagged (``trainer_contact``) additionally gets a red border and the line
     :data:`TRAINER_CONTACT_LABEL`. The border is drawn after the caption, so it
     stays a continuous rectangle.
+
+    ``extra_captions`` adds lines to a frame's caption, keyed by ``frame_idx``:
+    it is how a later stage's per-frame answer is drawn over the clip it came
+    from — :mod:`handstand.phases` uses it for the phase and the hold number,
+    which is the only way to watch where the boundaries landed. The lines go on
+    **every** panel, after the label and the frame's own numbers and before the
+    alert lines, because they describe the frame rather than the pose source. A
+    frame the mapping says nothing about gets no extra lines, so a mapping that
+    covers part of a clip is not an error.
 
     Rows are matched to frames by ``frame_idx``, never by position, and a
     parquet that disagrees with the video by more than
@@ -617,6 +627,7 @@ def render_overlay(
         raise ValueError("render_overlay needs at least one panel")
     if max_frames is not None and max_frames < 0:
         raise ValueError(f"max_frames must be >= 0, got {max_frames}")
+    captions: Mapping[int, Sequence[str]] = extra_captions or {}
 
     keypoint_panels = [load_panel(label, path) for label, path in panels]
     labels = tuple(panel.label for panel in keypoint_panels)
@@ -655,6 +666,7 @@ def render_overlay(
                             f"frame_idx {frame_keys.frame_idx}",
                             f"t_ms {frame_keys.t_ms}",
                         ]
+                        lines.extend(str(line) for line in captions.get(packet.frame_idx, ()))
                         if not frame_keys.detected:
                             lines.append(NO_POSE_LABEL)
                         if frame_keys.trainer_contact:

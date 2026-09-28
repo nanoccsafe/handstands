@@ -498,6 +498,82 @@ lengths), so the three agree.
 | `parameters` | the thresholds the run used, so a later run can be compared against this one |
 | `runtime_seconds` | wall-clock seconds for the clip |
 
+## Phases
+
+`handstand.phases` labels **every frame** of a clip with the phase it belongs to
+and numbers the holds, so scoring reads only the `hold` frames and hand steps
+(#71) and faults (#32) are events *inside* one. It reads the processed parquets
+above and the `body_length_px` of their sidecars, and writes:
+
+```
+<data_dir>/phases/<source>/<clip_id>.parquet   # one row per frame
+<data_dir>/phases/<source>/segments.csv        # one row per phase run
+```
+
+```sh
+cd pipeline
+uv run python -m handstand.phases --all                     # every processed clip
+uv run python -m handstand.phases --source vision --all
+uv run python -m handstand.phases --clips 057c9e6c96af --render 057c9e6c96af
+```
+
+`--render` writes `<data_dir>/overlays/<clip_id>_phases.mp4` with the phase and
+the hold number on every frame, which is the only way to see whether the
+boundaries landed where they should. A clip with no body length is written with
+every frame `unknown`, as the processed stage wrote it unusable.
+
+The parquet is **one row per frame**, not per (frame, joint):
+
+| column | type | meaning |
+|---|---|---|
+| `frame_idx`, `t_ms` | int64 | the frame and its timestamp, as in the keypoint schema |
+| `phase` | str | `pre`, `kickup`, `hold`, `exit`, `post` or `unknown` |
+| `hold_id` | int64 | the hold this frame is inside, numbered from 0 per clip, `-1` outside one |
+| `known` | bool | the frame has the wrist, ankle and hip midpoints a phase is read from, and no trainer contact |
+| `unknown_reason` | str | why not: `trainer_contact`, `no_visible_wrist`, `no_visible_ankle`, `no_visible_hip`; empty when known |
+| `v_ankle_mid`, `u_ankle_mid` | float64 | the ankle midpoint in the body frame (origin at the wrist midpoint, `u` right, `v` up, in body lengths) |
+| `v_hip_mid` | float64 | the hip midpoint in the body frame, the same units |
+| `body_angle_deg` | float64 | the angle of the wrist→ankle vector from straight up, signed by which way it leans |
+| `inverted` | bool | `v_ankle_mid > 0.6`: a body standing on its hands, with a margin |
+| `hands_low` | bool | the hip midpoint is at least `0.1` body lengths above the wrist midpoint: the hands are the support |
+| `wrist_speed_l_per_s` | float64 | the fastest visible wrist's speed over the previous `0.2 s`, NaN where there is no earlier frame to measure against |
+| `wrist_step_l` | float64 | the largest displacement of a visible wrist over that same `0.2 s` window |
+| `hands_down` | bool | `hands_low` and the hands are not moving: no visible wrist faster than `0.3` body lengths per second. A wrist whose speed could not be measured is not evidence of movement, so a frame just after a gap still counts |
+| `hand_step` | bool | a wrist moved more than `0.1` body lengths over that window: the hands went down somewhere else, and this is what ends a hold |
+| `legs_velocity_l_per_s` | float64 | the ankle midpoint's vertical velocity over a centred `0.1 s` window |
+| `legs_rising`, `legs_falling` | bool | that velocity above or below `0.1` body lengths per second: the feet going away from the floor, or coming back to it |
+
+Every boolean is `False` on a frame with `known = false`, so `known` is the
+column to filter on.
+
+`segments.csv` is the same answer as intervals, one row per run of frames that
+share a phase, for every clip of the source:
+
+| column | meaning |
+|---|---|
+| `clip_id` | the clip the row is about |
+| `phase` | as the parquet |
+| `hold_id` | the hold, or `-1` outside one. Two holds separated by a hand step are two rows |
+| `start_frame`, `end_frame` | the first and last frame of the run, inclusive |
+| `start_ms`, `end_ms` | the same in milliseconds, from `t_ms` |
+| `duration_s` | `(end_ms - start_ms) / 1000`, so the four time columns of a row always agree |
+
+The file is per source, not per run: a run over a few clips replaces its own rows
+and keeps the rest, so `--all` is what writes the whole dataset.
+
+### The rules
+
+A hold is `inverted` **and** `|body_angle| <= 35°` **and** `hands_down` **and** no
+hand step, sustained for at least `0.3 s`. A stretch of frames that fails the
+condition for less than `0.3 s` does not end a hold — a trainer walking in front
+of the camera, or a held handstand swaying a thousandth of a body length under
+the margin — but a hand step always does. The phase itself comes from a state
+machine over that: `pre` before the hands are down, `kickup` while they are down
+and the legs are rising, `hold` while a run qualifies, `exit` from the frame a
+hold stops qualifying until the feet land, and `post` once the body is no longer
+above its hands — until the hands are down and the legs rising again, which is a
+second attempt.
+
 ## Joint names
 
 The 33 MediaPipe pose landmarks, snake_case, in model order (this is the

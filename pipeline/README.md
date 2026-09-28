@@ -116,6 +116,35 @@ are module constants, and the sidecar records the ones a run used.
 (origin at the wrist midpoint, `u` right, `v` up, in body lengths). See
 `docs/keypoint_schema.md` for every column and every rule.
 
+## Phases
+
+Which part of a clip each frame belongs to: `pre`, `kickup`, `hold`, `exit`,
+`post` or `unknown`, with every hold numbered. Scoring reads only the `hold`
+frames; hand steps (#71) and faults (#32) are events inside one.
+
+```sh
+cd pipeline
+uv run python -m handstand.phases --all              # -> $HANDSTAND_DATA/phases/mediapipe/
+uv run python -m handstand.phases --source vision --all
+uv run python -m handstand.phases --clips 057c9e6c96af --overwrite
+uv run python -m handstand.phases --clips 057c9e6c96af --render 057c9e6c96af
+```
+
+Reads `processed/<source>/` and writes one parquet per clip — a row per frame
+with `phase`, `hold_id` and every signal the labels came from — plus
+`segments.csv`, one row per phase run for the whole source. `--render` draws the
+phase and the hold number on every frame of the clip, which is the only way to
+see whether the boundaries landed where they should.
+
+It is rule-based and readable, on purpose: a hold is `inverted` (the ankle
+midpoint more than 0.6 body lengths above the wrist midpoint in the body frame)
+and straight (within 35° of vertical) and `hands_down` (the hands are the
+support and not moving), sustained for at least 0.3 s; a wrist that moves more
+than 0.1 body lengths over 0.2 s is a hand step and ends it, while a stretch of
+up to 0.3 s of unknown frames inside a hold does not. The thresholds are module
+constants, documented at the top of `handstand.phases`. See
+`docs/keypoint_schema.md` for every column and the whole state machine.
+
 ## Paths
 
 `handstand.paths` resolves the shared workspace at call time (never at import
