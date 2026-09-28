@@ -748,6 +748,57 @@ close = best[(best["score_rotated"] - best["score_upright"]).abs() < 0.05]
 close[["frame_idx", "rotated", "score_upright", "score_rotated"]].drop_duplicates()
 ```
 
+### What it cost and what it bought, over the 180 clips
+
+`--rotate best --num-poses 3 --running-mode image --min-detection 0.2
+--min-presence 0.2` over all 180 clips took **57.3 min** against `auto`'s
+29.9 min — it runs the model on every frame twice. In return it finds a body in
+**99.4 %** of frames against `auto`'s 98.2 %, and the share of frames the model
+reads as *inverted* (wrists below the ankles in the display frame, i.e. as the
+handstand it is) is over the **athlete selection's** pick:
+
+| | `auto` | `best` |
+|---|---|---|
+| frames read as inverted | 59,553 of 63,610 (93.6 %) | 60,187 of 63,969 (94.1 %) |
+| frames the other mode got wrong and this one right | — | 381 |
+| frames this mode got wrong and `auto` right | 255 | — |
+
+The dataset total barely moves, and that is the honest reading of the rule: mean
+visibility over the 12 main joints is a weak discriminator, so `best` is not a
+wholesale improvement. It is a *local* one, and it is local in the right
+direction — 37 clips improve (333 frames fixed against 141 broken) and 23 get
+worse (46 fixed, 111 broken), 117 are unchanged, and 11 clips move by more than
+10 points:
+
+| clip | `auto` | `best` | frames fixed | frames broken |
+|---|---|---|---|---|
+| `176c8a7360b2` | 28.0 % | 53.8 % | 35 | 22 |
+| `03a650b3ab58` | 49.7 % | 74.2 % | 4 | 3 |
+| `cd1402aa803a` | 50.3 % | 69.1 % | 14 | 9 |
+| `438c3693d6d7` | 79.0 % | 94.2 % | 6 | 0 |
+| `42fe106ae68e` | 18.7 % | 32.4 % | 29 | 12 |
+| `651b0b5783cc` | 81.1 % | 92.4 % | 49 | 0 |
+| `7f9be313012d` | 75.4 % | 86.0 % | 1 | 0 |
+| `5050dcb30e08` | 76.3 % | 86.6 % | 13 | 0 |
+| `55ce46938d00` | 76.0 % | 46.4 % | 1 | 10 |
+| `938484a5fa21` | 75.0 % | 55.0 % | 2 | 9 |
+| `c0f56c720d07` | 22.9 % | 9.5 % | 7 | 16 |
+
+The three clips fixed outright — `438c3693d6d7`, `651b0b5783cc` and
+`5050dcb30e08`, the ones the finding was about — are the ones where the frame is
+only readable as a handstand *once it has been turned*; `best` breaks nothing in
+any of them. What it does change on those clips is how much else the model
+finds: `best` detects a body in 87.8 % of `438c3693d6d7`'s frames against
+`auto`'s 74.4 %, and flags trainer contact in 48.1 % against 36.5 % — the rotated
+pass sees the trainer standing next to a handstand, which the upright pass
+mostly cannot. Over the dataset that is 13,940 → 16,020 contact frames and 73 →
+76 clips with a trainer in them, and 2,241 more frames with a person in them at
+all.
+
+`score_upright`/`score_rotated` are what make the losses diagnosable: they say
+per frame how sure the model was of each read, so a clip like `55ce46938d00`
+can be re-decided on a different rule without re-running the model.
+
 ## Apple Vision
 
 `swift/VisionPose` is the second pose model, Apple's `VNDetectHumanBodyPoseRequest`
