@@ -1025,19 +1025,27 @@ def run_clip(
     frame_scores: list[tuple[float, float]] = []
     display_width = display_height = 0
 
-    def detect(landmarker: LandmarkerLike | None, frame: np.ndarray, t_ms: int, rotated: bool):
-        """``(P, 33, 5)`` display pixels for one pass over one frame."""
-        assert landmarker is not None  # mode/instance pairing above
-        inference_frame = apply_display_rotation(frame, 180) if rotated else frame
-        pose_norm = _detect_pose(
-            landmarker, inference_frame, t_ms, video_path, settings.running_mode
-        )
-        return _display_pixels(pose_norm, inference_frame, rotated, display_width, display_height)
-
     try:
         with DisplayVideo(video_path) as video:
             display_width = video.display_width
             display_height = video.display_height
+
+            def detect(
+                landmarker: LandmarkerLike | None,
+                frame: np.ndarray,
+                t_ms: int,
+                rotated: bool,
+            ) -> np.ndarray:
+                """``(P, 33, 5)`` display pixels for one pass over one frame."""
+                assert landmarker is not None  # mode/instance pairing above
+                inference_frame = apply_display_rotation(frame, 180) if rotated else frame
+                pose_norm = _detect_pose(
+                    landmarker, inference_frame, t_ms, video_path, settings.running_mode
+                )
+                return _display_pixels(
+                    pose_norm, inference_frame, rotated, display_width, display_height
+                )
+
             rotate_next = False  # first frame is never rotated
             for packet in video:
                 if best:
