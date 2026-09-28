@@ -75,6 +75,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- FeatureExtractor: stacking offsets, joint angles, line and leg-shape features per frame (#22)
 - PhaseSegmenter: pre / kick-up / hold / exit / post per frame, with hold segments (#21)
 - Keypoint post-processing: gating, outlier removal, gap fill, One-Euro smoothing, body length (#20)
 - OrientationNormalizer: inversion detection, rotate/unrotate (#19)
