@@ -67,6 +67,9 @@ uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
 # auto-vs-best on one clip, two panels side by side
 uv run python -m handstand.overlay --clip 438c3693d6d7 --modes auto best
 
+# and what that difference is over the whole dataset
+uv run python -m handstand.orient_measure
+
 # the same selection over the Apple Vision keypoints (chainlink #16's bake-off)
 uv run python -m handstand.athlete --source vision --rotate auto
 uv run python -m handstand.overlay --clip 6508f9b355bd --source vision_athlete
@@ -753,7 +756,12 @@ directions**. So the choice is now temporal
 
 That is **95** orientation changes over the 180 clips instead of 16,418, and the
 sustained runs still switch: the stuck trap is not damped away, it is the only
-kind of change left. The opening is a plain **sign**, not a sign past the band,
+kind of change left. (`auto` switches 3,639 times over the same clips — it
+follows the previous frame too — so the temporal rule is 38 times steadier than
+the mode it replaces and 173 times steadier than the per-frame one; both counts
+and their run lengths are in the tables
+[below](#what-it-cost-and-what-it-bought-over-the-180-clips).) The opening is a
+plain **sign**, not a sign past the band,
 because the window is centred and 89 % of the clips' opening mean margin is
 inside the band — for those clips the opening window is the only decision there
 is, and gating it as well would read them all upright, including the ones the
@@ -782,65 +790,120 @@ close[["frame_idx", "rotated", "score_upright", "score_rotated"]].drop_duplicate
 
 ### What it cost and what it bought, over the 180 clips
 
+Every number in this section comes out of one command, which reads the keypoints
+and the chain's own outputs and writes nothing::
+
+    cd pipeline
+    uv run python -m handstand.orient_measure               # best against auto
+    uv run python -m handstand.orient_measure --pick multi   # every person, not the athlete
+    uv run python -m handstand.orient_measure --clips 438c3693d6d7 --no-chain
+
+`handstand.orient_measure` counts the frames whose skeleton reads as a handstand
+(mean wrist `y` greater than mean ankle `y`) per mode, the frames one mode fixed
+and broke against the other, and the runs of frames the changes come in, plus
+the usable clips, holds and trainer presence the later stages produced. The
+counts it uses are fixed: the **athlete pick** (one body per frame — the
+skeleton everything downstream uses, `keypoints/mediapipe_athlete/<mode>/`, or
+with `--pick multi` the person whose wrists are lowest in the image of
+`keypoints/mediapipe_multi/<mode>/`), a mode's share over **the frames it
+detected**, and fixed/broken over **the frames both modes detected**.
+
 `--num-poses 3 --running-mode image --min-detection 0.2 --min-presence 0.2`
 (`--rotate best` is the default of a multi-person run) over all 180 clips costs
 **57.0 min** of model time against `auto`'s 30.0 min — it
 runs the model on every frame twice, and the decision itself (both scores over
 the whole clip) is milliseconds. It finds a body in **98.7 %** of frames against
-`auto`'s 98.2 %; the per-frame version of this mode found one in 99.4 %, and the
-454 frames it gains back are frames on which the orientation the clip is
+`auto`'s 98.2 %; the per-frame version of this mode, measured before the keypoints
+were re-run, found a body in 99.4 %, and the frames it gains back are ones on
+which the orientation the clip is
 committed to found nobody while the other pass found a body — a frame written as
 "no body" rather than as the other orientation's skeleton, which is the price of
 holding one orientation over a clip.
 
-The share of frames the model reads as *inverted* (wrists below the ankles in the
-display frame, i.e. as the handstand it is) is measured over the **athlete
-selection's** pick:
+**The flicker is what the temporal rule is for, and it is the one thing it
+fixes.** `auto` follows the previous frame's skeleton, and the model makes that
+decision change its mind constantly:
 
-| | `auto` | `best`, per frame | `best`, over the clip |
-|---|---|---|---|
-| frames read as inverted | 59,553 of 63,610 (93.6 %) | 60,187 of 63,969 (94.1 %) | 59,963 of 64,586 (92.8 %) |
-| orientation changes over the 180 clips | — | 16,418 | 95 |
-| frames fixed against `auto` | — | 381 | 1,028 |
-| frames broken against `auto` | 255 | 255 | 1,127 |
+| over the 180 clips | `auto` | `best` |
+|---|---|---|
+| orientation switches | **3,639** | **95** |
+| runs of one orientation | 3,819 | 275 |
+| … median / p90 / longest run, in frames | 1 / 13 / 1,646 | 185 / 543 / 1,245 |
+| runs of 3 frames or less (flicker) | 3,112 of 3,819 (81 %) | **2 of 275** |
 
-The two `best` columns are the same model on the same frames; only the decision
-differs, and the difference is exactly what the temporal rule trades. Fixing
-1,028 frames against breaking 1,127 is a smaller net win than the per-frame
-rule's 381 against 255, and it is *worse on the dataset total* (92.8 % against
-93.6 % and 94.1 %): a clip that is committed to the wrong orientation loses all
-of its frames instead of half of them, and that is what happens in
-`55ce46938d00`, whose frames the model reads more confidently — and more wrongly
-— the other way round (`best` 95.6 % → 0.0 % inverted, all 384 frames broken).
-It is also what the smoothing is *for*: the changes it makes come in runs of
-0.5 s or more, so 85 % of the runs of changed frames are 3 frames or shorter and
-the long ones are the real ones. The per-frame rule's 1-frame flips are gone
-(16,418 orientation changes against 95), and so is its ability to be accidentally
-right half the time.
+So 3,112 of the 3,819 stretches `auto` is read in last three frames or less. A
+body does not do that; the per-frame rule, which made 16,418 orientation changes
+over the same clips, is that behaviour plus a stronger dose of it.
 
-Clips: 29 improve, 24 get worse, 127 are unchanged, and 6 move by more than 10
+What it bought, on the frames it judged:
+
+| athlete pick, over the 180 clips | `auto` | `best` |
+|---|---|---|
+| frames read as a handstand | 59,553 of 63,610 detected (93.6 %) | 59,963 of 64,586 detected (92.8 %) |
+| frames fixed against `auto` | — | **382** |
+| frames broken against `auto` | — | **567** |
+| runs of fixed frames | — | 226, median 1, p90 2, longest 52; 96.0 % of them ≤ 3 frames |
+| runs of broken frames | — | 158, median 1, p90 3, longest 198; 89.9 % of them ≤ 3 frames |
+| clips better / worse / unchanged | — | 29 / 27 / 124 |
+| clips moving more than 10 points | — | 6 |
+
+Over the multi-person keypoints — the person whose wrists are lowest, i.e. the
+athlete candidate, before the athlete rules pick between bodies — the same
+picture: 89.8 % of 66,669 frames read as a handstand under `auto` against 89.9 %
+of 67,012 under `best`, 1,134 frames fixed against 973 broken, 32 clips better,
+30 worse, 118 unchanged, 10 moving by more than 10 points.
+
+**This is a worse trade than the per-frame rule made, and the losses are one
+clip.** The lead's review measured the per-frame version of this mode at 381
+frames fixed against 255 broken (its keypoints have since been overwritten, so
+that row is quoted, not re-measured); the temporal rule fixes 382 and breaks
+567. 281 of those broken frames are `55ce46938d00`, and the rest are the same
+kind of clip. What happens there is the price of a consistent decision: the
+model is *surer* of the rotated read (mean score margin +0.043, outside the
+±0.05 band on 59 % of its frames) and the skeleton that read gives back is a
+person standing on the mat, so the clip is committed to it for 687 of its 743
+frames and 281 of them are lost at once, where a per-frame rule would have read
+a share of them correctly by luck. Excluding that one clip the temporal rule
+fixes 382 and breaks 286, i.e. the same fixes as the per-frame rule and barely
+more losses — the switch is not what costs, the commitment is.
+
+That is the trade the temporal rule makes, and the reason it is worth making
+here is the first table: 3,112 flicker runs of `auto` (and 16,418 orientation
+changes of the per-frame rule) become 2, while the long runs — the ones that are
+a real change of orientation — survive, up to 1,245 frames long.
+
+Clips: 29 improve, 27 get worse, 124 are unchanged, and 6 move by more than 10
 points:
 
-| clip | `auto` | `best` (over the clip) | frames fixed | frames broken |
+| clip | `auto` | `best` | frames fixed | frames broken |
 |---|---|---|---|---|
+| `55ce46938d00` | 95.6 % | 13.1 % | 0 | 281 |
+| `938484a5fa21` | 84.5 % | 57.2 % | 1 | 21 |
 | `651b0b5783cc` | 81.1 % | 100.0 % | 52 | 0 |
-| `13479d9e86a6` | 48.8 % | 65.0 % | 27 | 14 |
-| `2ebc86f4e017` | 50.6 % | 64.4 % | 90 | 53 |
-| `c0f56c720d07` | 2.9 % | 16.6 % | 34 | 6 |
-| `938484a5fa21` | 84.5 % | 52.1 % | 4 | 50 |
-| `55ce46938d00` | 95.6 % | 0.0 % | 0 | 367 |
+| `13479d9e86a6` | 48.8 % | 65.4 % | 11 | 6 |
+| `42fe106ae68e` | 22.3 % | 35.9 % | 24 | 2 |
+| `cd1402aa803a` | 60.1 % | 70.6 % | 15 | 7 |
 
-The two clips the finding was about behave as it says they should.
-`438c3693d6d7` goes from 98.7 % to 99.7 % inverted and its frame 138 — the one in
-the issue, where `auto` reads the athlete as a person standing on the mat with
-their hands at chest height (wrist y 427, ankle y 733) — is read as the handstand
-it is (wrist y 749, ankle y 326), and it stays that way: the 26 frames the new
-rule rotates are enough for the trap and the other 821 are read upright and read
-correctly. `651b0b5783cc` goes from 81.1 % to 100 %; its first 52 frames are the
-ones `auto` read as a standing person (wrist 387, ankle 650) and `best` reads as
-a handstand (wrist 663, ankle 384). `5050dcb30e08` does not move at all: 80.7 %
-either way, 0 frames fixed and 0 broken, because the two modes choose the same
-orientation in every frame of it.
+Of the three clips the finding named, two behave as it says they should — but
+the first of them not for the reason one would guess — and the third does not move
+at all.
+`438c3693d6d7` goes from 98.7 % to 99.7 % read as a handstand, and its frame 138
+— the one in the issue, where `auto` reads the athlete as a person standing on
+the mat with their hands at chest height (wrist y 427, ankle y 733) — is read as
+the handstand it is (wrist y 749, ankle y 326). That frame is *not* one of the 26
+the new rule rotates (it rotates frames 576–601, where the model is surer of the
+rotated read): the trap there was that `auto` fed that frame turned and got one
+person back, a person standing. The upright pass of the same frame reports the
+athlete on their hands as well, and the athlete selection picks them, so the
+skeleton is right without the frame being turned at all. `651b0b5783cc` is the
+opposite case and the rule's own doing: the clip is read rotated from its first
+frame to its last (one run of 275), and its first 52 frames are the ones `auto`
+read as a standing person (wrist y 390, ankle y 664) and `best` reads as a
+handstand (wrist y 662, ankle y 375) — 52 frames fixed, in one run, and none
+broken. `5050dcb30e08` does not move at all: 0 frames fixed and 0 broken, because
+every frame of it reads the same under both modes, even though the two modes
+disagree about the orientation in 76 of its 190 frames and the clip's share goes
+80.7 % → 81.3 % on the frames `best` found a body in.
 
 What else changes: over the dataset the athlete selection flags 13,940 → 14,973
 trainer-contact frames and 73 → 74 clips with a trainer in them (`--rotate best`
@@ -859,7 +922,12 @@ column in every frame.
 
 Re-running the chain on the new keypoints (`handstand.athlete`, `postprocess`,
 `phases`, `features`, `trainer_report`, all with their defaults) against the same
-chain on `auto`:
+chain on `auto`. The `best` column is what
+`uv run python -m handstand.orient_measure` reads back off disk; the `auto`
+column is the changelog of #20, #21 and #69, which is the check that the two are
+counted the same way (the `auto` outputs are one `--rotate` away and have been
+overwritten); the per-frame column was measured on the earlier per-frame run,
+whose keypoints no longer exist, and is quoted, not re-measured:
 
 | | `auto` | `best`, per frame | `best`, over the clip |
 |---|---|---|---|
@@ -869,13 +937,18 @@ chain on `auto`:
 | hold time, seconds | 1,467.0 | 1,457.1 | 1,439.1 |
 | clips with a trainer in them | 73 | 76 | 74 |
 
-`auto` and the per-frame `best` agree with the numbers already in the changelog
-for #20 and #21 (178 usable, 166 with a hold, 1,467 s), which is the check that
-the two are measured the same way. The temporal rule gives up three clips' worth
-of hold and 28 s of hold time, on the strength of two clips' skeletons being read
-the wrong way round for most of their length; the per-frame rule gave up one.
-None of these four numbers says the keypoints are better, and none of them is
-what the mode is for: they are what the mode costs.
+The temporal rule gives up three clips' worth of hold and 28 s of hold time
+against `auto`, and one clip and 10 s against the per-frame rule, on the strength
+of two clips: one whose skeletons are read the wrong way round for most of their
+length, and one whose skeletons are read right and then thrown away.
+`651b0b5783cc` is the second, and it is the clip this mode reads best — the
+athlete selection flags trainer contact on 268 of its 275 frames (against 244
+under `auto`), the post-processor gates all of them out, no body length is
+measurable on it, and it drops out of the 177 usable clips with its hold with it.
+That is the shape of the cost of reading a clip correctly: the skeleton the model
+returns for a handstand is long and thin in a way the trainer-contact rules read
+as a second person in it. None of the five numbers above says the keypoints are
+better, and none of them is what the mode is for: they are what the mode costs.
 
 Watching it settles the argument either way — `uv run python -m handstand.overlay
 --clip 438c3693d6d7 --source athlete --modes auto best` writes the two panels
@@ -885,8 +958,10 @@ one rotation mode per panel, with the trainer-contact frames bordered in red. In
 their hands at chest height, over an athlete whose head is on the mat; in the
 `best` panel the skeleton runs the length of the body, hands on the mat, feet at
 the ceiling. In `651b0b5783cc` the same thing happens over the first 52 frames
-and the two panels are identical after that. In `5050dcb30e08` the two panels are
-identical throughout, because the modes agree on every frame of it.
+and the two panels are identical after that, both modes having settled on the
+rotated read. In `5050dcb30e08` the two panels draw the same skeleton throughout,
+because every frame of it reads the same under both modes, even though the two
+modes feed the model different orientations in 76 of its 190 frames.
 
 ## Apple Vision
 
