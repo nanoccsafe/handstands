@@ -107,6 +107,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- MediaPipe auto-rotation gets stuck reading inverted bodies upside down (#79)
 - The multi-person pipeline defaults to `--rotate best` (chainlink #79):
   `pose_mediapipe` with `--num-poses > 1`, and `handstand.athlete`,
   `handstand.postprocess` and `handstand.trainer_report` (phases and features
