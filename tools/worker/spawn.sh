@@ -49,7 +49,10 @@ else
   git -C "$REPO" worktree add -q "$wt" -b "$name" main
 fi
 
-loop_cli="${CHAINLINK_LOOP:-$HOME/.config/opencode/plugins/opencode-loop-plugin/bin/chainlink-loop}"
+# chainlink-loop: $CHAINLINK_LOOP, else on PATH, else the plugin's own repo checkout.
+loop_cli="${CHAINLINK_LOOP:-}"
+[[ -z "$loop_cli" ]] && loop_cli="$(command -v chainlink-loop 2>/dev/null || true)"
+[[ -z "$loop_cli" ]] && loop_cli="$HOME/storage/opencode-chainlink-loop-plugin/bin/chainlink-loop"
 reviewer_model="${REVIEWER_MODEL:-opencode-go/mimo-v2.6-flash}"
 if [[ "$mode" == "--chainlink" ]]; then
   [[ -x "$loop_cli" ]] || { echo "chainlink-loop not found at $loop_cli (set CHAINLINK_LOOP)" >&2; exit 1; }

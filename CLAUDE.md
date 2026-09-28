@@ -16,7 +16,8 @@ The default flow is one issue at a time through the opencode-loop-plugin's singl
 1. Make the issue description the complete spec (paths, interfaces to reuse, API, CLI, tests, acceptance):
    the plugin feeds the issue itself to its worker and reviewer, and they are small models.
 2. `tools/worker/spawn.sh <id> <slug> --chainlink [model]` runs the plugin's deterministic
-   `chainlink-loop --task <id> --no-close` (installed at `~/.config/opencode/plugins/opencode-loop-plugin/bin/`)
+   `chainlink-loop --task <id> --no-close` (plugin repo `~/storage/opencode-chainlink-loop-plugin`,
+   github.com/nanonite/opencode-chainlink-loop-plugin; spawn.sh finds it via $CHAINLINK_LOOP, PATH, or that repo)
    in the issue's worktree (`CHAINLINK_DB` points at the main `.chainlink`). One-shot `opencode run` steps:
    build-agent worker, plan-agent reviewer that cannot edit, findings fed back to the worker session, until the
    reviewer approves; the issue stays open. Long batches: `LOOP_ARGS="--worker-timeout 10800"`. Don't comment on
