@@ -185,6 +185,25 @@ def test_every_joint_the_config_asks_for_is_a_mediapipe_joint() -> None:
         assert f'value="{joint}"' in text, f"{joint} is missing from {config.name}"
 
 
+def test_keypoint_joints_are_label_tags_inside_keypointlabels() -> None:
+    """Label Studio rejects <Choice> inside <KeyPointLabels> ("Not expecting tag: choice")."""
+    import pathlib as _pathlib
+    import xml.etree.ElementTree as ET
+
+    config = (
+        _pathlib.Path(__file__).resolve().parents[2]
+        / "tools"
+        / "labeling"
+        / "label_studio_config.xml"
+    )
+    root = ET.fromstring(config.read_text(encoding="utf-8"))
+    kp = root.find("KeyPointLabels")
+    assert kp is not None
+    children = list(kp)
+    assert children and all(child.tag == "Label" for child in children)
+    assert {child.get("value") for child in children} >= set(labels.LABEL_JOINTS)
+
+
 def test_the_config_has_the_per_image_visibility_field_the_converter_reads() -> None:
     import pathlib as _pathlib
 

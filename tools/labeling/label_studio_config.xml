@@ -12,25 +12,25 @@
     current release: KeyPointLabels takes name, toName, choice, maxUsages,
     showInline, opacity, strokeWidth and snap, and nothing else). That is why the
     rule above asks for a missing point rather than a flag. If a later version
-    adds one, it will appear as an extra Choice inside this tag and the import
+    adds one, it will appear as an extra attribute on this tag and the import
     (handstand/labels.py) already reads value.occluded / value.visible.
   -->
   <KeyPointLabels name="keypoints" toName="image" choice="single" maxUsages="1" strokeWidth="3" opacity="0.7">
-    <Choice value="nose"/>
-    <Choice value="left_shoulder"/>
-    <Choice value="right_shoulder"/>
-    <Choice value="left_elbow"/>
-    <Choice value="right_elbow"/>
-    <Choice value="left_wrist"/>
-    <Choice value="right_wrist"/>
-    <Choice value="left_hip"/>
-    <Choice value="right_hip"/>
-    <Choice value="left_knee"/>
-    <Choice value="right_knee"/>
-    <Choice value="left_ankle"/>
-    <Choice value="right_ankle"/>
-    <Choice value="left_foot_index"/>
-    <Choice value="right_foot_index"/>
+    <Label value="nose"/>
+    <Label value="left_shoulder"/>
+    <Label value="right_shoulder"/>
+    <Label value="left_elbow"/>
+    <Label value="right_elbow"/>
+    <Label value="left_wrist"/>
+    <Label value="right_wrist"/>
+    <Label value="left_hip"/>
+    <Label value="right_hip"/>
+    <Label value="left_knee"/>
+    <Label value="right_knee"/>
+    <Label value="left_ankle"/>
+    <Label value="right_ankle"/>
+    <Label value="left_foot_index"/>
+    <Label value="right_foot_index"/>
   </KeyPointLabels>
   <Choices name="occluded_or_unsure" toName="image" choice="single" showInline="false" required="true">
     <Choice value="clear"/>
