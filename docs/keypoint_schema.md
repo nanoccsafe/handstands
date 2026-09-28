@@ -683,6 +683,20 @@ finite `com_forward`:
 A spread needs two frames, so the SDs, the range and the speed are NaN on a
 one-frame hold; the median and the percentages are defined on one.
 
+### Signs: `com_forward` against the columns from #22
+
+`com_forward` is signed **in the athlete's direction** (positive towards the
+fingers), while the #22 columns it is usually compared against — `body_angle`
+and the `off_*` offsets — are signed **in image `u`** (#22 signs features in a
+direction, not an anatomy). The two agree only inside one facing: a clip shot
+from the other side of the athlete flips one and not the other, so a
+correlation across many clips must sign-align the image column first,
+`body_angle × facing_sign`. Over the mediapipe holds that is what makes the
+relation come out right — `r(com_forward, body_angle)` pooled over all hold
+frames is −0.27 only because 107 of 163 clips face `−u`, while
+`r(com_forward, body_angle × facing_sign)` is +0.50 pooled and the median
+within-hold correlation is +0.79 (305 holds, positive in 89 % of them).
+
 ## Joint names
 
 The 33 MediaPipe pose landmarks, snake_case, in model order (this is the
