@@ -7,6 +7,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Phase segmentation: `uv run python -m handstand.phases --all` labels every
+  frame of a clip `pre`, `kickup`, `hold`, `exit`, `post` or `unknown` and
+  numbers the holds, so scoring reads only the hold frames and hand steps
+  (#71) and faults (#32) are events inside one. It reads the processed
+  trajectories of #20 and the body frame of `handstand.bodyframe`, and is
+  rule-based and readable: a hold is the ankle midpoint more than 0.6 body
+  lengths above the wrist midpoint, within 35° of vertical, with the hands
+  planted and not moving (no wrist faster than 0.3 body lengths per second over
+  0.2 s), sustained for at least 0.3 s — a wrist that moves more than 0.1 body
+  lengths over that window is a hand step and ends it, and a stretch of up to
+  0.3 s of frames nobody could see does not. One visible wrist is enough when a
+  side-on clip only reports one, which is what keeps 6508f9b355bd from losing its
+  hold. Output goes to `data/phases/<source>/<clip_id>.parquet` (a row per frame
+  with `phase`, `hold_id` and every signal the labels came from) and
+  `data/phases/<source>/segments.csv` (one row per phase run, merged per clip so
+  a run over a few clips keeps the rest). `--render` draws the phase and the hold
+  number on every frame through a new `extra_captions` argument of
+  `handstand.overlay.render_overlay`. Over the 180 MediaPipe clips: 178 usable,
+  166 with at least one hold, a longest hold per clip of median 5.3 s (p25 2.9 s,
+  p75 9.1 s, max 41.5 s) and 1467 s of hold time in total (#21)
 - Keypoint post-processing: `uv run python -m handstand.postprocess --all` gates
   the athlete keypoints (trainer contact, low visibility), removes teleports
   above 8 body lengths per second, interpolates gaps of at most 0.2 s in time,
