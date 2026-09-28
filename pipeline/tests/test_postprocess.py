@@ -1284,9 +1284,11 @@ def test_the_cli_wants_to_know_which_clips(tmp_path: pathlib.Path) -> None:
 
 
 def test_the_cli_runs_a_batch_and_prints_the_summary(tmp_path, capsys) -> None:
+    # No --rotate: the CLI reads the mode `handstand.athlete` defaults to.
     in_root = tmp_path / "keypoints" / pp.input_dirname()
-    write_clip(in_root, clip(), clip_id="aaa")
-    write_clip(in_root, clip(), clip_id="bbb")
+    assert pp.DEFAULT_ROTATE == "best"
+    write_clip(in_root, clip(), clip_id="aaa", rotate=pp.DEFAULT_ROTATE)
+    write_clip(in_root, clip(), clip_id="bbb", rotate=pp.DEFAULT_ROTATE)
     assert pp.main(["--data", str(tmp_path), "--all"]) == 0
     out = capsys.readouterr().out
     assert "clips=2" in out
@@ -1297,8 +1299,8 @@ def test_the_cli_runs_a_batch_and_prints_the_summary(tmp_path, capsys) -> None:
 
 def test_the_cli_limits_and_skips(tmp_path, capsys) -> None:
     in_root = tmp_path / "keypoints" / pp.input_dirname()
-    write_clip(in_root, clip(), clip_id="aaa")
-    write_clip(in_root, clip(), clip_id="bbb")
+    write_clip(in_root, clip(), clip_id="aaa", rotate=pp.DEFAULT_ROTATE)
+    write_clip(in_root, clip(), clip_id="bbb", rotate=pp.DEFAULT_ROTATE)
     assert pp.main(["--data", str(tmp_path), "--all", "--limit", "1"]) == 0
     assert (tmp_path / "processed" / "mediapipe" / "aaa.parquet").is_file()
     assert not (tmp_path / "processed" / "mediapipe" / "bbb.parquet").exists()
@@ -1317,8 +1319,8 @@ def test_the_cli_reports_a_missing_input_directory(tmp_path, capsys) -> None:
 
 def test_the_cli_carries_on_after_a_bad_clip(tmp_path, capsys) -> None:
     in_root = tmp_path / "keypoints" / pp.input_dirname()
-    write_clip(in_root, clip(), clip_id="aaa")
-    (in_root / "auto" / "broken.parquet").write_bytes(b"not a parquet")
+    write_clip(in_root, clip(), clip_id="aaa", rotate=pp.DEFAULT_ROTATE)
+    (in_root / pp.DEFAULT_ROTATE / "broken.parquet").write_bytes(b"not a parquet")
     assert pp.main(["--data", str(tmp_path), "--all"]) == 1
     out = capsys.readouterr().out
     assert "fail  broken" in out

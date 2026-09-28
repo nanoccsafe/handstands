@@ -522,7 +522,8 @@ def test_generate_clip_refreshes_a_clip_whose_settings_are_wrong(
     (videos / "a.mp4").touch()
     keypoints = tmp_path / "keypoints"
     write_multi_sidecar(
-        keypoints / pm.MULTI_OUTPUT_DIRNAME / "auto" / "clip00000001.parquet", num_poses=1
+        keypoints / pm.MULTI_OUTPUT_DIRNAME / tr.DEFAULT_ROTATE / "clip00000001.parquet",
+        num_poses=1,
     )
     entry = tr.CatalogueEntry(clip_id="clip00000001", filename="a.mp4")
 
@@ -530,7 +531,7 @@ def test_generate_clip_refreshes_a_clip_whose_settings_are_wrong(
     assert seen == [True, True]  # both stages, or the selection would read a stale input
 
     write_multi_sidecar(
-        keypoints / pm.MULTI_OUTPUT_DIRNAME / "auto" / "clip00000001.parquet",
+        keypoints / pm.MULTI_OUTPUT_DIRNAME / tr.DEFAULT_ROTATE / "clip00000001.parquet",
         num_poses=3,
         **dataclasses.asdict(tr.DETECTOR_SETTINGS),
     )
@@ -840,7 +841,7 @@ def report_workspace(tmp_path: pathlib.Path) -> pathlib.Path:
         ],
     )
     write_athlete(
-        tmp_path / "keypoints" / athlete.output_dirname() / "auto",
+        tmp_path / "keypoints" / athlete.output_dirname() / tr.DEFAULT_ROTATE,
         (with_second_person(20, contact=True), 40),
         "clip00000001",
     )
@@ -945,7 +946,9 @@ def test_the_cli_arguments_are_the_documented_ones() -> None:
     assert (args.limit, args.rotate, args.clips) == (3, "180", None)
     assert args.data is None and args.videos is None
     assert pathlib.Path(args.model) == pm.DEFAULT_MODEL_PATH
-    assert tr.DEFAULT_ROTATE == "auto"
+    # The mode the whole multi-person chain defaults to: `best`, the one whose
+    # keypoints read a handstand correctly (chainlink #79).
+    assert tr.DEFAULT_ROTATE == pm.RECOMMENDED_ROTATE == "best"
     assert tr.DETECTOR_SETTINGS == pm.DetectorSettings(
         running_mode="image", min_detection=0.2, min_presence=0.2
     )
@@ -956,7 +959,7 @@ def test_the_cli_reports_an_unreadable_parquet_as_one_error_row(
 ) -> None:
     """A corrupt parquet is one row with an error, not a report that stops."""
     data = report_workspace(tmp_path)
-    keypoints = data / "keypoints" / athlete.output_dirname() / "auto"
+    keypoints = data / "keypoints" / athlete.output_dirname() / tr.DEFAULT_ROTATE
     (keypoints / "clip00000001.parquet").write_bytes(b"not a parquet")
     write_athlete(
         keypoints,

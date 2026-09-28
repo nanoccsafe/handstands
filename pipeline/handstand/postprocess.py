@@ -14,7 +14,7 @@ That is what this module produces::
 CLI::
 
     cd pipeline
-    uv run python -m handstand.postprocess --source mediapipe --rotate auto --all
+    uv run python -m handstand.postprocess --source mediapipe --all   # --rotate best
     uv run python -m handstand.postprocess --clips 6508f9b355bd --overwrite
 
 The input is the athlete selection's parquet (``keypoints/mediapipe_athlete/``
@@ -186,7 +186,7 @@ DEFAULT_ROTATE = athlete.DEFAULT_ROTATE
 
 #: Output root under ``<data_dir>/``: the processed clips, one directory per
 #: source. Unlike ``keypoints/`` it holds no rotation-mode sub-directory, so one
-#: clip has one processed trajectory — the recommended ``auto`` mode, which is
+#: clip has one processed trajectory — the recommended ``best`` mode, which is
 #: what ``--rotate`` defaults to. Re-running a clip in a different mode needs
 #: ``--overwrite``, and the mode is recorded in the sidecar either way.
 PROCESSED_DIRNAME = "processed"

@@ -519,37 +519,148 @@ def test_mean_main_visibility_scores_the_lowest_wrist_person() -> None:
 
 
 @pytest.mark.parametrize(
-    ("upright", "rotated", "previous", "expected"),
+    ("upright", "rotated", "expected"),
     [
-        (0.9, 0.95, False, True),  # the rotated read is surer -> rotate
-        (0.95, 0.9, True, False),  # the upright read is surer -> do not
-        (0.9, 0.9, False, False),  # a tie keeps the previous frame's choice
-        (0.9, 0.9, True, True),
-        (0.9, 0.91, True, True),  # a hundredth of a point is still a decision
-        (0.91, 0.9, True, False),
+        (0.9, 0.95, 0.05),  # the rotated pass is surer
+        (0.95, 0.9, -0.05),  # the upright pass is surer
+        (0.9, 0.9, 0.0),  # a tie: a zero margin, which moves nothing
     ],
 )
-def test_choose_rotation_takes_the_surer_read_and_breaks_ties_with_the_previous_frame(
-    upright: float, rotated: float, previous: bool, expected: bool
+def test_frame_margin_is_the_score_difference(
+    upright: float, rotated: float, expected: float
 ) -> None:
-    assert pm.choose_rotation(upright, rotated, previous) is expected
+    assert pm.frame_margin([upright], [rotated])[0] == pytest.approx(expected)
 
 
-@pytest.mark.parametrize(
-    ("upright", "rotated", "previous", "expected"),
-    [
-        # A pass that found nobody cannot beat a pass that found a body.
-        (float("nan"), 0.4, False, True),
-        (0.4, float("nan"), True, False),
-        # Nothing to score in either orientation: the frame before still decides.
-        (float("nan"), float("nan"), False, False),
-        (float("nan"), float("nan"), True, True),
-    ],
-)
-def test_choose_rotation_with_nothing_to_score(
-    upright: float, rotated: float, previous: bool, expected: bool
-) -> None:
-    assert pm.choose_rotation(upright, rotated, previous) is expected
+def test_frame_margin_marks_every_frame_one_pass_found_nobody_in_as_nan() -> None:
+    """A pass with no body has no score, so the frame has no margin at all."""
+    margin = pm.frame_margin([0.9, float("nan"), 0.9], [0.4, 0.4, float("nan")])
+    assert margin[0] == pytest.approx(-0.5)
+    assert np.isnan(margin[1:]).all()
+    assert np.isnan(pm.frame_margin([float("nan")], [float("nan")]))[0]
+    assert np.isnan(pm.frame_margin([float("inf")], [0.4]))[0]
+    with pytest.raises(ValueError, match="one score per frame"):
+        pm.frame_margin([0.9, 0.9], [0.4])
+
+
+def test_smooth_margin_averages_over_a_centred_window_of_clip_time() -> None:
+    """The window is time-based (VFR aware) and skips the frames with no margin."""
+    times = [0, 100, 200, 300, 400, 500, 600]
+    margin = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    smoothed = pm.smooth_margin(times, margin, window_s=0.5)
+    # +-250 ms, so five frames at 100 ms: the single non-zero margin is a fifth
+    # of every window it is in and nothing at all outside them.
+    assert smoothed.tolist() == pytest.approx([1 / 3, 0.25, 0.2, 0.2, 0.2, 0.0, 0.0])
+
+    # A NaN margin is skipped, not counted as a zero, so a hole in the scores
+    # does not drag the frames around it towards zero.
+    holed = pm.smooth_margin([0, 100, 200], [1.0, float("nan"), 1.0], window_s=0.5)
+    assert holed.tolist() == pytest.approx([1.0, 1.0, 1.0])
+    # A frame whose whole window is unscored keeps no smoothed value at all.
+    empty = pm.smooth_margin(
+        [0, 100, 200, 300, 400], [float("nan"), float("nan"), float("nan"), 1.0, float("nan")], 0.1
+    )
+    assert np.isnan(empty[1]) and np.isnan(empty[2])
+    assert empty[3] == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="one margin per frame"):
+        pm.smooth_margin([0, 100], [0.5])
+    assert pm.smooth_margin([], []).size == 0
+
+
+def test_smooth_margin_window_is_measured_in_time_not_in_frames() -> None:
+    """A variable frame rate must not change the window a frame is read over."""
+    slow = pm.smooth_margin([0, 200, 400], [0.0, 1.0, 0.0], window_s=0.5)
+    fast = pm.smooth_margin([0, 20, 40], [0.0, 1.0, 0.0], window_s=0.5)
+    # +-250 ms reaches the neighbouring 200 ms frame, and not the 20 ms one.
+    assert slow.tolist() == pytest.approx([0.5, 1 / 3, 0.5])
+    assert fast.tolist() == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+
+
+def test_choose_orientations_reads_the_whole_clip_not_one_frame_at_a_time() -> None:
+    """A sustained preference switches; a one-frame confident mistake does not."""
+    times = [100 * index for index in range(40)]  # 100 ms a frame
+    upright = [0.9] * 40
+    # Frames 12-15: the rotated pass is suddenly and confidently surer.
+    rotated = [0.9] * 40
+    for index in (12, 13, 14, 15):
+        rotated[index] = 0.99
+
+    chosen = pm.choose_orientations(times, upright, rotated)
+    assert chosen.dtype == bool
+    # The four confident-wrong frames are 300 ms of evidence, so the switch
+    # happens on the last of them and never comes back.
+    assert chosen.tolist() == [False] * 15 + [True] * 25
+
+    # Two frames (200 ms) of the opposite preference are not enough to switch
+    # back: smoothed over half a second neither of them outweighs its
+    # neighbours, so the orientation the clip switched into stays.
+    flickered = list(rotated)
+    for index in (20, 21):
+        flickered[index] = 0.81
+    assert pm.choose_orientations(times, upright, flickered).tolist() == [False] * 15 + [True] * 25
+
+
+def test_choose_orientations_ignores_a_margin_inside_the_band() -> None:
+    """Inside ``ORIENT_MARGIN`` the two passes are a tie, and a tie moves nothing."""
+    times = [100 * index for index in range(40)]
+    # The clip opens clearly upright, so the question is only whether a
+    # difference too small to act on can move the orientation.
+    for gap in (0.0, 0.01, 0.049):
+        upright = [0.9] * 40
+        rotated = [0.9] * 10 + [0.9 + gap] * 30
+        assert not pm.choose_orientations(times, upright, rotated).any(), gap
+    # A difference past the band, held for the whole of the second half, is a
+    # preference: the switch happens 0.3 s into it.
+    rotating = pm.choose_orientations(times, [0.9] * 40, [0.9] * 10 + [0.99] * 30)
+    assert rotating.tolist() == [False] * 13 + [True] * 27
+    assert pm.ORIENT_MARGIN == 0.05
+
+
+def test_choose_orientations_starts_from_the_first_half_second() -> None:
+    """The clip's opening orientation is the sign of the opening smoothed margin."""
+    times = [100 * index for index in range(40)]
+    # Upright for the first second, then confidently rotated for the rest: the
+    # smoothed margin has to cross the margin and hold it for 0.3 s.
+    upright = [0.9] * 40
+    rotated = [0.9] * 10 + [0.99] * 30
+    chosen = pm.choose_orientations(times, upright, rotated)
+    assert chosen.tolist() == [False] * 13 + [True] * 27
+
+    # The same clip the other way round: rotated first, upright later.
+    flipped = pm.choose_orientations(times, [0.9] * 30 + [0.99] * 10, [0.99] * 30 + [0.9] * 10)
+    assert flipped.tolist() == [True] * 34 + [False] * 6
+
+    # The opening is a plain sign, margin band and all: a clip the model is
+    # barely surer of the rotated read in the first half second, and never
+    # decisively surer of after, is a clip it read rotated. For 89 % of the 180
+    # dataset clips the opening mean margin is inside the band, so this is where
+    # most of them are decided, and the hysteresis is what then holds them there.
+    assert pm.choose_orientations(times, [0.9] * 40, [0.91] * 40).all()
+    assert not pm.choose_orientations(times, [0.91] * 40, [0.9] * 40).any()
+
+    # Nothing to score at all: the clip is read upright, like `auto`'s first frame.
+    assert not pm.choose_orientations(times, [float("nan")] * 40, [float("nan")] * 40).any()
+    assert pm.choose_orientations([], [], []).size == 0
+
+
+def test_choose_orientations_keeps_its_orientation_through_unscored_frames() -> None:
+    """A frame one pass found nobody in has no margin, and moves nothing."""
+    times = [100 * index for index in range(40)]
+    upright = [0.9] * 40
+    rotated = [0.99] * 40
+    for index in (20, 21, 22, 23):
+        upright[index] = float("nan")
+    # The hole is not evidence against the rotated pass, and the evidence
+    # around it is what the orientation comes from: the whole clip, hole
+    # included, is read rotated.
+    assert pm.choose_orientations(times, upright, rotated).all()
+
+    # A clip that opens with nothing scorable starts upright — the same first
+    # frame `auto` takes — and switches once there is a margin to switch on.
+    late = pm.choose_orientations(
+        times, [float("nan")] * 10 + [0.9] * 30, [float("nan")] * 10 + [0.99] * 30
+    )
+    assert late.tolist() == [False] * 11 + [True] * 29
 
 
 def test_multi_person_runs_get_their_own_output_root() -> None:
@@ -1076,34 +1187,40 @@ def test_best_mode_keeps_two_trackers_in_video_mode_and_one_in_image_mode(
     assert image_created[0].closed
 
 
-def test_best_mode_keeps_the_previous_frame_on_a_tie(
+def test_best_mode_switches_on_a_sustained_margin_and_ignores_a_tie_or_a_flicker(
     synthetic_video: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    """Equal scores change nothing, in both directions: the frame before decides.
+    """A body does not turn upside down between two frames, so neither does the mode.
 
-    Frames 0-2 are tied at 0.9, so the first frame (which has no previous
-    decision) is upright and the two after it stay upright. Frame 3's rotated
-    read wins outright and flips the orientation; frames 4+ are tied again and
-    the flipped decision sticks.
+    The clip is 20 frames at 10 fps, i.e. 2 s of clip time. Frames 0-7 are tied,
+    so the clip opens upright (a tie is not a preference). Frames 8-12 are 0.09
+    in favour of the rotated pass, which is enough for the smoothed margin to
+    clear the band from frame 8 on, so the switch happens 0.3 s later, on frame
+    11. Frames 13-19 are tied again, which is not evidence either way and so
+    leaves the orientation where it is; frames 15-16 are two frames of confident
+    *upright* scores, 200 ms of noise that must not flip a clip back.
     """
     # The upright read at 0.9 and the rotated read at 0.9: nothing to choose between.
     tied = ([MISREAD_STANDING], [handstand_pose(0.9, 0.1, visibility=0.9)])
-    script = best_script(*([tied] * 3))
-    script += best_script(([MISREAD_STANDING], [handstand_pose(0.9, 0.1, visibility=0.99)]))
-    script += best_script(*([tied] * (FRAME_COUNT - 4)))
+    preferring_rotated = ([MISREAD_STANDING], [handstand_pose(0.9, 0.1, visibility=0.99)])
+    preferring_upright = ([MISREAD_STANDING], [handstand_pose(0.9, 0.1, visibility=0.81)])
+    script = best_script(*([tied] * 8))
+    script += best_script(*[preferring_rotated] * 5)
+    script += best_script(*([tied] * 2), preferring_upright, preferring_upright)
+    script += best_script(*([tied] * 3))
     factory, created, _ = stub_factory(script)
     report, out_dir = run(synthetic_video, tmp_path, factory, rotate_mode="best")
 
-    assert report.rotated_frames == FRAME_COUNT - 3
+    assert report.rotated_frames == FRAME_COUNT - 11
     table = pd.read_parquet(out_dir / "clip0000000001.parquet")
-    assert table.groupby("frame_idx")["rotated"].first().tolist() == [False] * 3 + [True] * (
-        FRAME_COUNT - 3
-    )
-    # Frame 3's flipped decision is written out with the scores behind it.
-    assert np.allclose(
-        table.groupby("frame_idx")[["score_upright", "score_rotated"]].first().loc[3],
-        [0.9, 0.99],
-    )
+    assert table.groupby("frame_idx")["rotated"].first().tolist() == [False] * 11 + [True] * 9
+    # The frame the switch happened on is written out with the scores behind it.
+    scores = table.groupby("frame_idx")[["score_upright", "score_rotated"]].first()
+    assert np.allclose(scores.loc[11], [0.9, 0.99])
+    # The two confident-but-wrong frames are still written as scored, orientation
+    # unchanged: the scores say what the model said, `rotated` says what the clip
+    # decided.
+    assert np.allclose(scores.loc[15:16], [0.9, 0.81])
 
 
 def test_best_mode_writes_a_frame_nobody_was_found_in_as_nan_scores(
@@ -1747,7 +1864,10 @@ def test_unknown_rotate_mode_is_rejected(
 def test_cli_parser_defaults_and_choices() -> None:
     parser = pm.build_arg_parser()
     args = parser.parse_args([])
-    assert args.rotate == "none"
+    # The rotation mode depends on --num-poses, so the parser leaves it unset and
+    # `default_rotate_mode` fills it in (see the two tests below).
+    assert args.rotate is None
+    assert pm.default_rotate_mode(args.num_poses) == "none"
     assert args.num_poses == pm.DEFAULT_NUM_POSES == 1
     assert args.running_mode == pm.DEFAULT_RUNNING_MODE == "video"
     assert args.min_detection == pm.DEFAULT_MIN_DETECTION_CONFIDENCE
@@ -1793,6 +1913,25 @@ def test_cli_parser_defaults_and_choices() -> None:
             parser.parse_args(["--num-poses", out_of_range])
 
 
+def test_a_multi_person_run_defaults_to_best_and_a_single_person_one_to_none() -> None:
+    """The multi-person setting is what the rest of the pipeline reads (#79).
+
+    ``--num-poses > 1`` falls back to ``best``: an inverted body is what MediaPipe
+    is worst at, and ``best`` is the only mode that reads each frame off itself
+    instead of off its predecessor. A single-person run keeps ``none``, which is
+    what the flag defaulted to before the multi-person keypoints existed, so the
+    historical output stays byte-identical.
+    """
+    assert pm.RECOMMENDED_ROTATE == "best"
+    assert pm.default_rotate_mode() == "none"
+    assert pm.default_rotate_mode(1) == "none"
+    for num_poses in (2, 3, pm.MAX_NUM_POSES):
+        assert pm.default_rotate_mode(num_poses) == "best"
+    for invalid in (0, 6, -1):
+        with pytest.raises(ValueError, match="num_poses"):
+            pm.default_rotate_mode(invalid)
+
+
 def test_cli_routes_each_num_poses_to_its_own_output_root(
     synthetic_video: pathlib.Path,
     tmp_path: pathlib.Path,
@@ -1825,16 +1964,23 @@ def test_cli_routes_each_num_poses_to_its_own_output_root(
     assert single.is_file()
     assert list(pd.read_parquet(single).columns) == list(pm.PARQUET_COLUMNS)
 
+    # A multi-person run without --rotate is the recommended `best` mode.
     assert pm.main(["--num-poses", "2", *common]) == 0
     assert requested == [1, 2]
-    multi = tmp_path / "keypoints" / "mediapipe_multi" / "none" / f"{clip_id}.parquet"
+    multi = tmp_path / "keypoints" / "mediapipe_multi" / "best" / f"{clip_id}.parquet"
     assert multi.is_file()
     table = pd.read_parquet(multi)
-    assert list(table.columns) == list(pm.PARQUET_COLUMNS_MULTI)
+    assert list(table.columns) == list(pm.PARQUET_COLUMNS_BEST_MULTI)
     assert json.loads(multi.with_suffix(".json").read_text())["num_poses"] == 2
 
+    # Every mode is still selectable, and each writes its own root and schema.
+    assert pm.main(["--num-poses", "2", "--rotate", "none", *common]) == 0
+    multi_none = tmp_path / "keypoints" / "mediapipe_multi" / "none" / f"{clip_id}.parquet"
+    assert list(pd.read_parquet(multi_none).columns) == list(pm.PARQUET_COLUMNS_MULTI)
+
     printed = capsys.readouterr().out
-    assert "num_poses=2" in printed
+    assert "rotate=best num_poses=2" in printed
+    assert "rotate=none num_poses=2" in printed
     assert "people[0:3 1:17]" in printed
 
 

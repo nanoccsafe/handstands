@@ -103,8 +103,9 @@ uv run python -m handstand.postprocess --source vision --all
 uv run python -m handstand.postprocess --clips 6508f9b355bd --overwrite
 ```
 
-Reads `keypoints/mediapipe_athlete/auto/` (`--source vision` reads
-`vision_athlete/`) and writes one parquet and one sidecar per clip under
+Reads `keypoints/mediapipe_athlete/best/` (`--source vision` reads
+`vision_athlete/`; `--rotate auto` reads the `auto` keypoints the dataset was
+first measured with) and writes one parquet and one sidecar per clip under
 `$HANDSTAND_DATA/processed/<source>/`. The parquet keeps the input's long schema
 and rows, with `x`/`y` processed and NaN where there is no position, plus
 `x_raw`/`y_raw` (what the model said), `valid` and `filled` — so

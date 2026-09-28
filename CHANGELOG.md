@@ -7,6 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- `--rotate best`, the recommended rotation mode: every frame is run in **both**
+  orientations and the one the model is more sure of is kept, which breaks the
+  `auto` trap of reading an inverted body as a standing person and then never
+  rotating again because the misread says the body is upright (chainlink #79).
+  The choice is temporal, because a body does not turn upside down between two
+  frames: the per-frame margin `score_rotated - score_upright` is averaged over a
+  centred 0.5 s window of clip time (VFR aware, NaN frames skipped) and the
+  orientation only switches once that smoothed margin has held the other sign, by
+  more than 0.05, for 0.3 s. Over the 180 clips that is 95 orientation changes
+  instead of the 16,418 of the per-frame rule, whose changes were mostly one- and
+  two-frame flickers in both directions: 1,028 frames fixed against `auto` and
+  1,127 broken, against 381/255 for the per-frame rule — the difference is
+  `55ce46938d00`, which the model reads more confidently, and more wrongly, the
+  other way round, and which a per-frame rule got accidentally right half the
+  time. Both scores are written out as `score_upright`/`score_rotated` next to the
+  `rotated` flag they decided, so a frame's choice can be re-decided later
+  without re-running the model
 - Phase segmentation: `uv run python -m handstand.phases --all` labels every
   frame of a clip `pre`, `kickup`, `hold`, `exit`, `post` or `unknown` and
   numbers the holds, so scoring reads only the hold frames and hand steps
@@ -75,6 +92,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 ### Changed
+- The multi-person pipeline defaults to `--rotate best` (chainlink #79):
+  `pose_mediapipe` with `--num-poses > 1`, and `handstand.athlete`,
+  `handstand.postprocess` and `handstand.trainer_report` (phases and features
+  read the post-processed trajectory, which has no rotation mode of its own).
+  `none`, `180`, `auto` and `best` all stay selectable, a single-person
+  `pose_mediapipe` run still defaults to `none`, and the modes other than
+  `best` are byte-identical to what they wrote before
 - FeatureExtractor: stacking offsets, joint angles, line and leg-shape features per frame (#22)
 - PhaseSegmenter: pre / kick-up / hold / exit / post per frame, with hold segments (#21)
 - Keypoint post-processing: gating, outlier removal, gap fill, One-Euro smoothing, body length (#20)

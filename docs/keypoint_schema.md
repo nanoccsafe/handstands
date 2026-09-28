@@ -58,9 +58,10 @@ uv run python -m handstand.pose_mediapipe --rotate auto --limit 3
 uv run python -m handstand.pose_mediapipe --rotate best --limit 3
 
 # the recommended multi-person setting, then the athlete selection on top of it
-uv run python -m handstand.pose_mediapipe --rotate best --num-poses 3 \
+# (--rotate best is the default of both, so it does not have to be given)
+uv run python -m handstand.pose_mediapipe --num-poses 3 \
     --running-mode image --min-detection 0.2 --min-presence 0.2
-uv run python -m handstand.athlete --rotate best
+uv run python -m handstand.athlete
 uv run python -m handstand.overlay --clip 6508f9b355bd --source athlete
 
 # auto-vs-best on one clip, two panels side by side
@@ -223,14 +224,15 @@ stage keeps working unchanged.
 
 ```sh
 cd pipeline
-uv run python -m handstand.athlete --rotate best          # the recommended keypoints
-uv run python -m handstand.athlete --rotate best --clips 6508f9b355bd
-uv run python -m handstand.athlete --rotate auto          # the dataset as measured so far
+uv run python -m handstand.athlete                       # --rotate best, the default
+uv run python -m handstand.athlete --clips 6508f9b355bd
+uv run python -m handstand.athlete --rotate auto         # the dataset as first measured
 uv run python -m handstand.athlete --source vision --rotate auto   # Apple Vision
 ```
 
-`--rotate` takes any of the four modes and defaults to `auto`, so a run without
-it works on the `auto` keypoints the dataset numbers were measured from. The
+`--rotate` takes any of the four modes and defaults to `best`, the recommended
+one (chainlink #79), so a run without it works on the `best` keypoints; `auto`
+is what the dataset was first measured with and is still one flag away. The
 selection itself does not know or care which mode it is reading.
 
 `--source {mediapipe,vision}` (default `mediapipe`, whose output is unchanged)
@@ -699,10 +701,12 @@ selection instead:
 | `none` | as displayed | all false |
 | `180` | every frame rotated 180° | all true |
 | `auto` | 180° when the *previous* frame's result was inverted — mean y of both wrists greater (lower in the image) than mean y of both ankles, computed in display coordinates; the first frame is never rotated; a frame with no detection keeps the previous decision | true on rotated frames |
-| `best` | **both** orientations of every frame, and the one the model is more sure of is kept | true where the rotated read won |
+| `best` | **both** orientations of every frame; the orientation is decided over the whole clip ([below](#rotate-best-reads-the-whole-clip-not-one-frame)) and the read it picks is the one kept | true where the clip was read rotated |
 
-**`best` is the recommended mode**, and `auto` is kept because it is what the
-dataset was measured with so far. The reason is a trap `auto` cannot get out of
+**`best` is the recommended mode**, and it is the default of the multi-person
+setting of `pose_mediapipe` and of `handstand.athlete` and every stage after it;
+`auto` is kept, one `--rotate auto` away, because it is what the dataset was
+measured with first. The reason is a trap `auto` cannot get out of
 (chainlink #79). `auto` decides each frame from the **previous** frame's
 skeleton: once MediaPipe has misread an inverted body as a standing person, the
 wrists are *above* the ankles, "not inverted" is concluded, and no frame is ever
@@ -710,7 +714,9 @@ rotated again — however wrong that read was. It is self-reinforcing, and in
 `438c3693d6d7` frame 138 (wrist y 427, ankle y 733) the athlete is written down
 as a person standing on their head for the rest of the clip.
 
-`best` looks at the frame itself instead of at its predecessor:
+### `--rotate best` reads the whole clip, not one frame
+
+Per frame, `best` runs **both** orientations and scores them, as it always did:
 
 1. Run the landmarker on the frame **as displayed** and on the **same frame
    rotated 180°**, and map the rotated result back into display pixels.
@@ -719,13 +725,39 @@ as a person standing on their head for the rest of the clip.
    order, as `handstand.athlete.MAIN_JOINTS`, so a confidently detected nose
    cannot carry a body the model has the rest of wrong). Only the scores the
    model actually reported are averaged; a frame with nobody in it scores NaN.
-3. Keep the higher of the two, writing **both** scores out as `score_upright`
-   and `score_rotated` next to the `rotated` flag they decided, so any frame's
-   choice can be re-examined later without re-running the model.
-4. **Tie** — including both-NaN — keeps the **previous frame's choice**, so a
-   frame the model is equally sure of either way does not flip the orientation
-   and hand the tracker a wobble. A pass that found nobody while the other found
-   a body loses outright; a pass cannot win on a body that is not there.
+3. Write **both** scores out as `score_upright` and `score_rotated` next to the
+   `rotated` flag they decided, so any frame's choice can be re-examined later
+   without re-running the model.
+
+What changed is step 4, the choice itself. A body's orientation does not change
+between two frames, and reading each frame's scores on its own let the model flip
+the reading back and forth: over the 180 clips the per-frame rule made **16,418**
+orientation changes, and most of them were one or two frames long, **in both
+directions**. So the choice is now temporal
+(`pose_mediapipe.choose_orientations`):
+
+1. The per-frame **margin** `score_rotated - score_upright` is NaN wherever a
+   pass found nobody: a pass with no body in it has no score to compare.
+2. The margin is averaged over a centred window of `ORIENT_WINDOW_S` = **0.5 s
+   of clip time** — these clips are variable frame rate, so the window is counted
+   in milliseconds and not in frames — ignoring the NaN frames.
+3. The clip **opens** in the orientation the sign of that smoothed margin gives
+   over its first 0.5 s. A tie, or no evidence at all in that window, opens it
+   upright, which is `auto`'s first frame.
+4. After that the orientation only **switches** once the smoothed margin has held
+   the other sign, by more than `ORIENT_MARGIN` = **0.05**, for
+   `ORIENT_MIN_SWITCH_S` = **0.3 s** — and the switch happens on the frame where
+   that has held long enough. A tie, a margin inside the band, a frame neither
+   pass could score and a one- or two-frame confident-but-wrong read all keep
+   the clip where it is.
+
+That is **95** orientation changes over the 180 clips instead of 16,418, and the
+sustained runs still switch: the stuck trap is not damped away, it is the only
+kind of change left. The opening is a plain **sign**, not a sign past the band,
+because the window is centred and 89 % of the clips' opening mean margin is
+inside the band — for those clips the opening window is the only decision there
+is, and gating it as well would read them all upright, including the ones the
+mode fixes.
 
 With `--num-poses > 1` each of the two scores is taken from **the person whose
 wrists are lowest in the image** of that pass (the largest mean wrist `y`,
@@ -750,54 +782,111 @@ close[["frame_idx", "rotated", "score_upright", "score_rotated"]].drop_duplicate
 
 ### What it cost and what it bought, over the 180 clips
 
-`--rotate best --num-poses 3 --running-mode image --min-detection 0.2
---min-presence 0.2` over all 180 clips took **57.3 min** against `auto`'s
-29.9 min — it runs the model on every frame twice. In return it finds a body in
-**99.4 %** of frames against `auto`'s 98.2 %, and the share of frames the model
-reads as *inverted* (wrists below the ankles in the display frame, i.e. as the
-handstand it is) is over the **athlete selection's** pick:
+`--num-poses 3 --running-mode image --min-detection 0.2 --min-presence 0.2`
+(`--rotate best` is the default of a multi-person run) over all 180 clips costs
+**57.0 min** of model time against `auto`'s 30.0 min — it
+runs the model on every frame twice, and the decision itself (both scores over
+the whole clip) is milliseconds. It finds a body in **98.7 %** of frames against
+`auto`'s 98.2 %; the per-frame version of this mode found one in 99.4 %, and the
+454 frames it gains back are frames on which the orientation the clip is
+committed to found nobody while the other pass found a body — a frame written as
+"no body" rather than as the other orientation's skeleton, which is the price of
+holding one orientation over a clip.
 
-| | `auto` | `best` |
-|---|---|---|
-| frames read as inverted | 59,553 of 63,610 (93.6 %) | 60,187 of 63,969 (94.1 %) |
-| frames the other mode got wrong and this one right | — | 381 |
-| frames this mode got wrong and `auto` right | 255 | — |
+The share of frames the model reads as *inverted* (wrists below the ankles in the
+display frame, i.e. as the handstand it is) is measured over the **athlete
+selection's** pick:
 
-The dataset total barely moves, and that is the honest reading of the rule: mean
-visibility over the 12 main joints is a weak discriminator, so `best` is not a
-wholesale improvement. It is a *local* one, and it is local in the right
-direction — 37 clips improve (333 frames fixed against 141 broken) and 23 get
-worse (46 fixed, 111 broken), 117 are unchanged, and 11 clips move by more than
-10 points:
+| | `auto` | `best`, per frame | `best`, over the clip |
+|---|---|---|---|
+| frames read as inverted | 59,553 of 63,610 (93.6 %) | 60,187 of 63,969 (94.1 %) | 59,963 of 64,586 (92.8 %) |
+| orientation changes over the 180 clips | — | 16,418 | 95 |
+| frames fixed against `auto` | — | 381 | 1,028 |
+| frames broken against `auto` | 255 | 255 | 1,127 |
 
-| clip | `auto` | `best` | frames fixed | frames broken |
+The two `best` columns are the same model on the same frames; only the decision
+differs, and the difference is exactly what the temporal rule trades. Fixing
+1,028 frames against breaking 1,127 is a smaller net win than the per-frame
+rule's 381 against 255, and it is *worse on the dataset total* (92.8 % against
+93.6 % and 94.1 %): a clip that is committed to the wrong orientation loses all
+of its frames instead of half of them, and that is what happens in
+`55ce46938d00`, whose frames the model reads more confidently — and more wrongly
+— the other way round (`best` 95.6 % → 0.0 % inverted, all 384 frames broken).
+It is also what the smoothing is *for*: the changes it makes come in runs of
+0.5 s or more, so 85 % of the runs of changed frames are 3 frames or shorter and
+the long ones are the real ones. The per-frame rule's 1-frame flips are gone
+(16,418 orientation changes against 95), and so is its ability to be accidentally
+right half the time.
+
+Clips: 29 improve, 24 get worse, 127 are unchanged, and 6 move by more than 10
+points:
+
+| clip | `auto` | `best` (over the clip) | frames fixed | frames broken |
 |---|---|---|---|---|
-| `176c8a7360b2` | 28.0 % | 53.8 % | 35 | 22 |
-| `03a650b3ab58` | 49.7 % | 74.2 % | 4 | 3 |
-| `cd1402aa803a` | 50.3 % | 69.1 % | 14 | 9 |
-| `438c3693d6d7` | 79.0 % | 94.2 % | 6 | 0 |
-| `42fe106ae68e` | 18.7 % | 32.4 % | 29 | 12 |
-| `651b0b5783cc` | 81.1 % | 92.4 % | 49 | 0 |
-| `7f9be313012d` | 75.4 % | 86.0 % | 1 | 0 |
-| `5050dcb30e08` | 76.3 % | 86.6 % | 13 | 0 |
-| `55ce46938d00` | 76.0 % | 46.4 % | 1 | 10 |
-| `938484a5fa21` | 75.0 % | 55.0 % | 2 | 9 |
-| `c0f56c720d07` | 22.9 % | 9.5 % | 7 | 16 |
+| `651b0b5783cc` | 81.1 % | 100.0 % | 52 | 0 |
+| `13479d9e86a6` | 48.8 % | 65.0 % | 27 | 14 |
+| `2ebc86f4e017` | 50.6 % | 64.4 % | 90 | 53 |
+| `c0f56c720d07` | 2.9 % | 16.6 % | 34 | 6 |
+| `938484a5fa21` | 84.5 % | 52.1 % | 4 | 50 |
+| `55ce46938d00` | 95.6 % | 0.0 % | 0 | 367 |
 
-The three clips fixed outright — `438c3693d6d7`, `651b0b5783cc` and
-`5050dcb30e08`, the ones the finding was about — are the ones where the frame is
-only readable as a handstand *once it has been turned*; `best` breaks nothing in
-any of them. What it does change on those clips is how much else the model
-finds: `best` detects a body in 87.8 % of `438c3693d6d7`'s frames against
-`auto`'s 74.4 %, and flags trainer contact in 48.1 % against 36.5 % — the rotated
-pass sees the trainer standing next to a handstand, which the upright pass
-mostly cannot. Over the dataset that is 13,940 → 16,020 contact frames and 73 →
-76 clips with a trainer in them, and 2,241 more frames with a person in them at
-all.
+The two clips the finding was about behave as it says they should.
+`438c3693d6d7` goes from 98.7 % to 99.7 % inverted and its frame 138 — the one in
+the issue, where `auto` reads the athlete as a person standing on the mat with
+their hands at chest height (wrist y 427, ankle y 733) — is read as the handstand
+it is (wrist y 749, ankle y 326), and it stays that way: the 26 frames the new
+rule rotates are enough for the trap and the other 821 are read upright and read
+correctly. `651b0b5783cc` goes from 81.1 % to 100 %; its first 52 frames are the
+ones `auto` read as a standing person (wrist 387, ankle 650) and `best` reads as
+a handstand (wrist 663, ankle 384). `5050dcb30e08` does not move at all: 80.7 %
+either way, 0 frames fixed and 0 broken, because the two modes choose the same
+orientation in every frame of it.
+
+What else changes: over the dataset the athlete selection flags 13,940 → 14,973
+trainer-contact frames and 73 → 74 clips with a trainer in them (`--rotate best`
+through `handstand.trainer_report`), and the frames with a person in them at all
+go 66,669 → 67,012.
 
 `score_upright`/`score_rotated` are what make the losses diagnosable: they say
 per frame how sure the model was of each read, so a clip like `55ce46938d00`
-can be re-decided on a different rule without re-running the model.
+can be re-decided on a different rule without re-running the model. The `rotated`
+column of every `best` run can be recomputed from the two score columns and
+`t_ms` alone, which is what makes that checkable: over the 180 clips,
+`choose_orientations` on the file's own scores reproduces the file's `rotated`
+column in every frame.
+
+### What the chain does with it
+
+Re-running the chain on the new keypoints (`handstand.athlete`, `postprocess`,
+`phases`, `features`, `trainer_report`, all with their defaults) against the same
+chain on `auto`:
+
+| | `auto` | `best`, per frame | `best`, over the clip |
+|---|---|---|---|
+| usable clips (a body length was measurable) | 178 | 177 | 177 |
+| usable frames | 67,603 | 67,220 | 67,431 |
+| clips with at least one hold | 166 | 165 | 163 |
+| hold time, seconds | 1,467.0 | 1,457.1 | 1,439.1 |
+| clips with a trainer in them | 73 | 76 | 74 |
+
+`auto` and the per-frame `best` agree with the numbers already in the changelog
+for #20 and #21 (178 usable, 166 with a hold, 1,467 s), which is the check that
+the two are measured the same way. The temporal rule gives up three clips' worth
+of hold and 28 s of hold time, on the strength of two clips' skeletons being read
+the wrong way round for most of their length; the per-frame rule gave up one.
+None of these four numbers says the keypoints are better, and none of them is
+what the mode is for: they are what the mode costs.
+
+Watching it settles the argument either way — `uv run python -m handstand.overlay
+--clip 438c3693d6d7 --source athlete --modes auto best` writes the two panels
+side by side (`<data_dir>/overlays/438c3693d6d7_athlete_auto-vs-best.mp4`),
+one rotation mode per panel, with the trainer-contact frames bordered in red. In
+`438c3693d6d7` frame 138 the `auto` panel draws a person standing on the mat with
+their hands at chest height, over an athlete whose head is on the mat; in the
+`best` panel the skeleton runs the length of the body, hands on the mat, feet at
+the ceiling. In `651b0b5783cc` the same thing happens over the first 52 frames
+and the two panels are identical after that. In `5050dcb30e08` the two panels are
+identical throughout, because the modes agree on every frame of it.
 
 ## Apple Vision
 
