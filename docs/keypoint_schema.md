@@ -393,6 +393,111 @@ cd pipeline
 uv run python -m handstand.trainer_report | head -40
 ```
 
+## Processed keypoints
+
+`handstand.postprocess` turns the per-frame guesses of the athlete selection into
+the trajectory every later stage measures: clean, smooth and in the athlete's own
+units. It reads the schema above (`keypoints/mediapipe_athlete/`, or
+`--source vision` for `vision_athlete/`) and writes the **same long schema with
+the same rows**, so `handstand.overlay` draws it unchanged, plus four columns:
+
+```
+<data_dir>/processed/<source>/<clip_id>.parquet   # input schema + 4 columns
+<data_dir>/processed/<source>/<clip_id>.json      # what was done to the clip
+```
+
+```sh
+cd pipeline
+uv run python -m handstand.postprocess --all                          # mediapipe, auto
+uv run python -m handstand.postprocess --source vision --all
+uv run python -m handstand.postprocess --clips 6508f9b355bd --overwrite
+```
+
+Note that unlike `keypoints/` there is no rotation-mode directory: one clip has
+one processed trajectory, the recommended `auto` mode, and re-running a clip in
+another mode needs `--overwrite`.
+
+| column | type | meaning |
+|---|---|---|
+| `x`, `y` | float64 | the **processed** position in display pixels, NaN wherever there is none |
+| `x_raw`, `y_raw` | float64 | what the model said, before any of this: the input's own `x`/`y`, NaN where the input had none |
+| `valid` | bool | does this sample have a position at all — false exactly where `x`/`y` are NaN, so one filter drops every unusable sample |
+| `filled` | bool | was this position interpolated across a short gap rather than measured. A filled sample is valid, but it is a bridge, not an observation |
+
+Every other column (`z`, `visibility`, `presence`, `rotated`, `detected`,
+`athlete_score`, `n_people`, `trainer_contact`, `contact_reason`) is passed
+through untouched.
+
+### What is done, in order
+
+1. **Gating.** Every joint of a frame is invalid when the frame is
+   `detected = false` or `trainer_contact = true`, and so is any joint whose
+   `visibility` is below `0.5` — or is NaN, which is what the renderer refuses to
+   draw as well. A contact frame's keypoints are two bodies' keypoints stitched
+   together; carrying them into a trajectory is how a centre of mass ends up on
+   the wrong person.
+2. **Body length `L`.** Torso (shoulder midpoint to hip midpoint) + thigh + shin,
+   each the **90th percentile** of that span over the clip's valid frames, in
+   display pixels. The percentile makes it a scale rather than a pose: a split, a
+   stag or a leg out of the picture plane can only make a projected span *shorter*,
+   so the frames where the limb lies in the picture plane set the yardstick (the
+   same idea as the bone-length percentile of the athlete selection). The thigh
+   and the shin are measured on each leg and the **longer** leg of a frame wins.
+   A clip with fewer than 10 valid frames for a part has no `L`, and is written
+   with every joint invalid and `usable: false` in its sidecar.
+3. **Outliers.** A joint that covers more than `8` body lengths in a second
+   between two consecutive valid samples is invalid in the later of the two: the
+   model lost it, it did not travel that fast. The earlier sample stays the
+   reference, so a single spike is dropped and the next sample is judged against
+   the last good one rather than against the spike.
+4. **Gap fill.** A run of invalid samples is interpolated linearly **in time**
+   between the valid samples on either side of it when those two are at most
+   `0.2 s` apart, and left NaN when they are further apart. Filled samples are
+   marked as such, so a later stage can refuse the bridges.
+5. **Smoothing.** A One-Euro filter per joint coordinate (`min_cutoff = 1.0`,
+   `beta = 0.3`, `d_cutoff = 1.0`), with the real `dt` from `t_ms` because these
+   clips are variable frame rate. The filter runs on positions **divided by
+   `L`**, so a cutoff means the same thing for a small athlete and a large one,
+   and it is restarted after every invalid run so it never smooths across a gap
+   it knows nothing about.
+
+### The body frame
+
+`handstand.bodyframe` is where a later stage turns a processed position into the
+athlete's own coordinates: the origin is the **wrist midpoint**, `u` runs to the
+right, `v` runs **up** (display `y` with the sign flipped, because the athlete is
+upside down), and both are divided by `L`.
+
+```python
+from handstand.bodyframe import body_frame_points, to_body_frame
+
+u, v = to_body_frame(x, y, wrist_mid_x, wrist_mid_y, L)         # one point
+uv = body_frame_points(points, (wrist_mid_x, wrist_mid_y), L)  # (..., 2) points
+```
+
+`handstand.prelabel` already measures model disagreement in the same unit (body
+lengths), so the three agree.
+
+### The processed sidecar
+
+| key | meaning |
+|---|---|
+| `clip_id`, `source`, `rotate` | as the athlete selection's sidecar |
+| `source_parquet` | the athlete parquet it read, e.g. `keypoints/mediapipe_athlete/auto/1a2b3c4d5e6f.parquet` |
+| `frame_count`, `joint_count` | frames in the clip and joints in its schema (33 for both models) |
+| `usable`, `unusable_reason` | whether the clip has a body length, and why not when it has none |
+| `body_length_px` | `L` in display pixels, or `null` |
+| `body_length_parts_px` | the torso / thigh / shin percentiles it is the sum of |
+| `body_length_frames` | how many valid frames each part was measured on |
+| `valid_sample_count`, `measured_sample_count`, `filled_sample_count`, `unfilled_sample_count` | the four kinds the rows fall into: a position from the model, a bridge, a position, and none. `valid == measured + filled`, and the four add up to `total_sample_count` |
+| `gated_out_sample_count`, `outlier_sample_count` | the samples lost to the gate and to the speed rule; the two add up to `unfilled_sample_count`, because a sample a rule removed that the gap fill then bridged is a bridge, not a loss |
+| `total_sample_count`, `pct_valid_samples` | rows in the parquet, and the share of them with a position |
+| `tracked_valid_sample_count`, `tracked_total_sample_count`, `pct_valid_tracked_samples` | the same over the 15 joints of the shared schema only (a face or a finger is not evidence about a hold) |
+| `hold_like_frame_count`, `pct_valid_tracked_samples_hold_like` | frames where the wrists are below the ankles (the `auto` rotation rule, on the gated coordinates), and the valid share of their tracked samples |
+| `jitter_l_raw`, `jitter_l_processed`, `pct_jitter_reduction` | median frame-to-frame displacement of the two wrists and two ankles in body lengths, before and after, and the fraction removed |
+| `parameters` | the thresholds the run used, so a later run can be compared against this one |
+| `runtime_seconds` | wall-clock seconds for the clip |
+
 ## Joint names
 
 The 33 MediaPipe pose landmarks, snake_case, in model order (this is the
