@@ -7,6 +7,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Orientation-aware athlete matching in the pre-labeler, and the re-run of the
+  19 frames it left without a pre-label (chainlink #78). Keypoints identify a
+  body only when both models read it the same way up: when the MediaPipe
+  reference and an RTMPose candidate disagree on inversion (mean wrist y against
+  mean ankle y), the distance between them measures the disagreement about
+  *orientation*, not about which body is which, so `select_person` no longer
+  refuses on it — it takes the **inverted** candidate whose box overlaps the
+  reference's best (`handstand.athlete.box_iou`), above
+  `MIN_ORIENTATION_FALLBACK_IOU` (0.1). The direction is the rule: a candidate
+  that stands while the reference is inverted is still refused, because that is
+  usually the trainer. The rotated pass is mapped back into display pixels
+  *before* it is matched, so the rule is read in the frame the labeler sees —
+  in the model's own coordinates it would flip with the pass and pick the
+  trainer on exactly the frames it exists to fix (the keypoint comparison is
+  unchanged by that: a 180° map-back preserves every distance and every box).
+  Which rule decided a frame is the review queue's new `match_rule` column —
+  `keypoint_gap` | `orientation_fallback` | `none`, and empty on the rows a
+  partial run never touched — so the one step that can pick the wrong person
+  now says why it did what it did
+- `uv run python -m handstand.prelabel --only <images> --merge-review`: re-run
+  part of the manifest and fold those rows back into the existing review queue
+  instead of replacing the queue with them (an unknown image name is an error,
+  because a subset run that silently drops a frame writes a file that looks
+  complete), plus `--contact-sheet-out`/`--contact-sheet-empty` for a sheet of
+  named frames — the empty ones are drawn captioned rather than skipped, since
+  on such a sheet the absence is the subject — and `--contact-sheet N` now
+  draws N tiles in the most square grid that holds them instead of always
+  drawing 6. Used for #78: `data/label_studio_prelabels_fix78.json` (19 tasks,
+  image URIs already in the `/data/local-files/?d=label_frames/<name>` form),
+  the updated `data/labels/review_queue.csv` and
+  `data/overlays/prelabels_fix78_contact_sheet.jpg`
 - `--rotate best`, the recommended rotation mode: every frame is run in **both**
   orientations and the one the model is more sure of is kept, which breaks the
   `auto` trap of reading an inverted body as a standing person and then never
@@ -105,6 +136,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   annotations (#8)
 
 ### Fixed
+- 11 of the 19 labelling frames that got no pre-label now get one (chainlink
+  #78): 6 because #79 made the MediaPipe reference read the handstand the right
+  way up and the keypoints agree again (`438c3693d6d7_138`, `64184de33f84_1`,
+  `651b0b5783cc` frames 3/18/34/49), 2 through the orientation fallback (both
+  `5050dcb30e08` frames, whose reference is still upright — the `auto` trap #79
+  could not break for that clip), and 3 because `mediapipe_athlete/best` detects
+  no athlete in that frame at all, so there is nothing to contradict the most
+  confident body (`13479d9e86a6_13`, `5a9611088218_19`, `a79591b7be18_64` —
+  the last of those was called a correct refusal in the #78 diagnosis, so its
+  pre-label is worth checking before it is imported). The 8 frames that stay
+  empty are all bodies a reference reading the *same* way up puts 0.4 to 1.5
+  body lengths away, or a body upright against an inverted reference: no
+  orientation excuse to fall back on
 
 ### Changed
 - MediaPipe auto-rotation gets stuck reading inverted bodies upside down (#79)
