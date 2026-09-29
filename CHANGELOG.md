@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- HandstandCore Swift package skeleton + swift test on the Mac mini (#38)
 - Center of mass (CoM) proxy, balance direction and hold stability features (#23)
 - Investigate the 19 frames where the pre-label model found no athlete (#78)
 - MediaPipe auto-rotation gets stuck reading inverted bodies upside down (#79)
