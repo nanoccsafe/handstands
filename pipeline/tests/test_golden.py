@@ -437,6 +437,26 @@ def test_main_accepts_the_default_real_out_when_data_sits_inside_the_repo(
     assert not target.exists()
 
 
+def test_a_pre_existing_real_fixture_is_left_untouched(tmp_path, monkeypatch) -> None:
+    """An ignored ``data/golden_real`` that already holds files: run adds nothing.
+
+    The main checkout's data directory legitimately contains fixtures from an
+    earlier ``--real`` run, so a missing clip must leave those files exactly as
+    they were — and must not fail because the folder happens to be there.
+    """
+    root = checkout_like_the_main_one(tmp_path)
+    target = root / "data" / golden.REAL_SUBDIR
+    target.mkdir(parents=True)
+    existing = target / "existing.json"
+    existing.write_text('{"mode": "synthetic"}\n')
+    monkeypatch.setattr(golden, "repo_root", lambda: root)
+
+    assert golden.main(["--real", "not_a_clip", "--data", str(root / "data")]) == 1
+
+    assert existing.read_text() == '{"mode": "synthetic"}\n'
+    assert sorted(entry.name for entry in target.iterdir()) == ["existing.json"]
+
+
 def test_a_tracked_path_inside_the_repo_is_refused(tmp_path) -> None:
     """git would commit it, so it is refused — even force-added under ``data/``.
 
@@ -503,20 +523,33 @@ def test_require_outside_repo_in_this_checkout(tmp_path) -> None:
     assert golden.require_outside_repo(outside) == outside.resolve()
 
 
-def test_real_mode_refuses_an_output_path_inside_the_repo(tmp_path) -> None:
-    """Under ``swift/`` even: exit 2 from the guard, nothing written."""
+def test_real_mode_refuses_an_output_path_inside_the_repo() -> None:
+    """Under ``swift/`` even: exit 2 from the guard, nothing written.
+
+    The assertions are about *this run* — the clip the guard rejected must not
+    leave a fixture behind — not about whether the destination folder already
+    exists, which no test may assume of a path it did not create.
+    """
     target = golden.repo_root() / "swift" / golden.REAL_SUBDIR
-    assert not target.exists()
+    marker = target / "not_a_clip.json"
+    assert not marker.exists()
     assert golden.main(["--real", "not_a_clip", "--real-out", str(target)]) == 2
-    assert not target.exists()
+    assert not marker.exists()
 
 
 def test_real_mode_accepts_the_default_data_dir_that_git_ignores() -> None:
-    """The default ``--real-out`` of this checkout: in the repo, ignored, allowed."""
+    """The default ``--real-out`` of this checkout: in the repo, ignored, allowed.
+
+    The live data directory may already hold fixtures from an earlier ``--real``
+    run — in the main checkout it does — so nothing here asserts whether the
+    folder exists, only that this missing clip writes no file of its own.
+    """
     data = golden.repo_root() / "data"
-    target = data / golden.REAL_SUBDIR
+    marker = data / golden.REAL_SUBDIR / "not_a_clip.json"
+    existed_before = marker.exists()
     assert golden.main(["--real", "not_a_clip", "--data", str(data)]) == 1
-    assert not target.exists()
+    assert not existed_before, "this clip never ran; its fixture must not be there"
+    assert not marker.exists(), "and the run must not have written it"
 
 
 def test_real_mode_reports_a_missing_clip_rather_than_writing(tmp_path) -> None:
