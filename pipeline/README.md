@@ -182,10 +182,13 @@ uv run python -m handstand.golden --real 6508f9b355bd   # local-only, never unde
 
 The repo is public, so what is committed is always synthetic
 (`meta.mode == "synthetic"`, generated from a seed) and `--real` refuses any
-output path inside the checkout: real-clip fixtures only ever land in
-`<data_dir>/golden_real/`, which is git-ignored. `tests/test_golden.py` reads
-the committed files back, re-runs the pipeline from their `input` and checks the
-answers still match `expected` to the tolerances stored in `meta`.
+output path git would commit, plus `swift/`, `ios/`, `pipeline/` and `docs/`
+outright, so real-clip fixtures only ever land in `<data_dir>/golden_real/`,
+which is git-ignored. The data tree may sit *inside* the checkout, as it does in
+the main one, and git ignoring it is exactly what allows that.
+`tests/test_golden.py` reads the committed files back, re-runs the pipeline from
+their `input` and checks the answers still match `expected` to the tolerances
+stored in `meta`.
 
 ## Paths
 

@@ -13,9 +13,12 @@ The repo is public (``CLAUDE.md``), so nothing derived from the real handstand
 videos may ever be committed: every fixture written under ``swift/`` is
 synthetic, generated from a seed, and carries ``meta.mode == "synthetic"``. The
 same JSON *format* can be produced for a real clip with ``--real``, but only
-into the git-ignored data directory — :func:`require_outside_repo` refuses any
-output path inside the repository, which is what keeps real keypoints out of a
-public tree by construction rather than by care.
+into a destination git ignores — :func:`require_outside_repo` refuses any path
+git would commit, and refuses ``swift/``, ``ios/``, ``pipeline/`` and ``docs/``
+outright, which is what keeps real keypoints out of a public tree by
+construction rather than by care. "Outside the repository" is deliberately
+*not* the rule: the shared data directory may sit inside the checkout (it does
+in the main one, git-ignored), and that default has to keep working there.
 
 CLI::
 
@@ -60,6 +63,7 @@ import importlib.metadata
 import json
 import math
 import pathlib
+import subprocess
 import sys
 import zlib
 from collections.abc import Mapping, Sequence
@@ -81,6 +85,7 @@ __all__ = [
     "GENERATOR_VERSION",
     "JOINTS",
     "MAX_FIXTURE_BYTES",
+    "NEVER_REAL_TREES",
     "REAL_SUBDIR",
     "TOLERANCES",
     "CaseSpec",
@@ -179,8 +184,9 @@ DISPLAY_WIDTH = 576
 DISPLAY_HEIGHT = 1024
 
 #: Where ``--real`` writes when ``--real-out`` is not given, relative to
-#: ``handstand.paths.data_dir()``. Git-ignored like the rest of the data tree,
-#: and refused if it resolves inside the repository.
+#: ``handstand.paths.data_dir()``. Git-ignored like the rest of the data tree —
+#: which is what allows it, wherever that tree happens to live (see
+#: :func:`require_outside_repo`).
 REAL_SUBDIR = "golden_real"
 
 #: How many frames of a real clip a ``--real`` fixture carries.
@@ -199,6 +205,13 @@ FIXTURE_SOURCE = "golden"
 #: Where the committed synthetic fixtures go, relative to the repository root —
 #: the default of ``--out``. ``default_out_dir`` is the absolute version of it.
 DEFAULT_OUT = pathlib.Path("swift/HandstandCore/Tests/HandstandCoreTests/Fixtures/golden")
+
+#: Source trees a ``--real`` output may never land under, whatever ``.gitignore``
+#: says about them: real keypoints belong in the data tree, not in code, and no
+#: ignore rule is allowed to argue otherwise. ``data/`` is absent on purpose —
+#: it may sit inside the checkout, which is exactly why the rule is "wherever
+#: git would commit" rather than "outside the repository".
+NEVER_REAL_TREES: tuple[str, ...] = ("swift", "ios", "pipeline", "docs")
 
 
 # --------------------------------------------------------------------------- #
@@ -232,27 +245,92 @@ def default_out_dir() -> pathlib.Path:
     return repo_root() / DEFAULT_OUT
 
 
-def require_outside_repo(path: str | pathlib.Path) -> pathlib.Path:
-    """Refuse a ``--real`` output path inside the repository; return it resolved.
+def require_outside_repo(
+    path: str | pathlib.Path, *, root: pathlib.Path | None = None
+) -> pathlib.Path:
+    """Refuse a ``--real`` output path git would commit; return it resolved.
 
     The repository is public: a fixture of a real clip holds keypoints of the
-    real videos, and those never go in git. ``--real`` therefore accepts only a
-    destination outside the checkout — the shared, git-ignored data directory by
-    default — and this is the function that enforces it, called before anything
-    is written. :class:`ValueError` names the offending path and the fix.
+    real videos, and those never go in git. The rule enforced here is therefore
+    **never write real data where git would commit it** — not "never inside the
+    repository", because the shared data directory can legitimately sit *in*
+    the checkout (it does in the main one) as long as ``.gitignore`` keeps it
+    out of commits:
+
+    * a path outside the repository is accepted as it stands;
+    * a path inside it is accepted only when git ignores it —
+      ``git check-ignore -q <path>`` run with the repository root as its
+      working directory, on the *path string*, so a destination that does not
+      exist yet (the usual case) is judged by the patterns covering it rather
+      than by what happens to be on disk. The check consults the index like
+      git does, so a tracked path counts as committable and is refused, and so
+      does one no ignore rule covers;
+    * anything under ``swift/``, ``ios/``, ``pipeline/`` or ``docs/`` is
+      refused whatever git answers, so an ignore rule can never be talked into
+      carrying real keypoints into the source tree.
+
+    ``root`` is the repository to judge against and defaults to
+    :func:`repo_root`; tests pass a temporary repository to model a checkout
+    whose data tree lives inside it. When git cannot answer at all the path is
+    treated as committable and refused: the safe side of a public repository.
+
+    :class:`ValueError` names the offending path and the fix, and is raised
+    before anything is written.
     """
     resolved = pathlib.Path(path).expanduser().resolve()
-    try:
-        root = repo_root()
-    except RuntimeError as error:
-        raise ValueError(f"refusing to write real fixtures: {error}") from error
-    if resolved == root or resolved.is_relative_to(root):
+    if root is None:
+        try:
+            root = repo_root()
+        except RuntimeError as error:
+            raise ValueError(f"refusing to write real fixtures: {error}") from error
+    else:
+        root = pathlib.Path(root).expanduser().resolve()
+    if not (resolved == root or resolved.is_relative_to(root)):
+        return resolved
+    hint = f"choose a --real-out git ignores (the default is <data_dir>/{REAL_SUBDIR})"
+    for tree in NEVER_REAL_TREES:
+        if resolved.is_relative_to(root / tree):
+            raise ValueError(
+                f"refusing to write real keypoint data under {tree}/: {resolved}\n"
+                f"the repo is public; source trees hold no real data, ever — {hint}"
+            )
+    if resolved == root:
         raise ValueError(
-            f"refusing to write real keypoint data inside the repository: {resolved}\n"
-            f"the repo is public; choose a --real-out outside {root} "
-            f"(the default is <data_dir>/{REAL_SUBDIR})"
+            f"refusing to write real keypoint data over the repository root: {resolved}\n"
+            f"the repo is public; {hint}"
+        )
+    if not _git_ignores(resolved, root):
+        raise ValueError(
+            f"refusing to write real keypoint data where git would commit it: {resolved}\n"
+            f"the repo is public; {root} does not ignore this path — {hint}, "
+            f"or one outside {root}"
         )
     return resolved
+
+
+def _git_ignores(path: pathlib.Path, root: pathlib.Path) -> bool:
+    """Would git keep ``path`` out of commits?
+
+    Runs ``git check-ignore -q`` with ``root`` as the working directory and the
+    path *string* as its argument, so a destination that does not exist yet —
+    the normal case for ``--real-out`` — is decided by the ``.gitignore``
+    patterns that cover it. Only the exit status matters: ``0`` means ignored,
+    anything else means "git would commit it" — a path no pattern covers, a
+    path the index already tracks (``check-ignore`` consults the index, so a
+    force-added file under ``data/`` is correctly refused), a tree that is not
+    a repository, or git being unavailable. All of those refuse, which is the
+    conservative answer for a public repository.
+    """
+    try:
+        outcome = subprocess.run(
+            ["git", "check-ignore", "-q", str(path)],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return outcome.returncode == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1119,13 +1197,15 @@ def real_fixture(
     source: str = postprocess.DEFAULT_SOURCE,
     frames: int = REAL_MAX_FRAMES,
 ) -> dict[str, object]:
-    """The same JSON for a **real** clip — never for a repository path.
+    """The same JSON for a **real** clip — never for a path git would commit.
 
-    Reads the athlete selection's parquet of ``clip_id`` (read-only, from the
-    shared data directory), keeps its first ``frames`` frames and the fifteen
-    tracked joints, and runs the identical chain over it. The document is marked
-    ``mode: "real"``, which is how a test can tell the two apart without reading
-    a single coordinate — the guard that keeps real keypoints out of ``swift/``.
+    The guard is :func:`require_outside_repo`, applied by :func:`main` before
+    anything is written. Reads the athlete selection's parquet of ``clip_id``
+    (read-only, from the shared data directory), keeps its first ``frames``
+    frames and the fifteen tracked joints, and runs the identical chain over it.
+    The document is marked ``mode: "real"``, which is how a test can tell the
+    two apart without reading a single coordinate — the guard that keeps real
+    keypoints out of ``swift/``.
     """
     root = pathlib.Path(data) if data is not None else data_dir()
     path = root / "keypoints" / postprocess.input_dirname(source) / rotate / f"{clip_id}.parquet"
@@ -1383,7 +1463,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "local-only: write a fixture for these real clips instead of the "
             "synthetic cases, into --real-out (default: <data_dir>/golden_real); "
-            "refused anywhere inside the repository, which is public"
+            "refused wherever git would commit it — never under swift/, ios/, "
+            "pipeline/ or docs/ either — because the repo is public"
         ),
     )
     parser.add_argument(

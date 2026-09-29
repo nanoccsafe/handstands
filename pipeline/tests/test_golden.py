@@ -10,8 +10,10 @@ The three properties chainlink #25 asks for each get their own test: the
 generator is deterministic (``test_the_generator_is_deterministic``), every
 case round-trips (``test_every_case_round_trips``), and ``hand_step`` really
 yields two holds while ``trainer_contact`` frames really are invalid. The fourth
-guard, ``--real`` refusing a repository path, is what keeps keypoints of the
-real videos out of a public tree.
+guard, ``--real`` refusing every path git would commit (and every source tree
+outright), is what keeps keypoints of the real videos out of a public tree — it
+is tested against a temporary repository laid out like the main checkout, whose
+``data/`` sits *inside* the repo and is git-ignored.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 import json
 import pathlib
 import statistics
+import subprocess
 from collections.abc import Mapping
 
 import numpy as np
@@ -389,35 +392,130 @@ def test_trainer_contact_frames_are_invalid() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The real-clip mode must stay out of the repository
+# The real-clip mode must never write where git would commit
 # --------------------------------------------------------------------------- #
 
 
-def test_require_outside_repo_rejects_the_checkout() -> None:
+def checkout_like_the_main_one(tmp_path, ignore: tuple[str, ...] = ("data/",)) -> pathlib.Path:
+    """A miniature checkout laid out like the main one: ``data/`` *inside* it.
+
+    The main checkout keeps the shared data tree within the repository —
+    git-ignored, as its ``.gitignore`` says — so a rule of the shape "real
+    fixtures stay outside the repository" breaks ``--real`` there. ``git init``
+    plus a ``.gitignore`` models that layout faithfully, because
+    ``require_outside_repo`` asks git, not the file tree, what may be written.
+    """
+    root = tmp_path / "checkout"
+    (root / "data").mkdir(parents=True)
+    for tree in golden.NEVER_REAL_TREES:
+        (root / tree).mkdir(exist_ok=True)
+    (root / "pipeline" / "pyproject.toml").write_text("[project]\nname = 'handstand'\n")
+    (root / ".gitignore").write_text("".join(f"{pattern}\n" for pattern in ignore))
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    return root
+
+
+def test_the_default_real_out_is_accepted_inside_an_ignored_data_tree(tmp_path) -> None:
+    """The main-checkout case: ``data/`` is in the repo, git ignores it → allowed."""
+    root = checkout_like_the_main_one(tmp_path)
+    target = root / "data" / golden.REAL_SUBDIR
+    assert golden.require_outside_repo(target, root=root) == target.resolve()
+
+
+def test_main_accepts_the_default_real_out_when_data_sits_inside_the_repo(
+    tmp_path, monkeypatch
+) -> None:
+    """The CLI under that layout: the guard passes, only the clip itself fails.
+
+    Exit code 1 is "the clip is missing"; 2 is the guard refusing, which is
+    what this did before the rule became "where git would commit it".
+    """
+    root = checkout_like_the_main_one(tmp_path)
+    monkeypatch.setattr(golden, "repo_root", lambda: root)
+    target = root / "data" / golden.REAL_SUBDIR
+    assert golden.main(["--real", "000000000000", "--data", str(root / "data")]) == 1
+    assert not target.exists()
+
+
+def test_a_tracked_path_inside_the_repo_is_refused(tmp_path) -> None:
+    """git would commit it, so it is refused — even force-added under ``data/``.
+
+    ``git check-ignore`` consults the index like git does, which is what makes
+    a file someone staged despite the ignore rule (or committed long ago) as
+    dangerous as any other tracked file.
+    """
+    root = checkout_like_the_main_one(tmp_path)
+    forced = root / "data" / "forced.json"
+    forced.write_text("{}\n")
+    subprocess.run(["git", "add", "-f", "data/forced.json"], cwd=root, check=True)
+    with pytest.raises(ValueError, match="public"):
+        golden.require_outside_repo(forced, root=root)
+
+    plain = root / "README.md"
+    plain.write_text("# checkout\n")
+    subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
+    with pytest.raises(ValueError, match="public"):
+        golden.require_outside_repo(plain, root=root)
+
+
+def test_an_unignored_path_inside_the_repo_is_refused(tmp_path) -> None:
+    """Nothing covers it, so git would commit it: refused — the root included."""
+    root = checkout_like_the_main_one(tmp_path)
+    with pytest.raises(ValueError, match="public"):
+        golden.require_outside_repo(root / golden.REAL_SUBDIR, root=root)
+    with pytest.raises(ValueError, match="public"):
+        golden.require_outside_repo(root, root=root)
+
+
+@pytest.mark.parametrize("tree", golden.NEVER_REAL_TREES)
+def test_a_source_tree_is_refused_even_when_git_ignores_it(tmp_path, tree: str) -> None:
+    """swift/, ios/, pipeline/ and docs/ hold no real data, ignore rules or not."""
+    root = checkout_like_the_main_one(
+        tmp_path, ignore=("data/", *(f"{name}/" for name in golden.NEVER_REAL_TREES))
+    )
+    target = root / tree / golden.REAL_SUBDIR
+    covered = subprocess.run(["git", "check-ignore", "-q", str(target)], cwd=root)
+    assert covered.returncode == 0, "the fixture: the ignore rule must cover it"
+    with pytest.raises(ValueError, match="public"):
+        golden.require_outside_repo(target, root=root)
+
+
+def test_a_path_outside_the_repository_is_accepted(tmp_path) -> None:
+    root = checkout_like_the_main_one(tmp_path)
+    outside = tmp_path / "elsewhere" / golden.REAL_SUBDIR
+    assert golden.require_outside_repo(outside, root=root) == outside.resolve()
+
+
+def test_require_outside_repo_in_this_checkout(tmp_path) -> None:
+    """The live layout: source trees out, this checkout's own ``data/`` in."""
     root = golden.repo_root()
     with pytest.raises(ValueError, match="public"):
         golden.require_outside_repo(root)
     with pytest.raises(ValueError, match="public"):
         golden.require_outside_repo(root / "swift" / "HandstandCore" / "Tests")
     with pytest.raises(ValueError, match="public"):
-        golden.require_outside_repo(root / "data" / golden.REAL_SUBDIR)
+        golden.require_outside_repo(root / "docs" / "keypoint_schema.md")
+    # ``data/`` is inside the checkout but git ignores it, so the default stands.
+    target = root / "data" / golden.REAL_SUBDIR
+    assert golden.require_outside_repo(target) == target.resolve()
     # A path outside the checkout is accepted, resolved.
-    outside = golden.require_outside_repo(pathlib.Path("/tmp") / golden.REAL_SUBDIR)
-    assert outside == pathlib.Path("/tmp") / golden.REAL_SUBDIR
+    outside = tmp_path / golden.REAL_SUBDIR
+    assert golden.require_outside_repo(outside) == outside.resolve()
 
 
 def test_real_mode_refuses_an_output_path_inside_the_repo(tmp_path) -> None:
+    """Under ``swift/`` even: exit 2 from the guard, nothing written."""
     target = golden.repo_root() / "swift" / golden.REAL_SUBDIR
     assert not target.exists()
     assert golden.main(["--real", "not_a_clip", "--real-out", str(target)]) == 2
     assert not target.exists()
 
 
-def test_real_mode_refuses_a_data_dir_inside_the_repo() -> None:
-    """Even the default ``--real-out`` is refused when it lands in the checkout."""
+def test_real_mode_accepts_the_default_data_dir_that_git_ignores() -> None:
+    """The default ``--real-out`` of this checkout: in the repo, ignored, allowed."""
     data = golden.repo_root() / "data"
     target = data / golden.REAL_SUBDIR
-    assert golden.main(["--real", "not_a_clip", "--data", str(data)]) == 2
+    assert golden.main(["--real", "not_a_clip", "--data", str(data)]) == 1
     assert not target.exists()
 
 

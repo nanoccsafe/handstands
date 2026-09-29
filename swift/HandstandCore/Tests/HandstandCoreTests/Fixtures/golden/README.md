@@ -35,11 +35,12 @@ cd pipeline
 uv run python -m handstand.golden --real 6508f9b355bd
 ```
 
-but `--real` only ever writes outside the checkout — into
+but `--real` only ever writes where git ignores it — into
 `<data_dir>/golden_real/` (git-ignored) by default — and
-`golden.require_outside_repo` refuses any `--real` output path inside the
-repository, before anything is written. Real fixtures are never written under
-`swift/`.
+`golden.require_outside_repo` refuses any `--real` output path git would
+commit, before anything is written: `swift/`, `ios/`, `pipeline/` and `docs/`
+are refused outright, ignore rules or not. Real fixtures are never written
+under `swift/`.
 
 ## Format
 
