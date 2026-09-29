@@ -32,11 +32,13 @@ swift/HandstandCore/
 │   ├── Joint.swift                     the 15 tracked joints, raw values = Python names
 │   ├── Keypoint.swift                  Keypoint, PoseFrame (+ midpoint / isValid, JSON Codable)
 │   ├── Rotation.swift                  handstand.rotation
-│   └── BodyFrame.swift                 handstand.bodyframe
+│   ├── BodyFrame.swift                 handstand.bodyframe
+│   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
     ├── JointTests.swift                raw values == handstand.postprocess.TRACKED_JOINTS
     ├── RotationTests.swift             mirrors pipeline/tests/test_rotation.py
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
+    ├── FramingCheckTests.swift         whole body in frame / cut off / too small / alone (#46)
     ├── PoseFrameTests.swift            midpoint / isValid
     ├── FixtureTests.swift              reads the fixture through Bundle.module
     └── Fixtures/tiny_frames.json       three hand-written PoseFrames
@@ -76,6 +78,15 @@ Conventions the sources keep, so the package builds for **both iOS and macOS**:
   `body_frame_points` / `midpoint`: origin at the wrist midpoint, `u` to the
   right, `v` up, divided by `L`. A `body_length` that is not a positive finite
   number throws, exactly where Python raises its `ValueError`.
+* `FramingCheck` — the one piece here with no Python twin: the Record
+  screen's live framing guide (chainlink #46). It takes the people one frame's
+  detector saw, as joints in **normalised** coordinates (0…1, origin top-left,
+  `y` down), and returns `noPerson` / `multiplePeople` / `tooSmall` /
+  `partlyOutOfFrame(edges:missing:)` / `ok` plus the sentence the screen
+  shows. The rules — a confident joint, the 0.04 edge margin, the 0.35
+  minimum body height, the six-joint second-person threshold — are constants
+  at the top of the file, and `FramingCheckTests` pins each verdict and each
+  message down. `ios/HandstandApp/Capture/` is what feeds it.
 
 Python's `numpy` broadcasting has no place to land in a typed, dependency-free
 package, so batches are `[Keypoint]` in and out; where an error type replaces a

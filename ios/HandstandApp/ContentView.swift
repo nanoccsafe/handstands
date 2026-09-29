@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// The home screen: the app title, the one-line summary of what it is for,
-/// and the two things it can do. Capture (chainlink #46) and analysis
-/// (chainlink #47) replace the placeholders this screen leads to.
+/// and the two things it can do. Capture (chainlink #46) leads to the live
+/// camera screen; analysis (chainlink #47) still leads to a placeholder.
 struct ContentView: View {
     var body: some View {
         NavigationStack {
@@ -13,7 +13,7 @@ struct ContentView: View {
                     .multilineTextAlignment(.center)
 
                 NavigationLink {
-                    RecordPlaceholderView()
+                    RecordView()
                 } label: {
                     Label("Record", systemImage: "video.fill")
                 }

@@ -61,7 +61,30 @@ a phone needs one.
 4. Free-provisioning installs **expire after 7 days**; then the icon goes
    grey. Just repeat step 2 — reinstall the same way, nothing is lost.
 
+## Testing recording on the phone
+
+The camera does not exist in the simulator, so recording and its framing
+guide are checked on the iPhone itself (sideload as above). The checklist:
+
+1. Open **Record** and **grant camera access** when iOS asks. If access was
+   refused earlier, the screen explains and offers **Open Settings** — turn
+   the camera on there and come back.
+2. With your **whole body in frame** the border around the preview turns
+   **green** and the message reads "Looks good".
+3. **Cut your feet off** (step close, or stand at the bottom of the
+   picture): the border turns **amber** and the message names the problem —
+   "Step back: your feet are out of frame", or "you are cut off at the
+   bottom of the frame". Standing far away turns it amber with "Move
+   closer"; a second person walking in turns it red.
+4. **Record ~10 s**: tap the record button, wait, tap stop. The done screen
+   shows about **0:10** and a frame of **1080 × 1920**.
+5. **Record again** returns to the live camera; **Done** goes back home.
+
+Recordings land in `Application Support/Recordings/<yyyyMMdd-HHmmss>.mov`
+on the phone and stay there — nothing is uploaded, and the folder is
+deliberately *not* excluded from an iCloud backup.
+
 Everything stays on the phone: no networking, no analytics, recordings are
-not uploaded anywhere. The scaffold ships the home, record-placeholder,
-video-pick and about screens; capture (chainlink #46), analysis (#47),
-overlay (#48) and storage (#51) come later.
+not uploaded anywhere. The app ships the home, record, video-pick and about
+screens; analysis (chainlink #47), overlay (#48) and storage (#51) come
+later.
