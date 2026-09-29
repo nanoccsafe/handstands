@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from handstand import com
 from handstand import features as ft
 from handstand import pose_mediapipe as pm
 
@@ -32,6 +33,12 @@ LENGTH = 300.0
 #: The frame interval of the synthetic clips, in milliseconds. Real clips are
 #: variable frame rate, so the tests that care about time say so explicitly.
 FRAME_MS = 33
+
+#: How far above the ankle the toes sit in the synthetic pose: the foot carries
+#: the leg on, which is where a pointed foot in a line handstand puts it, so the
+#: foot segment has both its ends and a frame built from this pose is a
+#: *complete* one for the centre of mass to weigh.
+FOOT_BEYOND = 0.1
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +113,13 @@ class Pose:
         half_shoulders = self.shoulder_span / 2.0
         points["left_shoulder"] = (self.u_shoulder - half_shoulders, self.v_shoulder)
         points["right_shoulder"] = (self.u_shoulder + half_shoulders, self.v_shoulder)
+        # The toes carry the leg on past the ankle (FOOT_BEYOND), taking the
+        # ankle's own place — spread and all — with them. The features schema
+        # has no toes; the processed one does, and that is what makes a frame of
+        # this pose a complete one for the centre of mass to weigh.
+        for side in ("left", "right"):
+            ankle_u, ankle_v = points[f"{side}_ankle"]
+            points[f"{side}_foot_index"] = (ankle_u, ankle_v + FOOT_BEYOND)
         return points
 
     def mirrored(self) -> Pose:
@@ -158,7 +172,11 @@ def track_of(poses: Sequence[Pose]) -> ft.BodyTrack:
     uv = np.full((frames, len(joints), 2), np.nan)
     for index, pose in enumerate(poses):
         for name, point in pose.stations().items():
-            uv[index, joints.index(name)] = point
+            # The pose says where the toes are as well; the features schema does
+            # not carry them, and a joint a schema has no column for is one this
+            # track simply does not have.
+            if name in joints:
+                uv[index, joints.index(name)] = point
         if not pose.visible:
             uv[index] = np.nan
         for name in pose.hidden:
@@ -206,7 +224,7 @@ def test_every_feature_is_measured_on_every_frame_of_a_clip() -> None:
     features = measure([LINE, PIKE, BANANA])
 
     assert features.frames == 3
-    assert sorted(features.values) == sorted(ft.FEATURE_NAMES)
+    assert sorted(features.values) == sorted((*ft.FEATURE_NAMES, *ft.COM_COLUMNS))
     for name in ft.FEATURE_NAMES:
         assert features.value(name).shape == (3,)
     assert features.value("hip_angle")[1] < features.value("hip_angle")[0]
@@ -647,6 +665,7 @@ def test_the_per_frame_table_carries_the_labels_and_every_feature() -> None:
         "valid",
         "side_view",
         *ft.FEATURE_NAMES,
+        *ft.COM_COLUMNS,
     ]
     assert len(table) == features.frames
     assert table["frame_idx"].tolist() == [0, 1, 2]
@@ -769,6 +788,205 @@ def test_extract_refuses_labels_that_are_not_one_per_frame() -> None:
         )
     with pytest.raises(ValueError, match="trainer_contact"):
         extract([LINE] * 3, ["hold"] * 3, trainer_contact=np.array([False, True]))
+
+
+# --------------------------------------------------------------------------- #
+# The centre of mass and balance
+# --------------------------------------------------------------------------- #
+
+
+def shifted_forward(amount: float) -> Pose:
+    """A pose whose knees and ankles are ``amount`` away from the hands.
+
+    The legs swing and the torso stays over the wrists, which keeps the
+    shoulder→hip line vertical — the facing sign's reference — while the CoM
+    goes as far as the leg mass share can carry it.
+    """
+    return dataclasses.replace(LINE, u_knee=amount, u_ankle=amount)
+
+
+def sway_clip(times_ms: Sequence[int], forward: Sequence[float]) -> ft.ClipFeatures:
+    """A one-hold clip whose ``com_forward`` is exactly ``forward``, with real timestamps.
+
+    The stability numbers are about a trajectory and the clock it was sampled
+    on, so that is what the clip is made of: every other measurement is NaN, as
+    it is on a frame nobody could see, and every frame is in the hold.
+    """
+    frames = len(times_ms)
+    values: dict[str, np.ndarray] = {
+        name: np.full(frames, np.nan) for name in (*ft.FEATURE_NAMES, *ft.COM_COLUMNS)
+    }
+    values["com_forward"] = np.asarray(forward, dtype=np.float64)
+    values["com_complete"] = np.ones(frames, dtype=bool)
+    return ft.ClipFeatures(
+        clip_id=CLIP_ID,
+        source="mediapipe",
+        frame_idx=np.arange(frames, dtype=np.int64),
+        t_ms=np.asarray(times_ms, dtype=np.int64),
+        phase=np.full(frames, ft.HOLD_PHASE, dtype=object),
+        hold_id=np.zeros(frames, dtype=np.int64),
+        measured=ft.BodyFeatures(values=values, valid=np.ones(frames, dtype=bool)),
+    )
+
+
+def test_the_centre_of_mass_columns_are_written_per_frame() -> None:
+    table = ft.feature_table(extract([LINE], ["hold"]))
+
+    assert list(table.columns)[-len(ft.COM_COLUMNS) :] == list(ft.COM_COLUMNS)
+    # The symmetric line's CoM is on the vertical through the hands to within
+    # the head's own pull — the nose is the one joint off the line — and every
+    # segment was there.
+    assert table["com_u"][0] == pytest.approx(com.MASS_HEAD_NECK * 0.04)
+    assert 0.0 < table["com_v"][0] < LINE.v_hip
+    assert bool(table["com_complete"][0])
+    # The nose is at +u, so the athlete faces +u, so the CoM towards the
+    # fingers is the CoM to the right: positive, and well inside the base.
+    assert table["facing_sign"][0] == 1.0
+    assert table["com_forward"][0] == pytest.approx(table["com_u"][0])
+    assert table["balance_zone"][0] == "ok"
+
+    # The same clip shot from the other side of the athlete: every u negated,
+    # so the sign flips and com_forward — the balance — does not.
+    mirrored = ft.feature_table(extract([LINE.mirrored()], ["hold"]))
+    assert mirrored["facing_sign"][0] == -1.0
+    assert mirrored["com_u"][0] == pytest.approx(-table["com_u"][0])
+    assert mirrored["com_forward"][0] == pytest.approx(table["com_forward"][0])
+    assert mirrored["balance_zone"][0] == "ok"
+
+    # A frame the model saw nobody in has no CoM to speak of: NaN, incomplete,
+    # and no zone — not the frame's last known position.
+    unseen = ft.feature_table(extract([dataclasses.replace(LINE, visible=False)], ["hold"]))
+    assert math.isnan(unseen["com_u"][0]) and math.isnan(unseen["com_forward"][0])
+    assert not bool(unseen["com_complete"][0])
+    assert unseen["balance_zone"][0] != unseen["balance_zone"][0]
+
+
+def test_the_balance_zone_says_which_side_of_the_base_the_com_is_on() -> None:
+    over = ft.feature_table(extract([shifted_forward(0.3)], ["hold"]))
+    under = ft.feature_table(extract([shifted_forward(-0.3)], ["hold"]))
+
+    # Forwards past the fingertips, and the athlete faces +u, so this is the
+    # overbalance side; backwards past the heel of the hand is the other.
+    assert over["com_forward"][0] > ft.com.BASE_FRONT
+    assert over["balance_zone"][0] == "over"
+    assert under["com_forward"][0] < -ft.com.BASE_BACK
+    assert under["balance_zone"][0] == "under"
+    # The zones are read off com_forward and nothing else, so a mirrored clip
+    # with the same body in the same place lands in the same zone.
+    mirrored_over = ft.feature_table(extract([shifted_forward(0.3).mirrored()], ["hold"]))
+    assert mirrored_over["balance_zone"][0] == "over"
+    assert mirrored_over["facing_sign"][0] == -1.0
+
+
+def test_the_facing_sign_is_the_holds_vote_and_not_each_frames() -> None:
+    poses = [
+        dataclasses.replace(LINE, u_nose=0.05),
+        # This frame's own nose says -u: within a hold the majority rules, so
+        # the hold's answer is what com_forward is measured with.
+        dataclasses.replace(LINE, u_nose=-0.02),
+        dataclasses.replace(LINE, u_nose=0.04),
+        dataclasses.replace(LINE, u_nose=0.06),
+        # Outside a hold there is no majority to take, so this frame keeps its.
+        dataclasses.replace(LINE, u_nose=-0.05),
+    ]
+    features = extract(poses, ["hold", "hold", "hold", "hold", "pre"])
+    table = ft.feature_table(features)
+
+    assert table["facing_sign"].tolist() == [1.0, 1.0, 1.0, 1.0, -1.0]
+    # com_forward is com_u under the hold's sign on every hold frame — and the
+    # nose still moved the CoM itself, which is a measurement, not a vote: the
+    # second frame's CoM is to the left of the hands, and stays there.
+    assert table["com_forward"].tolist()[:4] == pytest.approx(table["com_u"].tolist()[:4])
+    assert table["com_u"][1] < 0.0
+    assert table["com_forward"][1] < 0.0
+    # The frame outside the hold is measured with its own sign instead.
+    assert table["com_forward"][4] == pytest.approx(-table["com_u"][4])
+
+
+def test_a_hold_that_never_moves_has_no_sway() -> None:
+    features = extract([LINE] * 6, ["hold"] * 6)
+    stability = ft.hold_stability(features, 0)
+    row = ft.hold_rows(features)[0]
+
+    # Six frames of the same pose: the CoM is in one place, so the sway, the
+    # range and the speed are all zero — to within a float's last bits, which is
+    # why the written row, rounded to five decimals, is exactly zero.
+    for name in ("com_sway_sd", "com_sway_range", "com_speed_rms"):
+        assert stability[name] == pytest.approx(0.0, abs=1e-12)
+        assert row[name] == 0.0
+    # Where it sat is where it is, and nothing left the base of support.
+    assert row["com_forward_median"] == pytest.approx(0.00324)
+    assert row["pct_over"] == 0.0
+    assert row["pct_under"] == 0.0
+    # The hip and the shoulder were both doing nothing: the quiet shoulder and
+    # quiet hip a balanced hold is read from.
+    assert row["hip_angle_sd"] == 0.0
+    assert row["shoulder_angle_sd"] == 0.0
+
+
+def test_a_hold_that_could_not_be_measured_has_no_balance_numbers() -> None:
+    features = extract([dataclasses.replace(LINE, visible=False)] * 4, ["hold"] * 4)
+    row = ft.hold_rows(features)[0]
+
+    assert row["valid_frames"] == 0
+    for name in ft.HOLD_STABILITY_COLUMNS:
+        assert math.isnan(row[name]), f"{name} is a number on a hold nobody could see"
+
+
+def test_the_hold_table_carries_the_balance_columns() -> None:
+    table = ft.hold_summary_table([extract([LINE] * 6, ["hold"] * 6)])
+
+    assert list(table.columns) == list(ft.HOLD_SUMMARY_COLUMNS)
+    assert list(table.columns)[-len(ft.HOLD_STABILITY_COLUMNS) :] == list(
+        ft.HOLD_STABILITY_COLUMNS
+    )
+    # The balance answer sits beside the shape answer in the same row: the same
+    # hold, what it looked like and how steady it was.
+    assert "line_deviation_median" in table.columns
+    assert table["com_forward_median"][0] == pytest.approx(0.00324)
+    assert table["hip_angle_sd"][0] == 0.0
+
+
+def sway_of(times_s: np.ndarray, amplitude: float, frequency: float) -> np.ndarray:
+    """A pure sine sway of a given amplitude and frequency, sampled at ``times_s``."""
+    return amplitude * np.sin(2.0 * np.pi * frequency * times_s)
+
+
+def test_the_sway_of_a_sinusoid_is_what_the_analytic_answer_says() -> None:
+    # The analytic answer for a sway x(t) = A sin(2 pi f t): an SD of A / sqrt 2
+    # and a speed RMS of 2 pi f A / sqrt 2. The timestamps are deliberately
+    # uneven — a real clip is variable frame rate — so the difference has to
+    # come from t_ms and not from a frame count.
+    amplitude, frequency = 0.05, 1.0
+    rng = np.random.default_rng(7)
+    gaps_ms = rng.integers(20, 50, size=181)
+    times_ms = np.concatenate(([0], np.cumsum(gaps_ms)))
+    times_s = times_ms / 1000.0
+    forward = sway_of(times_s, amplitude, frequency)
+    stability = ft.hold_stability(sway_clip(times_ms, forward), 0)
+
+    analytic_sd = amplitude / math.sqrt(2.0)
+    analytic_speed = 2.0 * math.pi * frequency * amplitude / math.sqrt(2.0)
+    assert stability["com_sway_sd"] == pytest.approx(analytic_sd, rel=0.05)
+    assert stability["com_speed_rms"] == pytest.approx(analytic_speed, rel=0.05)
+    # The rest of the row is the same signal read a different way: a centre it
+    # hovers around, a range of about two amplitudes (the 5th and 95th
+    # percentiles of a sine sit at 0.988 of it), and the share of the hold spent
+    # behind the heel of the hand, where a 0.05 L sway dips below -0.03 L.
+    assert abs(stability["com_forward_median"]) < 0.01
+    assert stability["com_sway_range"] == pytest.approx(1.9754 * amplitude, rel=0.05)
+    assert stability["pct_over"] == 0.0
+    assert stability["pct_under"] == pytest.approx(29.5, abs=4.0)
+
+    # The same sway sampled twice as slowly gives the same speed: the
+    # derivative is taken over the real gap between frames, so the answer does
+    # not depend on how often the camera happened to fire.
+    coarse = np.arange(0, int(times_ms[-1]) + 1, 67, dtype=np.int64)
+    slow = ft.hold_stability(
+        sway_clip(coarse, sway_of(coarse / 1000.0, amplitude, frequency)), 0
+    )
+    assert slow["com_speed_rms"] == pytest.approx(analytic_speed, rel=0.05)
+    assert slow["com_sway_sd"] == pytest.approx(analytic_sd, rel=0.05)
 
 
 # --------------------------------------------------------------------------- #
@@ -934,6 +1152,10 @@ def test_the_features_and_their_targets_are_documented() -> None:
         assert feature.name in ft.__doc__, f"{feature.name} is not in the module docstring"
     for name, _, _, _ in ft.TOLERANCES:
         assert name in ft.FEATURE_NAMES
+    # The balance columns are documented where the features are: a column nobody
+    # can look up is a column nobody can read.
+    for name in (*ft.COM_COLUMNS, *ft.HOLD_STABILITY_COLUMNS):
+        assert name in ft.__doc__, f"{name} is not in the module docstring"
 
 
 # --------------------------------------------------------------------------- #
@@ -1172,6 +1394,25 @@ def test_the_plot_of_a_clip_with_nothing_to_show_still_draws(tmp_path: pathlib.P
     path = ft.plot_clip(table, tmp_path / "empty.png")
 
     assert path.is_file()
+
+
+def test_the_plot_draws_the_com_and_the_zones_after_the_features(
+    tmp_path: pathlib.Path,
+) -> None:
+    # Two panels after the fourteen: where the centre of mass sat relative to
+    # the fingers, with the two edges of the base of support on it, and which
+    # zone each frame was in.
+    assert ft.plot_panels() == (*ft.FEATURE_NAMES, "com_forward", "balance_zone")
+    drawn, test = ft.balance_fault_line()
+    assert drawn == (-ft.com.BASE_BACK, ft.com.BASE_FRONT)
+    assert "under" in test and "over" in test
+
+    labels = ["pre"] * 3 + ["hold"] * 10 + ["exit"] * 2
+    table = ft.feature_table(extract([LINE] * 15, labels))
+    path = ft.plot_clip(table, ft.plot_path(tmp_path, CLIP_ID))
+
+    assert path.is_file()
+    assert path.stat().st_size > 0
 
 
 # --------------------------------------------------------------------------- #
