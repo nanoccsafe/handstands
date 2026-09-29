@@ -33,12 +33,14 @@ swift/HandstandCore/
 │   ├── Keypoint.swift                  Keypoint, PoseFrame (+ midpoint / isValid, JSON Codable)
 │   ├── Rotation.swift                  handstand.rotation
 │   ├── PostProcess.swift               handstand.postprocess (#39)
+│   ├── Phases.swift                    handstand.phases — the segmenter, phases only (#40)
 │   ├── BodyFrame.swift                 handstand.bodyframe
 │   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
     ├── JointTests.swift                raw values == handstand.postprocess.TRACKED_JOINTS
     ├── RotationTests.swift             mirrors pipeline/tests/test_rotation.py
     ├── PostProcessTests.swift          golden parity + the postprocess step tests (#39)
+    ├── PhasesTests.swift               golden parity + the phase segmenter tests (#40)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
     ├── FramingCheckTests.swift         whole body in frame / cut off / too small / alone (#46)
     ├── PoseFrameTests.swift            midpoint / isValid
@@ -81,6 +83,9 @@ Conventions the sources keep, so the package builds for **both iOS and macOS**:
   flip `(width - 1 - x, height - 1 - y)`.
 * `PostProcess` — `handstand.postprocess`: the five-step keypoint
   post-process, in the section below (chainlink #39).
+* `PhaseSegmenter` — `handstand.phases`: one label (`pre`, `kickup`, `hold`,
+  `exit`, `post`, `unknown`) and one hold number per frame, in the section
+  below (chainlink #40; features are #81).
 * `BodyFrame` — `handstand.bodyframe.to_body_frame` /
   `body_frame_points` / `midpoint`: origin at the wrist midpoint, `u` to the
   right, `v` up, divided by `L`. A `body_length` that is not a positive finite
@@ -156,6 +161,92 @@ five golden fixtures of chainlink #25 through the port and compares them with
 `expected.postprocess` at `meta.tolerances` (body length 1e-6 px, positions
 1e-3 px, `valid`/`filled` exact); the other tests mirror the unit cases of
 `pipeline/tests/test_postprocess.py` on tiny hand-made inputs.
+
+## PhaseSegmenter (chainlink #40)
+
+`Sources/HandstandCore/Phases.swift` mirrors the phase half of
+`pipeline/handstand/phases.py`: **every** frame gets a label and the frames of
+each hold get a number, because every stage after this one needs to know which
+part of a clip it is looking at. The entry point is
+`PhaseSegmenter.classify(tMs:processed:trainerContact:config:)` → `ClipPhases`
+(`phase` and `holdId` per frame, plus the `FrameSignals` they were made from
+and the `[HoldRun]s` it found). The input is exactly what Python's
+`classify_clip` receives: the trajectory from `PostProcess.process`, the
+**raw** trainer-contact flags (the post-process gates them away; a phase still
+has to say *why* a frame is unknown) and `bodyLength.totalPx` as the scale.
+The helpers (`midpoint`, `largest`, `bodyFrameUV`, `windowMotion`,
+`velocityLPerS`, `frameSignals`, `holdCondition`, `holdRuns`, `assignPhases`)
+are `internal` statics of `PhaseSegmenter`, so `@testable import` reaches them
+the way the Python tests reach the module functions.
+
+What it does, in the order the pipeline runs it:
+
+1. **Signals** — every measurement taken in the body frame
+   (`BodyFrame.toBodyFrame`, origin at the wrist midpoint, units of `L`, so
+   one threshold means the same thing on a 350 px athlete and a 600 px one):
+   `inverted`, `bodyAngleDeg`, `handsLow`, the wrist step and speed over
+   `handStillWindowS`, `handsDown`, `handStep`, and the ankle midpoint's
+   `legsVelocityLPerS` over `legVelocityWindowS`. A frame the module cannot
+   see into — trainer contact, or a wrist, ankle or hip with no position — is
+   `known == false`, carries the reason string Python writes, and every
+   boolean of it is `false`.
+2. **Hold runs** — `holdCondition` (inverted and straight, hands planted, no
+   hand step) collapsed into runs: an unknown frame or a frame where the
+   geometry merely failed bridges the run while the whole break is at most
+   `holdBreakMaxS`, a **hand step ends the run wherever it happens**, and only
+   runs at least `minHoldS` long count as holds — numbered from 0 in time
+   order.
+3. **State machine** — `assignPhases` labels every frame: `pre` becomes
+   `kickup` when the hands go down and the legs rise, a qualified run is
+   `hold`, a hold that stops holding is `exit`, and once the body is no longer
+   above the hands every state but `pre` becomes `post`. Frames nobody could
+   see are `unknown` and never move the state on; a gap *inside* a hold keeps
+   the hold's phase and number.
+
+The constants, each the Python module constant of the same name, on
+`PhaseConfig` (`.init()` is the Python configuration):
+
+| Python | value | Swift default |
+|---|---|---|
+| `NO_HOLD` | -1 | `PhaseConfig.noHold`, `PhaseSegmenter.noHold` |
+| `INVERTED_MIN` | 0.6 | `PhaseConfig.invertedMin` |
+| `HOLD_MAX_ANGLE` | 35.0 | `holdMaxAngle` |
+| `MIN_HOLD_S` | 0.3 | `minHoldS` |
+| `HAND_STILL_L_PER_S` | 0.3 | `handStillLPerS` |
+| `HAND_STILL_WINDOW_S` | 0.2 | `handStillWindowS` |
+| `HAND_STEP_L` | 0.1 | `handStepL` |
+| `HANDS_LOW_MIN_V` | 0.1 | `handsLowMinV` |
+| `LEG_VELOCITY_MIN_L_PER_S` | 0.1 | `legVelocityMinLPerS` |
+| `LEG_VELOCITY_WINDOW_S` | 0.1 | `legVelocityWindowS` |
+| `HOLD_BREAK_MAX_S` | 0.3 | `holdBreakMaxS` |
+| `REASON_TRAINER`, `REASON_WRISTS`, `REASON_ANKLES`, `REASON_HIPS` | the four `unknown` reasons | `reasonTrainer`, `reasonWrists`, `reasonAnkles`, `reasonHips` |
+| `WRIST_JOINTS`, `ANKLE_JOINTS`, `HIP_JOINTS` | the joints each signal is read off | `wristJoints`, `ankleJoints`, `hipJoints` |
+| `_TIME_EPS` | 1e-9 | `timeEps` |
+
+`PHASES` is not a config value: it *is* the declaration order of the `Phase`
+enum — `pre`, `kickup`, `hold`, `exit`, `post`, `unknown`.
+
+Three rules the parity check is really about: every window and duration is
+measured against `tMs` converted to **seconds** (these clips are variable
+frame rate — nothing assumes a fixed fps, and `np.searchsorted` finds each
+window by timestamp), a `NaN` comparison is false *and* a `NaN` wrist speed is
+not evidence that the hands moved (which is what lets a trainer's occlusion
+pass through a hold instead of ending it), and a clip with no body length
+comes back with every frame `unknown`, `hold_id` -1 and Python's
+`"no body length (… px)"` reason — Swift's description of a `Double` agrees
+with Python's `repr` on every value that path produces. The features, the
+centre of mass and the hold summary are chainlink #81; the parquet / CSV
+writing, the segments table, the `ClipStats` summary, the overlay and the CLI
+are **not** ported.
+
+`PhasesTests.testEveryGoldenFixtureMatchesThePythonPhases` runs all five
+golden fixtures of chainlink #25 through `PostProcess.process` and the
+segmenter and compares `phase` and `hold_id` with `expected.phases` **exactly**
+(that tolerance is 0), plus `holdCount` with `meta.hold_count`; a mismatch
+names the case, the frame, `t_ms`, both answers and that frame's signals. The
+other tests mirror the unit cases of `pipeline/tests/test_phases.py` on tiny
+hand-made trajectories written in the body frame (the wrist midpoint is the
+origin, `LENGTH` = 300 px).
 
 ## Running the tests
 
