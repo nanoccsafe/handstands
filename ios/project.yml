@@ -1,0 +1,104 @@
+# XcodeGen spec for the Handstand iPhone app (chainlink #44).
+#
+# The .xcodeproj is GENERATED from this file and never committed
+# (`ios/*.xcodeproj/` is in .gitignore), so this is the file to edit:
+#
+#     cd ios && xcodegen generate && open Handstand.xcodeproj
+#
+# Signing: CODE_SIGN_STYLE is Automatic (below); the team id is personal, so
+# it is never committed — Base.xcconfig defaults it to empty and includes
+# Config/Local.xcconfig (git-ignored) where the real id goes. See
+# Config/Local.xcconfig.example and docs/ios.md.
+name: Handstand
+
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+# The app links HandstandCore — the package swift_test.sh builds and tests on
+# the Mac — as a local dependency. No network fetch, same sources as Linux.
+packages:
+  HandstandCore:
+    path: ../swift/HandstandCore
+
+# Applied to every target: CODE_SIGN_STYLE and the (empty by default)
+# DEVELOPMENT_TEAM come from here, never from this file.
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "6.0"
+
+targets:
+  HandstandApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: HandstandApp
+    # The Info.plist itself is generated from this file by xcodegen (and is
+    # git-ignored like the project); the camera / photo-library strings are
+    # the ones the system shows in its permission prompts.
+    info:
+      path: HandstandApp/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSCameraUsageDescription: Record your handstand attempts to analyse your form.
+        NSPhotoLibraryUsageDescription: Choose a handstand video to analyse.
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+    dependencies:
+      - package: HandstandCore
+        product: HandstandCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nanoccsafe.handstand
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: "NO"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+
+  HandstandAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: HandstandAppTests
+    dependencies:
+      - target: HandstandApp
+      - package: HandstandCore
+        product: HandstandCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nanoccsafe.handstand.HandstandAppTests
+        GENERATE_INFOPLIST_FILE: "YES"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/HandstandApp.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/HandstandApp"
+
+schemes:
+  HandstandApp:
+    build:
+      targets:
+        HandstandApp: all
+        HandstandAppTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - HandstandAppTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
