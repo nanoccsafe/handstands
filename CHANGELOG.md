@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Port PhaseSegmenter to Swift (phases only; features are #81) (#40)
 - Port postprocess to Swift (gating, outliers, gap fill, One-Euro, body length) (#39)
 - Golden test fixtures for Python->Swift parity (synthetic, committed; real clips local-only) (#25)
 - Recording with a live framing guide (AVFoundation + Vision) in the iOS app (#46)
