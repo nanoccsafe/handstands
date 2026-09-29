@@ -6,6 +6,14 @@ for the Swift ports of post-process (chainlink #39), phases + features (#40)
 and the scorer (#41): a port is right when it reproduces `expected`, frame by
 frame, inside `meta.tolerances`.
 
+**Parity only, not ground truth.** The stick figures are crude: `banana_hold` has
+far less arch than a real banana or Mexican handstand, and `hand_step` and
+`trainer_contact` only loosely resemble the real thing. A case's name says what
+the generator was aiming for, not what the pose is. Use these files only to
+check that Swift reproduces Python's numbers on the same input. Never use them
+to train, evaluate or tune a classifier or threshold; only labelled real clips
+count. Realistic cases are to be designed with the user (chainlink #80).
+
 Regenerate them from the repository root:
 
 ```sh
