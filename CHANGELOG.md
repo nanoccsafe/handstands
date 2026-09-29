@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- iOS app scaffold (SwiftUI, XcodeGen) consuming HandstandCore, ready to sideload (#44)
 - HandstandCore Swift package skeleton + swift test on the Mac mini (#38)
 - Center of mass (CoM) proxy, balance direction and hold stability features (#23)
 - Investigate the 19 frames where the pre-label model found no athlete (#78)
