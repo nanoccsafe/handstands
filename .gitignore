@@ -25,6 +25,13 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 
+# iOS app: the project and its Info.plist are generated from ios/project.yml
+ios/*.xcodeproj/
+ios/HandstandApp/Info.plist
+
+# Personal signing config (a team id is personal data; repo is public)
+ios/Config/Local.xcconfig
+
 # ML artifacts (published via releases if needed)
 *.mlmodel
 *.mlpackage/

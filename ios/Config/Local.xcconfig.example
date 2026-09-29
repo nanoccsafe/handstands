@@ -1,0 +1,7 @@
+// Copy this file to Local.xcconfig (same directory) and replace the value
+// with your Apple ID team id: Xcode > Settings > Accounts > your account, or
+// the target's Signing & Capabilities > Team (it looks like AB12CD34EF).
+//
+// Local.xcconfig is git-ignored on purpose — a team id is personal data and
+// this repository is public, so it must never be committed.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID
