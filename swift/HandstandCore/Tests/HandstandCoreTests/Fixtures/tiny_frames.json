@@ -1,0 +1,35 @@
+[
+  {
+    "frameIndex": 0,
+    "tMs": 0,
+    "joints": {
+      "nose": { "x": 100.5, "y": 40.25, "visibility": 0.98 },
+      "left_shoulder": { "x": 80, "y": 90, "visibility": 0.97 },
+      "right_shoulder": { "x": 120, "y": 90, "visibility": 0.96 },
+      "left_wrist": { "x": 70, "y": 200, "visibility": 0.95 },
+      "right_wrist": { "x": 130, "y": 200, "visibility": 0.94 }
+    }
+  },
+  {
+    "frameIndex": 1,
+    "tMs": 33,
+    "joints": {
+      "nose": { "x": 101, "y": 41, "visibility": 0.9 },
+      "left_shoulder": { "x": 81, "y": 91, "visibility": 0.89 },
+      "right_shoulder": { "x": 121, "y": 91, "visibility": 0.88 },
+      "left_wrist": { "x": 71, "y": 201, "visibility": 0.87 },
+      "right_wrist": { "x": 131, "y": 201, "visibility": 0.86 }
+    }
+  },
+  {
+    "frameIndex": 2,
+    "tMs": 66,
+    "joints": {
+      "nose": { "x": 102, "y": 42, "visibility": 0.85 },
+      "left_shoulder": { "x": 82, "y": 92, "visibility": 0.84 },
+      "right_shoulder": { "x": 122, "y": 92, "visibility": 0.83 },
+      "left_wrist": { "x": 72, "y": 202, "visibility": 0.82 },
+      "right_wrist": { "x": 132, "y": 202, "visibility": 0.81 }
+    }
+  }
+]
