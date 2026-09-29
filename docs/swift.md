@@ -32,16 +32,21 @@ swift/HandstandCore/
 │   ├── Joint.swift                     the 15 tracked joints, raw values = Python names
 │   ├── Keypoint.swift                  Keypoint, PoseFrame (+ midpoint / isValid, JSON Codable)
 │   ├── Rotation.swift                  handstand.rotation
+│   ├── PostProcess.swift               handstand.postprocess (#39)
 │   ├── BodyFrame.swift                 handstand.bodyframe
 │   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
     ├── JointTests.swift                raw values == handstand.postprocess.TRACKED_JOINTS
     ├── RotationTests.swift             mirrors pipeline/tests/test_rotation.py
+    ├── PostProcessTests.swift          golden parity + the postprocess step tests (#39)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
     ├── FramingCheckTests.swift         whole body in frame / cut off / too small / alone (#46)
     ├── PoseFrameTests.swift            midpoint / isValid
     ├── FixtureTests.swift              reads the fixture through Bundle.module
-    └── Fixtures/tiny_frames.json       three hand-written PoseFrames
+    ├── GoldenFixtures.swift            the golden fixture schema, shared by the parity tests
+    ├── GoldenFixtureTests.swift        the fixtures decode and their rows line up (#25)
+    ├── Fixtures/tiny_frames.json       three hand-written PoseFrames
+    └── Fixtures/golden/                the five synthetic parity cases + README.md
 ```
 
 Conventions the sources keep, so the package builds for **both iOS and macOS**:
@@ -74,6 +79,8 @@ Conventions the sources keep, so the package builds for **both iOS and macOS**:
   `inverse_rotate_points` / `rotated_frame_size`. Angles are counter-clockwise
   in image coordinates, 90° and 270° swap the frame size, and 180° is the index
   flip `(width - 1 - x, height - 1 - y)`.
+* `PostProcess` — `handstand.postprocess`: the five-step keypoint
+  post-process, in the section below (chainlink #39).
 * `BodyFrame` — `handstand.bodyframe.to_body_frame` /
   `body_frame_points` / `midpoint`: origin at the wrist midpoint, `u` to the
   right, `v` up, divided by `L`. A `body_length` that is not a positive finite
@@ -91,6 +98,64 @@ Conventions the sources keep, so the package builds for **both iOS and macOS**:
 Python's `numpy` broadcasting has no place to land in a typed, dependency-free
 package, so batches are `[Keypoint]` in and out; where an error type replaces a
 `ValueError`, the message text is kept.
+
+## PostProcess (chainlink #39)
+
+`Sources/HandstandCore/PostProcess.swift` mirrors
+`pipeline/handstand/postprocess.py`: the five steps `process_clip` runs over a
+clip, in the same order and with the same edge cases, over
+`[PostProcessInputFrame]` → `ProcessedClip` (`joints`, `valid` and `filled` per
+frame, plus the `BodyLength` sidecar). The entry point is
+`PostProcess.process(_:config:)`; the helpers (`gatedValid`,
+`estimateBodyLength`, `removeSpeedOutliers`, `fillGaps`, `smoothTrack`,
+`OneEuroFilter`, `percentileOf`) are `internal`, so `@testable import` reaches
+them the way the Python tests reach the module functions.
+
+1. **Gating** — a frame with no pose or with `trainerContact` contributes
+   nothing, and a joint whose coordinates are not finite, or whose visibility
+   is below `minVisibility`, is not a position (a `NaN` visibility fails the
+   comparison, as in Python).
+2. **Body length** — `L` = torso + thigh + shin, each the percentile of its
+   per-frame span over the frames where *that* span could be measured, the
+   thigh and shin taken as the **longer** leg of the frame. Fewer than
+   `minBodyFrames` measurable frames — or a total below
+   `handstand.athlete.MIN_BODY_LENGTH_PIXELS` — makes the clip unusable, with
+   Python's reason string in `BodyLength.reason`.
+3. **Outliers** — a joint moving faster than `maxSpeedLPerS` body lengths per
+   second between two consecutive valid samples is invalid in the *later* one;
+   the earlier sample stays the reference.
+4. **Gap fill** — a run of invalid samples is interpolated linearly **in time**
+   when its two ends are at most `maxGapS` seconds apart, and marked
+   `filled`; further apart, or at a track's head or tail, it stays invalid.
+5. **Smoothing** — a One-Euro filter per joint coordinate, in body lengths,
+   with the real `dt` from `t_ms`, restarted after every invalid run.
+
+The constants, each the Python module constant of the same name:
+
+| Python | value | Swift default |
+|---|---|---|
+| `MIN_VISIBILITY` | 0.5 | `PostProcessConfig.minVisibility` |
+| `BODY_LENGTH_PERCENTILE` | 90.0 | `bodyLengthPercentile` |
+| `MIN_BODY_FRAMES` | 10 | `minBodyFrames` |
+| `MAX_SPEED_L_PER_S` | 8.0 | `maxSpeedLPerS` |
+| `MAX_GAP_S` | 0.2 | `maxGapS` |
+| `MIN_CUTOFF`, `BETA`, `D_CUTOFF` | 1.0, 0.3, 1.0 | `minCutoff`, `beta`, `dCutoff` |
+| `MIN_SAMPLE_DT` | 1e-3 | `minSampleDt` |
+| `athlete.MIN_BODY_LENGTH_PIXELS` | 1.0 | `PostProcessConstants.minBodyLengthPixels` |
+
+Three rules the parity check is really about: the percentile interpolates the
+way numpy's default `"linear"` method does (index `(n - 1) * p / 100`, lerped
+between the two neighbours), every time comparison uses `t_ms` converted to
+seconds (the clips are variable frame rate — nothing assumes a fixed fps), and
+an unusable clip comes back with every joint invalid and no positions, exactly
+as Python writes it. `hold_like_frames`, the `ClipStats` summary, the parquet /
+JSON writing and the CLI are **not** ported.
+
+`PostProcessTests.testEveryGoldenFixtureMatchesThePythonPostProcess` runs all
+five golden fixtures of chainlink #25 through the port and compares them with
+`expected.postprocess` at `meta.tolerances` (body length 1e-6 px, positions
+1e-3 px, `valid`/`filled` exact); the other tests mirror the unit cases of
+`pipeline/tests/test_postprocess.py` on tiny hand-made inputs.
 
 ## Running the tests
 

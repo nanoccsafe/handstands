@@ -5,9 +5,9 @@ import PackageDescription
 /// can run the same maths the workstation runs.
 ///
 /// * `HandstandCore` — pure value types and pure functions ported from
-///   `pipeline/handstand/` (joints, keypoints, rotation, body frame; the
-///   postprocess / phases / features ports land in later issues). No I/O, no
-///   UIKit or AppKit, so the same target builds for iOS and macOS and
+///   `pipeline/handstand/` (joints, keypoints, rotation, body frame,
+///   postprocess; the phases / features ports land in later issues). No I/O,
+///   no UIKit or AppKit, so the same target builds for iOS and macOS and
 ///   `swift test` covers all of it.
 /// * `HandstandCoreTests` — XCTest mirror of the Python tests, plus a tiny
 ///   JSON fixture read through `Bundle.module` to prove resources work for the
