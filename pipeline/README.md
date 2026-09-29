@@ -165,6 +165,31 @@ up to 0.3 s of unknown frames inside a hold does not. The thresholds are module
 constants, documented at the top of `handstand.phases`. See
 `docs/keypoint_schema.md` for every column and the whole state machine.
 
+## Golden fixtures
+
+The test data the Swift ports are checked against: synthetic clips, run through
+the real `postprocess`, `phases` and `features` stages in memory, with input and
+expected output written to one JSON file per case under
+`swift/HandstandCore/Tests/HandstandCoreTests/Fixtures/golden/` (committed; the
+format is documented in that folder's `README.md`).
+
+```sh
+cd pipeline
+uv run python -m handstand.golden                    # regenerate every case
+uv run python -m handstand.golden --only line_hold   # one of them
+uv run python -m handstand.golden --real 6508f9b355bd   # local-only, never under swift/
+```
+
+The repo is public, so what is committed is always synthetic
+(`meta.mode == "synthetic"`, generated from a seed) and `--real` refuses any
+output path git would commit, plus `swift/`, `ios/`, `pipeline/` and `docs/`
+outright, so real-clip fixtures only ever land in `<data_dir>/golden_real/`,
+which is git-ignored. The data tree may sit *inside* the checkout, as it does in
+the main one, and git ignoring it is exactly what allows that.
+`tests/test_golden.py` reads the committed files back, re-runs the pipeline from
+their `input` and checks the answers still match `expected` to the tolerances
+stored in `meta`.
+
 ## Paths
 
 `handstand.paths` resolves the shared workspace at call time (never at import
