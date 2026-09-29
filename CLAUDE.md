@@ -58,6 +58,8 @@ prompt in `docs/prompts/`).
 - `git -C ../wt-<name> log --oneline main..` and `git -C ../wt-<name> diff main...`. Run the tests yourself
   in the worktree. For `mac` issues: `rsync -a --delete --exclude .git ../wt-<name>/ macmini:~/wt/<name>/`
   then `ssh macmini 'cd ~/wt/<name>/swift/HandstandCore && swift test'` (or `xcodebuild` for the app).
+  Or `../wt-<name>/tools/mac/swift_test.sh HandstandCore wt/<name>`: always the *worktree's* copy, since the
+  script syncs the tree it lives in (main's copy tests main). Check that the new test suites appear in the output.
 - Summarize the diff and test results for the user. Merge only after the user approves, and only with
   `tools/worker/merge.sh <name>`: it commits chainlink's CHANGELOG edits, merges, runs the tests (undoing
   the merge if they fail), pushes, and only then runs `stop.sh --clean` and closes the issue. Never chain
