@@ -14,8 +14,13 @@ import HandstandCore
 final class SessionStoreTests: XCTestCase {
     /// A temp Recordings folder with an in-memory SwiftData store over it.
     /// The returned container keeps the store alive for the test; the
-    /// caller removes the folder when it is done.
-    private func makeSUT(readInfo: SessionStore.InfoReader? = nil) throws -> (
+    /// caller removes the folder when it is done. `annotatedDirectory` is
+    /// where the store looks for annotated exports (chainlink #50) — a test
+    /// passes its own folder so nothing touches the app's real Caches.
+    private func makeSUT(
+        readInfo: SessionStore.InfoReader? = nil,
+        annotatedDirectory: URL? = nil
+    ) throws -> (
         store: SessionStore, container: ModelContainer, directory: URL
     ) {
         let directory = FileManager.default.temporaryDirectory
@@ -30,10 +35,15 @@ final class SessionStoreTests: XCTestCase {
             store = SessionStore(
                 context: ModelContext(container),
                 recordingsDirectory: directory,
-                readInfo: readInfo
+                readInfo: readInfo,
+                annotatedDirectory: annotatedDirectory
             )
         } else {
-            store = SessionStore(context: ModelContext(container), recordingsDirectory: directory)
+            store = SessionStore(
+                context: ModelContext(container),
+                recordingsDirectory: directory,
+                annotatedDirectory: annotatedDirectory
+            )
         }
         return (store, container, directory)
     }
@@ -470,6 +480,67 @@ final class SessionStoreTests: XCTestCase {
 
         XCTAssertEqual(result.added, 0)
         XCTAssertEqual(result.removed, 0)
+        XCTAssertEqual(try sut.store.sessions().count, 0)
+    }
+
+    // MARK: - The annotated export (chainlink #50)
+
+    /// The export's name, spelled once for the export button and for
+    /// `delete`: `<basename>-annotated.mp4` in the exports directory (the
+    /// app's Caches; a test's own folder here).
+    func testTheAnnotatedExportIsNamedAfterTheMovie() throws {
+        let caches = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SessionStoreTests-caches-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        let sut = try makeSUT(annotatedDirectory: caches)
+        defer {
+            try? FileManager.default.removeItem(at: sut.directory)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        let movie = try makeMovie(named: "20260928-143059.mov", in: sut.directory)
+        let session = try sut.store.add(
+            movie: movie,
+            metadata: nil,
+            info: VideoInfo(duration: 5, width: 720, height: 1280)
+        )
+
+        let export = sut.store.annotatedExportURL(for: session)
+
+        XCTAssertEqual(export.lastPathComponent, "20260928-143059-annotated.mp4")
+        XCTAssertEqual(
+            export.deletingLastPathComponent().path, caches.path,
+            "exports are cached outside the Recordings folder")
+        XCTAssertEqual(
+            export.path, SessionStore.annotatedExportURL(for: movie, in: caches).path,
+            "the static spelling `delete` uses agrees with the store's")
+    }
+
+    /// Deleting a recording takes its leftover annotated export with it:
+    /// nobody can watch an export of a film that is gone, and Caches is not
+    /// a place anything reads back.
+    func testDeleteRemovesTheAnnotatedExportInCaches() throws {
+        let caches = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SessionStoreTests-caches-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        let sut = try makeSUT(annotatedDirectory: caches)
+        defer {
+            try? FileManager.default.removeItem(at: sut.directory)
+            try? FileManager.default.removeItem(at: caches)
+        }
+        let movie = try makeMovie(named: "20260928-143059.mov", in: sut.directory)
+        let session = try sut.store.add(
+            movie: movie,
+            metadata: nil,
+            info: VideoInfo(duration: 10, width: 1080, height: 1920)
+        )
+        let export = sut.store.annotatedExportURL(for: session)
+        try Data("an annotated movie".utf8).write(to: export)
+        XCTAssertTrue(exists(export), "the export sits in the caches folder")
+
+        try sut.store.delete(session)
+
+        XCTAssertFalse(exists(export), "the leftover export goes with the recording")
+        XCTAssertFalse(exists(movie))
         XCTAssertEqual(try sut.store.sessions().count, 0)
     }
 }

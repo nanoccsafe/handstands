@@ -316,6 +316,46 @@ the movie plays except the playhead. Side view only for now, like the
 rest of the analysis (front/back is chainlink #83); the names are
 view-neutral.
 
+## Export
+
+An **analysed** session — the same condition as the diagram and the
+summary — gets an **Export video** button in its own section
+(chainlink #50; the library side is docs/swift.md's **AnnotatedVideo**
+section). It writes an annotated copy of the movie: the picture with the
+**stress diagram burned into every frame** and the **heat strip along the
+bottom**, as an H.264 `.mp4`.
+
+- **What is in it**: every frame of the original video, at the source's own
+  frame timing, upright at its display size (a sideways recording comes out
+  upright too), with the skeleton, the dashed stack line and the centre of
+  mass drawn exactly as the overlay draws them — the same band colours and
+  sizes, scaled to the video's resolution (`scale = videoHeight / 1000`) —
+  the heat strip along the bottom 3 % with a white playhead at each frame's
+  time, and a small footer bottom-left: "Handstand · 2026-09-30", plus
+  "Score 78" when the clip has one. The source's audio comes along when the
+  container can carry it unchanged (AAC).
+- **Where it is written**: the app's **Caches** directory, as
+  `<basename>-annotated.mp4` — never in Recordings, never a History row,
+  and nothing is uploaded anywhere.
+- **Progress and Cancel**: the export reports 0…100 % and Cancel stops it
+  at once; a cancelled (or failed) export deletes its own partial file, so
+  nothing half-written is ever left behind.
+- **Sharing is up to the user**: when it finishes the section shows
+  **Share video** (`ShareLink`), which opens the share sheet — save it to
+  Photos, send it to a coach, whatever happens after that is the user's.
+  The `NSPhotoLibraryAddUsageDescription` string ("Save your annotated
+  handstand video to Photos.") is what makes **Save Video** in that sheet
+  work.
+- **Deleted afterwards**: the cached export goes when the session screen
+  goes away, when a new export starts, and when the recording is deleted —
+  `SessionStore.delete` takes a leftover `<basename>-annotated.mp4` with the
+  movie. The copy in Photos (or wherever it was shared to) is the user's;
+  the app keeps none.
+
+An analysis the pipeline could not measure still exports: the plain video
+with no skeleton and a neutral strip, rather than a button that does
+nothing.
+
 ## Testing recording on the phone
 
 The camera does not exist in the simulator, so recording and its framing
@@ -388,8 +428,18 @@ this checklist is for the iPhone (sideload as above):
    worst moment** card and check the player jumps to that frame and
    **pauses**; and read the numbered cues under **"What to work on"**.
    Tap **Analyse again** and check the strip, card and cues all refresh.
+8. **Export an analysed session** (chainlink #50): with an analysis on
+   screen, tap **Export video** — the progress bar must climb from 0 to
+   100 %, and **Cancel** mid-way must go straight back to the button with
+   no file left behind. When it finishes tap **Share video** → **Save
+   Video**, then open the clip **in Photos** and check the **skeleton
+   lines up with your body** (upright and unmirrored, even for a recording
+   made sideways), the **strip runs along the bottom** with its white
+   playhead, and the footer shows the date. Leave the session and come
+   back: the export is gone from the phone's Caches and can be made again
+   with one tap.
 
 Everything stays on the phone: no networking, no analytics, recordings are
 not uploaded anywhere. The app ships the home, record, history, analysis,
-stress-diagram overlay, summary (heat strip, worst moment, cues),
-video-pick and about screens.
+stress-diagram overlay, summary (heat strip, worst moment, cues), annotated
+video export, video-pick and about screens.

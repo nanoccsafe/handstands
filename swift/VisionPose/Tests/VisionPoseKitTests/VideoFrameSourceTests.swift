@@ -293,6 +293,44 @@ final class VideoFrameSourceTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(capped, Self.frameCount / 2 - 2)
         XCTAssertLessThanOrEqual(capped, Self.frameCount / 2 + 2)
     }
+
+    // MARK: - The display size
+
+    /// `displaySize()` is the reader's own measurement — the same track find
+    /// and `preferredTransform` → quarter-turn resolution `open()` takes,
+    /// factored out so chainlink #50's export can configure its writer
+    /// *before* it reads a frame. It must agree with the frames `frames()`
+    /// then delivers, upright clip and quarter-turn clip alike.
+    func testDisplaySizeAgreesWithTheFramesItWouldRead() async throws {
+        let (upright, uprightDirectory) = try await writeVideo()
+        defer { try? FileManager.default.removeItem(at: uprightDirectory) }
+
+        let size = try await VideoFrameSource(url: upright, maxFps: 0).displaySize()
+        XCTAssertEqual(size, CGSize(width: 64, height: 128), "an upright clip reads as stored")
+        let uprightFrames = try await collect(VideoFrameSource(url: upright, maxFps: 0))
+        XCTAssertEqual(CVPixelBufferGetWidth(uprightFrames[0].buffer), Int(size.width))
+        XCTAssertEqual(CVPixelBufferGetHeight(uprightFrames[0].buffer), Int(size.height))
+
+        let (sideways, sidewaysDirectory) = try await writeVideo(
+            transform: CGAffineTransform(rotationAngle: .pi / 2))
+        defer { try? FileManager.default.removeItem(at: sidewaysDirectory) }
+        let asset = AVURLAsset(url: sideways)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw XCTSkip("the written clip has no track to read a transform off")
+        }
+        let preferred = try await track.load(.preferredTransform)
+        guard preferred != .identity else {
+            throw XCTSkip("AVAssetWriter did not keep the quarter-turn transform")
+        }
+
+        let display = try await VideoFrameSource(url: sideways, maxFps: 0).displaySize()
+        XCTAssertEqual(
+            display, CGSize(width: 128, height: 64),
+            "the stored height is the display width")
+        let sidewaysFrames = try await collect(VideoFrameSource(url: sideways, maxFps: 0))
+        XCTAssertEqual(CVPixelBufferGetWidth(sidewaysFrames[0].buffer), Int(display.width))
+        XCTAssertEqual(CVPixelBufferGetHeight(sidewaysFrames[0].buffer), Int(display.height))
+    }
 }
 
 /// A `PoseService` that only counts: no Vision, no model, no image of a
