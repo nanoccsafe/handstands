@@ -21,12 +21,16 @@ struct AnalysisPanel: View {
     var body: some View {
         switch service.state {
         case .idle:
-            Button(startLabel, action: onStart)
-                .buttonStyle(.borderedProminent)
+            startButton
         case .running(let progress):
             running(progress)
         case .finished(let summary):
             results(summary)
+            // Done is not the end: the run can be repeated from here (the
+            // button the task's checklist taps — "Analyse again" once the
+            // row has been analysed), without leaving and re-opening the
+            // screen.
+            startButton
         case .failed(let message):
             Text(message)
                 .font(.footnote)
@@ -38,6 +42,14 @@ struct AnalysisPanel: View {
     }
 
     // MARK: - The states
+
+    /// The button that starts a run — the same control in `.idle` and under
+    /// a finished run's results, so the label the screen chose ("Analyse" /
+    /// "Analyse again") reads the same wherever it appears.
+    private var startButton: some View {
+        Button(startLabel, action: onStart)
+            .buttonStyle(.borderedProminent)
+    }
 
     /// Working: how far (a percentage a person can read off a glance) and a
     /// way out. The screen stays awake while this is on (`isIdleTimerDisabled`
