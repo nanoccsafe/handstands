@@ -34,6 +34,8 @@ swift/HandstandCore/
 │   ├── Rotation.swift                  handstand.rotation
 │   ├── PostProcess.swift               handstand.postprocess (#39)
 │   ├── Phases.swift                    handstand.phases — the segmenter, phases only (#40)
+│   ├── CentreOfMass.swift              handstand.com — the segment model and balance (#81)
+│   ├── Features.swift                  handstand.features — per-frame features + hold rows (#81)
 │   ├── BodyFrame.swift                 handstand.bodyframe
 │   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
@@ -41,6 +43,8 @@ swift/HandstandCore/
     ├── RotationTests.swift             mirrors pipeline/tests/test_rotation.py
     ├── PostProcessTests.swift          golden parity + the postprocess step tests (#39)
     ├── PhasesTests.swift               golden parity + the phase segmenter tests (#40)
+    ├── CentreOfMassTests.swift         mirrors pipeline/tests/test_com.py (#81)
+    ├── FeaturesTests.swift             golden parity + the feature tests (#81)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
     ├── FramingCheckTests.swift         whole body in frame / cut off / too small / alone (#46)
     ├── PoseFrameTests.swift            midpoint / isValid
@@ -85,7 +89,12 @@ Conventions the sources keep, so the package builds for **both iOS and macOS**:
   post-process, in the section below (chainlink #39).
 * `PhaseSegmenter` — `handstand.phases`: one label (`pre`, `kickup`, `hold`,
   `exit`, `post`, `unknown`) and one hold number per frame, in the section
-  below (chainlink #40; features are #81).
+  below (chainlink #40).
+* `CentreOfMass` — `handstand.com`: where the body's centre of mass sits over
+  the hands, which way the athlete faces and which side of the base of support
+  it is on, in the section below (chainlink #81).
+* `Features` — `handstand.features`: the 14 per-frame features, the balance
+  columns and the per-hold summary, in the section below (chainlink #81).
 * `BodyFrame` — `handstand.bodyframe.to_body_frame` /
   `body_frame_points` / `midpoint`: origin at the wrist midpoint, `u` to the
   right, `v` up, divided by `L`. A `body_length` that is not a positive finite
@@ -235,9 +244,9 @@ pass through a hold instead of ending it), and a clip with no body length
 comes back with every frame `unknown`, `hold_id` -1 and Python's
 `"no body length (… px)"` reason — Swift's description of a `Double` agrees
 with Python's `repr` on every value that path produces. The features, the
-centre of mass and the hold summary are chainlink #81; the parquet / CSV
-writing, the segments table, the `ClipStats` summary, the overlay and the CLI
-are **not** ported.
+centre of mass and the hold summary are chainlink #81's, in the two sections
+below; the parquet / CSV writing, the segments table, the `ClipStats` summary,
+the overlay and the CLI are **not** ported.
 
 `PhasesTests.testEveryGoldenFixtureMatchesThePythonPhases` runs all five
 golden fixtures of chainlink #25 through `PostProcess.process` and the
@@ -247,6 +256,131 @@ names the case, the frame, `t_ms`, both answers and that frame's signals. The
 other tests mirror the unit cases of `pipeline/tests/test_phases.py` on tiny
 hand-made trajectories written in the body frame (the wrist midpoint is the
 origin, `LENGTH` = 300 px).
+
+## CentreOfMass (chainlink #81)
+
+`Sources/HandstandCore/CentreOfMass.swift` mirrors
+`pipeline/handstand/com.py`: where the body's centre of mass is over the
+hands, which way the athlete faces, and which side of the base of support it
+sits on. The input is one clip's joints **already in the body frame** — the
+`BodyTrack` that `Features.bodyFrameTrack` builds, origin at the wrist
+midpoint, `u` right, `v` up, units of `L` — and the answer is in the same
+units, so "the CoM is at 0.02 L" is a distance a judge could see.
+
+1. **Segment model** — `centreOfMass(uv:joints:)` is the mass-weighted mean of
+   Winter's twelve segments: head + neck and trunk on the midline, and the
+   upper arm, forearm + hand, thigh, shank and foot on **both** sides. The
+   helpers (`points`, `point`, `midpoint`, `sideMean`, `along`, `headPoints`,
+   `segmentPoints`, `midlinePoints`) are `internal` statics, so `@testable
+   import` reaches them the way the Python tests reach the module functions;
+   a shape Python refuses with a `ValueError` throws the same message text.
+2. **Which way is forward** — `facingSign(shoulderMid:hipMid:nose:)` reads the
+   nose's side of the shoulder→hip torso line (`+1` towards `+u`; `NaN`
+   without a nose, on the line, or with no line at all), and
+   `majorityPerHold(_:holdId:)` decides it **per hold**: every frame of a hold
+   takes the sign most of its frames voted for, frames outside a hold keep
+   their own, and a tie — or no finite vote — keeps its frames as they were.
+3. **Balance** — `comForward` is `com_u × facing_sign` (the CoM in anatomical
+   rather than image coordinates), and `balanceZone` cuts it at the base of
+   support: `under` behind the heel of the hand, `over` in front of the
+   fingertips, `ok` in between, `nil` where there is no CoM.
+
+The constants, each the Python module constant of the same name:
+
+| Python | value | Swift |
+|---|---|---|
+| `MASS_HEAD_NECK`, `MASS_TRUNK` | 0.081, 0.497 | `CentreOfMass.massHeadNeck`, `.massTrunk` |
+| `MASS_UPPER_ARM`, `MASS_FOREARM_HAND` | 0.028, 0.022 | `massUpperArm`, `massForearmHand` |
+| `MASS_THIGH`, `MASS_SHANK`, `MASS_FOOT` | 0.100, 0.0465, 0.0145 | `massThigh`, `massShank`, `massFoot` |
+| `COM_HEAD_NECK`, `COM_TRUNK` | 1.0, 0.5 | `comHeadNeck`, `comTrunk` |
+| `COM_UPPER_ARM`, `COM_FOREARM_HAND` | 0.436, 0.682 | `comUpperArm`, `comForearmHand` |
+| `COM_THIGH`, `COM_SHANK`, `COM_FOOT` | 0.433, 0.433, 0.5 | `comThigh`, `comShank`, `comFoot` |
+| `HEAD_FALLBACK` | 0.5 | `headFallback` |
+| `BASE_BACK`, `BASE_FRONT` | 0.03, 0.06 | `CentreOfMass.baseBack`, `.baseFront` (public) |
+| `SEGMENT_SOURCE`, `ZONE_NAMES` | Winter (2009); `under`/`ok`/`over` | `segmentSource`, `zoneNames` |
+
+Three rules the parity check is really about, all in the Python docstrings: a
+segment missing on **one** side is measured on the other side's *coordinates*
+(a side view overlaps the two sides, so nothing is mirrored) while one missing
+on **both** is dropped and the rest renormalised with `complete` false; the
+head's CoM **is** the nose, or 0.5 of the way from the shoulder midpoint
+towards the spine extended past the shoulder when there is no nose — an
+estimated head keeps the frame complete; and a frame with nothing left has no
+CoM: `NaN`, not the mean of nothing.
+
+`CentreOfMassTests` mirrors `pipeline/tests/test_com.py` case for case (13
+tests, the same hand-written poses and the same pencil-checkable expectations).
+
+## Features (chainlink #81)
+
+`Sources/HandstandCore/Features.swift` mirrors the measurement half of
+`pipeline/handstand/features.py`: every per-frame number the scorer will read,
+and one row per hold. The entry points are
+`Features.extract(tMs:processed:phases:trainerContact:)` → `ClipFeatures` and
+`Features.holdRows(_:)` → `[HoldSummaryRow]`; the helpers (`bodyFrameTrack`,
+`pixelMidpoint`, `bodyFeatures`, `groupMidpoint`, `sideMean`, `sideAngle`,
+`bothSides`, `angleBetween`, `angleAt`, `rowMax`, `facingSign`, `banana`,
+`head`, `distance`, `ratio`, `unusableFeatures`, `applyHoldFacing`, `spread`,
+`holdStability`, `median`, `populationSD`, `roundedScalar`) are `internal`.
+
+What it does, in the order the pipeline runs it:
+
+1. **Body frame** — `bodyFrameTrack` is `BodyFrame.toBodyFrame` over a whole
+   clip, one frame at a time, with the origin the wrist midpoint of *each*
+   frame (one visible wrist is enough; none is a frame whose body frame was
+   never placed, so every joint comes back `NaN` rather than a position
+   measured against the image's own origin).
+2. **Geometry** — `bodyFeatures` measures `Features.all`, in Python's order:
+   the four stacking offsets (`off_shoulder`…`off_ankle`), `line_deviation`
+   (the worst of them, `NaN` only when all four are unmeasured), `body_angle`,
+   the four interior joint angles averaged over the sides, `banana` (signed
+   towards the nose's side of the shoulder→ankle line), `head`, then the two
+   features that *are* a measurement between the two sides and so need both:
+   `leg_separation` and `hand_width`.
+3. **Centre of mass and balance** — `CentreOfMass.centreOfMass` on the same
+   track, the per-frame `facing_sign`, `com_forward` and `balance_zone`.
+4. **Hold facing** — `applyHoldFacing` replaces the per-frame facing with the
+   hold's majority vote and recomputes `com_forward` and `balance_zone`; the
+   CoM itself is not touched.
+5. **Hold summary** — `holdRows` gives every feature's median and IQR over the
+   hold's *measurable* frames, the hold's frame counts, times and duration,
+   and `holdStability`'s eight balance columns.
+
+The constants, each the Python module constant of the same name; they are
+statics rather than a config struct, and `Features.all` **is** `FEATURES`:
+
+| Python | value | Swift |
+|---|---|---|
+| `MIN_SEGMENT_L` | 1e-9 | `Features.minSegmentL` |
+| `LINE_TOLERANCE_L`, `BODY_ANGLE_TOL_DEG` | 0.1 L, 10° | `lineToleranceL`, `bodyAngleTolDeg` |
+| `PIKE_HIP_DEG`, `OPEN_SHOULDER_DEG` | 165°, 160° | `pikeHipDeg`, `openShoulderDeg` |
+| `STRAIGHT_KNEE_DEG`, `BENT_ELBOW_DEG` | 165°, 160° | `straightKneeDeg`, `bentElbowDeg` |
+| `BANANA_TOLERANCE_L`, `HEAD_FLEXION_DEG`, `SPLIT_DEG` | 0.1 L, 60°, 30° | `bananaToleranceL`, `headFlexionDeg`, `splitDeg` |
+| `_LENGTH_DIGITS`, `_ANGLE_DIGITS` | 5, 2 | `lengthDigits`, `angleDigits` |
+| `FEATURES` | 14 specs (name, unit, target, digits) | `Features.all: [FeatureSpec]` |
+| `COM_COLUMNS` | `com_u`, `com_v`, `facing_sign`, `com_forward` | `comColumns` (the other two are `ClipFeatures.comComplete` / `.balanceZone`) |
+| `HOLD_STABILITY` | 8 balance columns + their digits | `balanceStats: [BalanceStat]`, `holdStabilityNames` |
+| `HOLD_SUMMARY_COLUMNS` | the hold table's columns | `holdSummaryColumns` (minus `clip_id` and `source`, which Swift does not carry) |
+
+Three rules the parity check is really about: a feature the frame could not
+support is **`NaN`, never a number made of nothing**, and `valid` is what a
+later stage filters on (a trainer in front of the camera makes the frame
+invalid but leaves its numbers in the table); a left/right pair is the mean of
+both where both are and the one that is where only one is, except
+`leg_separation` and `hand_width`, which need both; and the hold summary
+rounds like Python's `round(x, d)` — half to even on the binary value — with
+`NaN` left as `NaN`. The tables (`feature_table`), the parquet / CSV writing,
+the `ClipStats` summary, the TOLERANCES fault list, the plots and the CLI are
+**not** ported.
+
+`FeaturesTests.testEveryGoldenFixtureMatchesThePythonFeatures` runs all five
+golden fixtures of chainlink #25 through `PostProcess.process`,
+`PhaseSegmenter.classify` and `Features.extract`, and compares every column of
+`expected.features` and every numeric key of `expected.hold_summary` at
+`meta.tolerances` (1e-3), with `null` ⇔ `NaN`, `balance_zone` and the hold's
+integer fields exact; a mismatch names the case, the frame or hold, the column
+and both values. The other tests mirror the core of
+`pipeline/tests/test_features.py` on poses written by hand in the body frame.
 
 ## Running the tests
 
