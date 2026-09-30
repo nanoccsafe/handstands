@@ -1,8 +1,9 @@
 import SwiftUI
 
 /// The home screen: the app title, the one-line summary of what it is for,
-/// and the two things it can do. Capture (chainlink #46) leads to the live
-/// camera screen; analysis (chainlink #47) still leads to a placeholder.
+/// and the things it can do. Capture (chainlink #46) leads to the live
+/// camera screen, History (#51) to what has been recorded, and analysis
+/// (#47) still leads to a placeholder.
 struct ContentView: View {
     var body: some View {
         NavigationStack {
@@ -31,6 +32,17 @@ struct ContentView: View {
                     AnalyseVideoView()
                 } label: {
                     Label("Analyse a video", systemImage: "film")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+
+                // Everything recorded, newest first (chainlink #51) —
+                // local SwiftData, no network behind it.
+                NavigationLink {
+                    HistoryView()
+                } label: {
+                    Label("History", systemImage: "clock.arrow.circlepath")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)

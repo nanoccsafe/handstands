@@ -1,5 +1,6 @@
 import AVFoundation
 import HandstandCore
+import SwiftData
 import SwiftUI
 import UIKit
 
@@ -15,6 +16,10 @@ import UIKit
 struct RecordView: View {
     @State private var model = CaptureService()
     @Environment(\.dismiss) private var dismiss
+    /// Where a finished take is written into History (chainlink #51): the
+    /// same container the app's `.modelContainer(...)` opens, handed to the
+    /// service the moment the screen appears.
+    @Environment(\.modelContext) private var context
     /// The last hold the user picked, remembered per device. Read through
     /// `HoldType.resolved`, so a fresh install — and any stale stored value —
     /// shows Line.
@@ -45,6 +50,13 @@ struct RecordView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             model.holdType = holdType
+            // History (chainlink #51): the store a finished take is
+            // recorded into. Without a folder there is no store — the video
+            // would not be writable either, and `reconcile()` on the
+            // History screen is the backstop for anything missed here.
+            if let directory = try? RecordingFile.directory() {
+                model.sessionStore = SessionStore(context: context, recordingsDirectory: directory)
+            }
             await model.start()
         }
         .onChange(of: holdType) { _, selected in

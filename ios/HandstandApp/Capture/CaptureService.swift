@@ -53,6 +53,13 @@ final class CaptureService {
     /// The session the preview layer displays (set once the engine exists).
     private(set) var session: AVCaptureSession?
 
+    /// Where a finished take is recorded into History (chainlink #51).
+    /// Injected by `RecordView` from its environment's `modelContext`; when
+    /// it is nil (a screen without a container) nothing here fails — the
+    /// video is still written, and `reconcile()` adds it to History the
+    /// next time that screen opens.
+    var sessionStore: SessionStore?
+
     /// The hold the picker shows. The Record screen keeps it in step with
     /// `@AppStorage("holdType")`; it is copied into `activeTake` the moment
     /// recording starts, so a tap on the picker afterwards cannot rewrite
@@ -228,24 +235,39 @@ final class CaptureService {
             let take = activeTake ?? (hold: HoldType.default, startedAt: Date())
             activeTake = nil
             finishedHoldType = take.hold
+            let metadata = RecordingMetadata(
+                holdType: take.hold,
+                recordedAt: take.startedAt,
+                appVersion: RecordingMetadata.currentAppVersion
+            )
             do {
-                try RecordingMetadata(
-                    holdType: take.hold,
-                    recordedAt: take.startedAt,
-                    appVersion: RecordingMetadata.currentAppVersion
-                ).write(for: url)
+                try metadata.write(for: url)
             } catch {
                 errorMessage = "The recording was kept, but its sidecar could not be written: "
                     + error.localizedDescription
             }
             // The done screen shows what the *file* says, not what the
-            // stopwatch said — same VideoInfo the picker screen reads.
+            // stopwatch said — same VideoInfo the picker screen reads. The
+            // same read feeds History (chainlink #51): one Session row per
+            // recording, right after the sidecar that describes it.
             Task { [weak self] in
+                let info: VideoInfo
                 do {
-                    let info = try await VideoInfoReader.read(url: url)
-                    self?.finished = info
+                    info = try await VideoInfoReader.read(url: url)
                 } catch {
                     self?.errorMessage = "The recording could not be read back: \(error.localizedDescription)"
+                    return
+                }
+                guard let self else { return }
+                self.finished = info
+                do {
+                    _ = try self.sessionStore?.add(movie: url, metadata: metadata, info: info)
+                } catch {
+                    // Never at the cost of the video: the take stays on
+                    // disk and `reconcile()` (History's `.task`) adds it
+                    // the next time that screen opens.
+                    self.errorMessage = "The recording was kept, but it is missing from History for now: "
+                        + error.localizedDescription
                 }
             }
         case let .failure(error):
