@@ -44,6 +44,14 @@ targets:
     platform: iOS
     sources:
       - path: HandstandApp
+      # The user's scoring reference (chainlink #28) lives here — never in
+      # git (`.gitignore`), so the folder is usually absent and the build
+      # must work without it: `optional: true` skips it when missing, and
+      # when present its files are bundled as resources, which is where
+      # ReferenceLoader finds `reference-line.json`. See docs/ios.md.
+      - path: LocalResources
+        optional: true
+        buildPhase: resources
     # The Info.plist itself is generated from this file by xcodegen (and is
     # git-ignored like the project); the camera / photo-library strings are
     # the ones the system shows in its permission prompts.

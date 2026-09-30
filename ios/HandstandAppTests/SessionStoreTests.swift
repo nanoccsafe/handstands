@@ -343,6 +343,7 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(session.holdCount, 3)
         XCTAssertEqual(session.longestHoldS, 4.2)
         XCTAssertEqual(session.analysisVersion, "analysis-1")
+        XCTAssertNil(session.analysisNote, "a measured clip has no note")
         XCTAssertNotNil(session.analyzedAt)
         // Analysis changes the row, never the file list.
         XCTAssertEqual(try sut.store.sessions().count, 1)
@@ -369,6 +370,63 @@ final class SessionStoreTests: XCTestCase {
 
         XCTAssertNotNil(session.analyzedAt)
         XCTAssertNil(session.clipScore, "analysed without a score stays score-less")
+        XCTAssertEqual(session.holdCount, 2)
+    }
+
+    /// An unmeasurable analysis is still an analysis: `recordAnalysis` is
+    /// called with hold count 0, no score, and the reason in `note` — which
+    /// is what the detail screen and the History row read as "Couldn't
+    /// measure" instead of a hold count of 0.
+    func testRecordAnalysisStoresTheNoteOfAnUnmeasurableClip() throws {
+        let sut = try makeSUT()
+        defer { try? FileManager.default.removeItem(at: sut.directory) }
+        let movie = try makeMovie(named: "20260928-143059.mov", in: sut.directory)
+        let session = try sut.store.add(
+            movie: movie,
+            metadata: nil,
+            info: VideoInfo(duration: 10, width: 1080, height: 1920)
+        )
+        XCTAssertNil(session.analysisNote, "a fresh recording has no note")
+
+        try sut.store.recordAnalysis(
+            for: session,
+            score: nil,
+            holdCount: 0,
+            longestHoldS: 0,
+            version: "vision-1",
+            note: "thigh was measurable on 0 frame(s), need 10"
+        )
+
+        XCTAssertEqual(session.analysisNote, "thigh was measurable on 0 frame(s), need 10")
+        XCTAssertNil(session.clipScore)
+        XCTAssertEqual(session.holdCount, 0)
+        XCTAssertEqual(session.longestHoldS, 0)
+        XCTAssertNotNil(session.analyzedAt, "it was analysed — just not measured")
+        XCTAssertEqual(session.analysisVersion, "vision-1")
+    }
+
+    /// A later, measurable run overwrites the note: the row shows the
+    /// numbers then, not the old failure.
+    func testRecordAnalysisWithoutANoteClearsAnEarlierOne() throws {
+        let sut = try makeSUT()
+        defer { try? FileManager.default.removeItem(at: sut.directory) }
+        let movie = try makeMovie(named: "20260928-143059.mov", in: sut.directory)
+        let session = try sut.store.add(
+            movie: movie,
+            metadata: nil,
+            info: VideoInfo(duration: 10, width: 1080, height: 1920)
+        )
+        try sut.store.recordAnalysis(
+            for: session, score: nil, holdCount: 0, longestHoldS: 0,
+            version: "vision-1", note: "no body length"
+        )
+
+        try sut.store.recordAnalysis(
+            for: session, score: 0.87, holdCount: 2, longestHoldS: 4.2, version: "vision-1"
+        )
+
+        XCTAssertNil(session.analysisNote)
+        XCTAssertEqual(session.clipScore, 0.87)
         XCTAssertEqual(session.holdCount, 2)
     }
 }

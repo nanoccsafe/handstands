@@ -168,18 +168,24 @@ final class SessionStore {
     /// now): when it was scored, how it scored, and which run did it. A
     /// `nil` score is allowed — it records "analysed, no score", and
     /// `SessionProgress` keeps it out of the numbers.
+    ///
+    /// `note` is why the clip could not be measured (an unusable analysis:
+    /// hold count 0, score `nil`), `nil` for one that was measured — it is
+    /// written every time, so a later good run clears an earlier note.
     func recordAnalysis(
         for session: Session,
         score: Double?,
         holdCount: Int,
         longestHoldS: Double,
-        version: String
+        version: String,
+        note: String? = nil
     ) throws {
         session.analyzedAt = Date()
         session.clipScore = score
         session.holdCount = holdCount
         session.longestHoldS = longestHoldS
         session.analysisVersion = version
+        session.analysisNote = note
         try context.save()
     }
 

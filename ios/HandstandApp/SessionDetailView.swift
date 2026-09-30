@@ -1,11 +1,14 @@
 import AVKit
+import Foundation
 import HandstandCore
 import SwiftUI
+import UIKit
 
 /// One recording, played (chainlink #51): the movie the row points at,
-/// exactly the facts the list shows beside it, and the one destructive
-/// action in the app — deleting takes the video off the phone too, after
-/// the same confirmation the list uses.
+/// exactly the facts the list shows beside it, the analysis of chainlink #47
+/// (read the frames, run Apple Vision + the pipeline, save the result back
+/// to this row), and the one destructive action in the app — deleting takes
+/// the video off the phone too, after the same confirmation the list uses.
 @MainActor
 struct SessionDetailView: View {
     let session: Session
@@ -19,6 +22,15 @@ struct SessionDetailView: View {
     /// The player for this row's movie, made once — body would otherwise
     /// build a fresh `AVPlayer` (and restart the video) on every redraw.
     @State private var player: AVPlayer?
+    /// The analysis of this row: button, progress, results. Owned here, so
+    /// leaving the screen stops a run in flight (see `onDisappear`).
+    @State private var service = AnalysisService()
+
+    /// Is a run in flight — the state the screen has to stay awake for.
+    private var isAnalysing: Bool {
+        if case .running = service.state { return true }
+        return false
+    }
 
     var body: some View {
         List {
@@ -42,12 +54,56 @@ struct SessionDetailView: View {
                     "Frame",
                     value: VideoInfoFormatter.pixelSize(width: session.width, height: session.height)
                 )
-                if let score = session.clipScore {
+                if session.analysisNote != nil {
+                    // Analysed but unmeasurable (no body length): say so
+                    // rather than showing a score that is not there or a
+                    // hold count of 0, which would read as "did not hold".
+                    Text("Couldn't measure")
+                        .foregroundStyle(.secondary)
+                } else if let score = session.clipScore {
                     LabeledContent("Score", value: SessionFormatter.score(score))
-                } else {
+                } else if session.analyzedAt == nil {
                     Text("Not analysed yet")
                         .foregroundStyle(.secondary)
+                } else {
+                    // Analysed but scoreless (no reference in the build, or
+                    // no hold that could be scored): analysed, no number —
+                    // "Not analysed yet" would be wrong.
+                    Text("No score yet")
+                        .foregroundStyle(.secondary)
                 }
+            }
+
+            Section("Analysis") {
+                // What the last run *saved* (chainlink #51's columns), while
+                // the panel has nothing of its own to show: the panel starts
+                // from `.idle` on every visit, so these rows are how a
+                // re-opened session shows the numbers the run reported.
+                if service.state == .idle, session.analyzedAt != nil {
+                    if session.analysisNote != nil {
+                        // The run could not measure this take: no holds to
+                        // list, and a "0" would read as "did not hold".
+                        Text("Couldn't measure")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        if let holds = session.holdCount {
+                            LabeledContent("Holds", value: "\(holds)")
+                        }
+                        if let longest = session.longestHoldS {
+                            LabeledContent(
+                                "Longest hold",
+                                value: String(format: "%.1f s", longest)
+                            )
+                        }
+                    }
+                }
+                // The first end-to-end run in the app (chainlink #47):
+                // frames -> Apple Vision -> Analyzer -> this row.
+                AnalysisPanel(
+                    service: service,
+                    startLabel: session.analyzedAt == nil ? "Analyse" : "Analyse again",
+                    onStart: analyse
+                )
             }
 
             Section {
@@ -65,8 +121,19 @@ struct SessionDetailView: View {
             }
         }
         .onDisappear {
-            // Leaving the screen takes the sound with it.
+            // Leaving the screen takes the sound with it, the analysis with
+            // it (a run nobody is watching must not keep the CPU hot — and
+            // Delete may be what sent this screen away), and the "stay
+            // awake" with it.
             player?.pause()
+            service.cancel()
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+        .onChange(of: isAnalysing) { _, analysing in
+            // The run takes seconds and the screen dims in ten: keep it
+            // awake while it runs, and only while it runs — restored the
+            // moment it finishes, fails or is cancelled.
+            UIApplication.shared.isIdleTimerDisabled = analysing
         }
         .confirmationDialog(
             "Delete this recording? The video is removed from the phone.",
@@ -90,6 +157,10 @@ struct SessionDetailView: View {
     }
 
     private func delete() {
+        // A run in flight must not write its result to a row that is about
+        // to go: cancelling bumps the generation, so its save is refused
+        // no matter when it wakes up.
+        service.cancel()
         do {
             try store.delete(session)
             dismiss()
@@ -97,6 +168,20 @@ struct SessionDetailView: View {
             // The row and the video are still there (delete only removes
             // the record once the files are gone), so say what went wrong.
             deletionError = error.localizedDescription
+        }
+    }
+
+    /// The "Analyse" button: this row's movie, this row's hold, saved back
+    /// to this row. `AnalysisService` stops anything already running, so
+    /// every tap means one run.
+    private func analyse() {
+        Task {
+            await service.analyse(
+                movie: store.movieURL(for: session),
+                holdType: session.holdType,
+                session: session,
+                store: store
+            )
         }
     }
 }

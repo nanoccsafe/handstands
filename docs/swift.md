@@ -647,12 +647,30 @@ backend is the default. The app's switchboard already exists:
 backend that does not exist yet), and #47 asks for
 `PoseBackend.vision.makeService()` — no UI, no hard-coded backend further down.
 
+**Reading the video is `VideoFrameSource`** (chainlink #47): the runner's
+decode loop — the track's `preferredTransform` through
+`DisplayTransform.quarterTurns`, `kCVPixelFormatType_32BGRA`, the same
+millisecond `tMs` rounding — packaged as an `AsyncThrowingStream` that
+**pulls** one frame per `next()` instead of pushing them ahead. That is what
+keeps a phone (slower than the decoder) from piling the whole clip up in
+memory, and from ever holding a buffer the next decode would have recycled.
+`maxFps` keeps at most N frames per second — a frame is kept when
+`tMs >= lastKeptTMs + 1000/maxFps - 0.5`, the first always is, `<= 0` keeps
+everything (what a parity run against the runner's CSV wants) — and
+`VideoPoseExtractor.extract(_:service:progress:)` runs a `PoseService` over
+the kept frames: `reset()` once, one `process` per frame, 0…1 progress and
+`Task` cancellation checked between frames. The app's `AnalysisService`
+(#47) drives it off the main actor.
+
 Tests: `swift/VisionPose/Tests/VisionPoseKitTests/` — the y flip, the map-back
 checked against `CoordinateMath`, the `.auto` sequence including `reset()`, the
 rotate modes, the lowest-wrist choice, missing joints and the absent
 `foot_index`, `visibility` == confidence, the empty frame, `tMs` /
-`trainerContact`, `DisplayFrames`, and one smoke test that runs the real
-detector over a blank 64×64 buffer made in the test.
+`trainerContact`, `DisplayFrames`, the video reader
+(`VideoFrameSourceTests`, over a clip each test writes itself with
+`AVAssetWriter`: frame counts, the 30 fps rule, a quarter-turn track's
+display size, extract/reset/progress, cancellation), and one smoke test that
+runs the real detector over a blank 64×64 buffer made in the test.
 
 ## Running the tests
 

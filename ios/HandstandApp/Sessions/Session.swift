@@ -14,7 +14,8 @@ import SwiftData
 /// Everything is on the phone: the container is opened with
 /// `cloudKitDatabase: .none`, there is no network code behind this model.
 ///
-/// The analysis columns (`analyzedAt` … `analysisVersion`) are filled in by
+/// The analysis columns (`analyzedAt` … `analysisVersion`, plus
+/// `analysisNote` for a clip that could not be measured) are filled in by
 /// chainlink #47 once scoring runs on the device; until then they are `nil`,
 /// which the History screens read as "Not analysed yet".
 @Model
@@ -47,6 +48,12 @@ final class Session {
     /// Which scoring run wrote the values above, for when the algorithm
     /// changes and old scores must be told apart from new ones.
     var analysisVersion: String?
+    /// Why the last analysis could not measure this take, in the
+    /// post-process's own words — set only when the clip was *unusable*
+    /// (no body length), `nil` otherwise. Optional, so an existing store
+    /// needs no migration; the screens read it as "Couldn't measure"
+    /// instead of a score or a hold count.
+    var analysisNote: String?
 
     /// The hold as a `HoldType`: unknown raw values (and holds the MVP
     /// cannot record yet) read as Line, via `HoldType.resolved`.
@@ -63,7 +70,8 @@ final class Session {
         clipScore: Double? = nil,
         holdCount: Int? = nil,
         longestHoldS: Double? = nil,
-        analysisVersion: String? = nil
+        analysisVersion: String? = nil,
+        analysisNote: String? = nil
     ) {
         self.movieFilename = movieFilename
         self.recordedAt = recordedAt
@@ -76,5 +84,6 @@ final class Session {
         self.holdCount = holdCount
         self.longestHoldS = longestHoldS
         self.analysisVersion = analysisVersion
+        self.analysisNote = analysisNote
     }
 }
