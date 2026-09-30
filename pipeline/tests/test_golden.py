@@ -19,6 +19,7 @@ is tested against a temporary repository laid out like the main checkout, whose
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import statistics
 import subprocess
@@ -27,7 +28,7 @@ from collections.abc import Mapping
 import numpy as np
 import pytest
 
-from handstand import features, golden, phases, postprocess
+from handstand import features, golden, phases, postprocess, score
 
 #: Where the committed fixtures live — the folder this test guards.
 FIXTURES = golden.default_out_dir()
@@ -165,6 +166,149 @@ def test_every_case_round_trips(case: str) -> None:
     assert not problems, f"{case}:\n" + "\n".join(problems[:25])
 
 
+# --------------------------------------------------------------------------- #
+# The scorer's answers (chainlink #41) and the reference they were scored with
+# --------------------------------------------------------------------------- #
+
+#: Every key ``expected.score.holds[]`` carries, spelled out once so a field
+#: dropped by the generator or added by one side fails here rather than being
+#: quietly un-compared.
+SCORE_HOLD_FIELDS = {
+    "hold_id",
+    "hold_frames",
+    "valid_frames",
+    "hold_start_ms",
+    "hold_end_ms",
+    "hold_duration_s",
+    "score",
+    "reason",
+    "deviation",
+    "penalty",
+    "groups",
+    "values",
+    "z",
+    "top_faults",
+    "missing_groups",
+}
+
+
+@pytest.mark.parametrize("case", golden.CASES)
+def test_every_case_carries_a_score_section(case: str) -> None:
+    """One scored object per hold, the clip's own hold, and nothing left out."""
+    document = fixture(case)
+    section = document["expected"]["score"]
+    assert set(section) == {"holds", "clip_hold_id"}
+    holds = section["holds"]
+    hold_ids = sorted({row["hold_id"] for row in document["expected"]["phases"]} - {-1})
+    assert [hold["hold_id"] for hold in holds] == hold_ids, "one score per hold, in hold_id order"
+    assert len(holds) == document["meta"]["hold_count"]
+    assert section["clip_hold_id"] in hold_ids or section["clip_hold_id"] is None
+
+    for hold in holds:
+        assert set(hold) == SCORE_HOLD_FIELDS
+        for field in (
+            "hold_id",
+            "hold_frames",
+            "valid_frames",
+            "hold_start_ms",
+            "hold_end_ms",
+        ):
+            assert isinstance(hold[field], int), f"{case} hold {hold['hold_id']}: {field}"
+        assert isinstance(hold["hold_duration_s"], float)
+        assert set(hold["groups"]) == {group for group, _, _ in score.GROUPS}
+        assert set(hold["values"]) == set(score.SCORE_FEATURES)
+        assert set(hold["z"]) <= set(score.SCORE_FEATURES)
+        # The score and the reason are each other's absence or presence.
+        if hold["score"] is None:
+            assert hold["reason"] in {"too few valid frames", "nothing to compare"}
+        else:
+            assert hold["reason"] == ""
+            assert 0.0 <= hold["score"] <= 100.0
+        # A group is missing exactly when it is null, and says so twice.
+        assert [name for name, value in hold["groups"].items() if value is None] == hold[
+            "missing_groups"
+        ]
+        for fault in hold["top_faults"]:
+            assert len(fault) == 4
+            assert isinstance(fault[0], str) and fault[0] in score.SCORE_FEATURES
+            for number in fault[1:]:
+                assert number is None or isinstance(number, float)
+
+    # The hold fields are the hold summary's own — a score row and a summary
+    # row describe the same frames, so they must agree field for field.
+    for scored, summary in zip(holds, document["expected"]["hold_summary"], strict=True):
+        for field in (
+            "hold_id",
+            "hold_frames",
+            "valid_frames",
+            "hold_start_ms",
+            "hold_end_ms",
+            "hold_duration_s",
+        ):
+            assert scored[field] == summary[field], f"{case}: hold {scored['hold_id']} {field}"
+
+
+def test_the_score_tolerances_are_declared() -> None:
+    """What ``meta.tolerances`` promises for every score field (#41's own)."""
+    for key, value in {
+        "expected.score.values": 1e-6,
+        "expected.score.z": 1e-4,
+        "expected.score.deviation": 1e-4,
+        "expected.score.penalty": 1e-4,
+        "expected.score.groups": 1e-4,
+        "expected.score.score": 0.1,
+    }.items():
+        assert golden.TOLERANCES[key] == value
+
+
+def test_the_parity_reference_is_committed_and_valid() -> None:
+    """`parity_reference.json` reads back as a schema-v1 reference, and is #41's."""
+    path = FIXTURES / golden.PARITY_REFERENCE_NAME
+    assert path.is_file()
+    loaded = score.load_reference(path)  # markers, numbers and names all checked
+    assert loaded == golden.parity_reference()
+    assert loaded.built_from == golden.PARITY_BUILT_FROM
+    assert "NOT a real reference" in loaded.built_from
+    assert loaded.n_holds > 0
+    assert set(loaded.features) == set(score.SCORE_FEATURES)
+    for mean, sd, count in loaded.features.values():
+        assert math.isfinite(mean)
+        assert sd >= 0.0
+        assert 0 < count <= loaded.n_holds
+
+
+def test_the_parity_reference_is_rebuilt_from_the_committed_inputs() -> None:
+    """The file is derived from the fixtures themselves, not from the generator.
+
+    The five ``input`` sections are the source of truth this way: rebuilding
+    the reference through ``clip_from_frames`` must land on the committed file's
+    numbers exactly (both are rounded to the writing precision).
+    """
+    runs = [golden.run_pipeline(clip_of(fixture(case)), case) for case in golden.CASES]
+    rebuilt = golden.reference_from_runs(runs)
+    assert rebuilt == score.load_reference(FIXTURES / golden.PARITY_REFERENCE_NAME)
+
+
+@pytest.mark.parametrize("case", golden.CASES)
+def test_every_case_scores_the_same_against_the_committed_reference(case: str) -> None:
+    """``expected.score`` is reproducible from the committed file, not just in memory.
+
+    This is the check a Swift port leans on: it decodes ``parity_reference.json``
+    and the fixture, so the two of them together have to produce the stored
+    answers inside ``meta.tolerances``.
+    """
+    document = fixture(case)
+    run = golden.run_pipeline(clip_of(document), document["meta"]["case"])
+    reference = score.load_reference(FIXTURES / golden.PARITY_REFERENCE_NAME)
+    problems = compare(
+        document["expected"]["score"],
+        golden.score_section(run, reference),
+        document["meta"]["tolerances"],
+        "expected.score",
+    )
+    assert not problems, f"{case}:\n" + "\n".join(problems[:25])
+
+
 @pytest.mark.parametrize("case", golden.CASES)
 def test_the_generator_is_deterministic(case: str, tmp_path) -> None:
     """Same seed, identical JSON bytes — twice, written as files."""
@@ -235,18 +379,32 @@ def test_the_generated_clip_is_in_the_keypoint_schema(tmp_path) -> None:
 
 
 def test_the_committed_fixtures_fit_the_size_budget() -> None:
-    total = sum(path.stat().st_size for path in FIXTURES.glob("*.json"))
+    cases = [FIXTURES / f"{case}.json" for case in golden.CASES]
+    reference = FIXTURES / golden.PARITY_REFERENCE_NAME
+    assert all(path.is_file() for path in cases) and reference.is_file()
+    total = sum(path.stat().st_size for path in [*cases, reference])
     assert total <= golden.MAX_FIXTURE_BYTES, f"{total} bytes of committed fixtures"
-    assert len(list(FIXTURES.glob("*.json"))) == len(golden.CASES)
+    # The folder holds the five cases and the parity reference — nothing else,
+    # because every Swift test reads whatever `*.json` it finds there.
+    expected = {f"{case}.json" for case in golden.CASES}
+    expected.add(golden.PARITY_REFERENCE_NAME)
+    assert {path.name for path in FIXTURES.glob("*.json")} == expected
 
 
 def test_no_real_fixture_is_committed_under_swift() -> None:
     """The repo is public: whatever is under ``swift/`` is synthetic by construction."""
-    for path in FIXTURES.glob("*.json"):
+    for case in golden.CASES:
+        path = FIXTURES / f"{case}.json"
         text = path.read_text()
         assert golden.read_fixture(path)["meta"]["mode"] == "synthetic"
         assert "golden_real" not in text
         assert '"seed": null' not in text
+    # The reference beside them is built from those synthetic holds only, and
+    # says so in the one field that describes where its numbers came from.
+    reference = (FIXTURES / golden.PARITY_REFERENCE_NAME).read_text()
+    assert "golden_real" not in reference
+    assert "synthetic golden holds" in reference
+    assert "NOT a real reference" in reference
 
 
 # --------------------------------------------------------------------------- #

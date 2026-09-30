@@ -3,7 +3,7 @@
   "case": "hand_step",
   "mode": "synthetic",
   "generator": "handstand.golden",
-  "generator_version": "1",
+  "generator_version": "2",
   "seed": 20260925,
   "display": {
    "width": 576,
@@ -31,7 +31,13 @@
    "expected.phases.phase": 0.0,
    "expected.phases.hold_id": 0.0,
    "expected.features": 0.001,
-   "expected.hold_summary": 0.001
+   "expected.hold_summary": 0.001,
+   "expected.score.values": 1e-06,
+   "expected.score.z": 0.0001,
+   "expected.score.deviation": 0.0001,
+   "expected.score.penalty": 0.0001,
+   "expected.score.groups": 0.0001,
+   "expected.score.score": 0.1
   }
  },
  "input": [
@@ -689,6 +695,13 @@
   "hold_summary": [
    {"clip_id":"hand_step","source":"golden","hold_id":0,"hold_frames":42,"valid_frames":42,"hold_start_ms":1261,"hold_end_ms":2624,"hold_duration_s":1.363,"off_shoulder_median":0.00062,"off_shoulder_iqr":0.00714,"off_hip_median":0.00149,"off_hip_iqr":0.01533,"off_knee_median":-0.00098,"off_knee_iqr":0.05359,"off_ankle_median":0.00134,"off_ankle_iqr":0.06254,"line_deviation_median":0.03045,"line_deviation_iqr":0.0224,"body_angle_median":0.06,"body_angle_iqr":2.7,"shoulder_angle_median":178.83,"shoulder_angle_iqr":0.0,"hip_angle_median":177.73,"hip_angle_iqr":1.7,"knee_angle_median":179.48,"knee_angle_iqr":2.81,"elbow_angle_median":179.65,"elbow_angle_iqr":0.0,"banana_median":5e-05,"banana_iqr":0.00541,"head_median":29.04,"head_iqr":0.06,"leg_separation_median":2.94,"leg_separation_iqr":0.0,"hand_width_median":1.75,"hand_width_iqr":1e-05,"com_forward_median":0.0073,"com_sway_sd":0.02194,"com_sway_range":0.0698,"com_speed_rms":0.14831,"hip_angle_sd":15.24,"shoulder_angle_sd":1.16,"pct_over":0.0,"pct_under":11.9},
    {"clip_id":"hand_step","source":"golden","hold_id":1,"hold_frames":40,"valid_frames":40,"hold_start_ms":2825,"hold_end_ms":4122,"hold_duration_s":1.297,"off_shoulder_median":-0.07438,"off_shoulder_iqr":0.01002,"off_hip_median":-0.07644,"off_hip_iqr":0.02111,"off_knee_median":-0.08848,"off_knee_iqr":0.03268,"off_ankle_median":-0.09369,"off_ankle_iqr":0.04417,"line_deviation_median":0.09369,"line_deviation_iqr":0.03761,"body_angle_median":-4.05,"body_angle_iqr":1.91,"shoulder_angle_median":167.82,"shoulder_angle_iqr":0.34,"hip_angle_median":177.74,"hip_angle_iqr":0.0,"knee_angle_median":179.49,"knee_angle_iqr":0.0,"elbow_angle_median":159.77,"elbow_angle_iqr":0.37,"banana_median":5e-05,"banana_iqr":0.00039,"head_median":29.06,"head_iqr":0.05,"leg_separation_median":2.94,"leg_separation_iqr":0.0,"hand_width_median":3.84652,"hand_width_iqr":0.1448,"com_forward_median":-0.07193,"com_sway_sd":0.01212,"com_sway_range":0.03361,"com_speed_rms":0.11665,"hip_angle_sd":8.91,"shoulder_angle_sd":0.51,"pct_over":0.0,"pct_under":100.0}
-  ]
+  ],
+  "score": {
+   "holds": [
+    {"hold_id":0,"hold_frames":42,"valid_frames":42,"hold_start_ms":1261,"hold_end_ms":2624,"hold_duration_s":1.363,"score":90.3,"reason":"","deviation":0.386878,"penalty":0.0,"groups":{"stack":0.313525,"shoulder":0.639885,"hip":0.449263,"com":0.137924,"elbows":0.47034,"knees_toes":0.043333,"head":0.415565},"values":{"off_shoulder":0.00062,"off_hip":0.00149,"off_knee":-0.00098,"off_ankle":0.00134,"body_angle":0.055,"line_deviation":0.030445,"shoulder_angle":178.83,"hip_angle":177.73,"knee_angle":179.48,"elbow_angle":179.65,"banana":5e-05,"head":29.04,"leg_separation":2.94,"com_forward":0.0073,"com_sway_sd":0.021937,"hip_angle_sd":15.235058},"z":{"off_shoulder":0.458526,"off_hip":-0.142615,"off_knee":0.054087,"off_ankle":0.260552,"body_angle":0.249654,"line_deviation":-0.715714,"shoulder_angle":0.639885,"hip_angle":0.455258,"knee_angle":0.073333,"elbow_angle":0.47034,"banana":-0.443268,"head":-0.415565,"leg_separation":-0.013333,"com_forward":0.144598,"com_sway_sd":-0.13125,"hip_angle_sd":-1.16159},"top_faults":[["shoulder_angle",178.83,172.983333,0.639885],["elbow_angle",179.65,176.193333,0.47034],["hip_angle",177.73,173.065833,0.455258]],"missing_groups":[]},
+    {"hold_id":1,"hold_frames":40,"valid_frames":40,"hold_start_ms":2825,"hold_end_ms":4122,"hold_duration_s":1.297,"score":73.9,"reason":"","deviation":1.043261,"penalty":0.0,"groups":{"stack":1.510349,"shoulder":0.565645,"hip":0.449751,"com":1.444068,"elbows":2.234002,"knees_toes":0.048333,"head":0.403342},"values":{"off_shoulder":-0.07438,"off_hip":-0.076445,"off_knee":-0.08848,"off_ankle":-0.093685,"body_angle":-4.045,"line_deviation":0.093685,"shoulder_angle":167.815,"hip_angle":177.74,"knee_angle":179.49,"elbow_angle":159.775,"banana":5e-05,"head":29.06,"leg_separation":2.94,"com_forward":-0.071935,"com_sway_sd":0.012123,"hip_angle_sd":8.912852},"z":{"off_shoulder":-2.235729,"off_hip":-1.356272,"off_knee":-1.476008,"off_ankle":-1.643985,"body_angle":-1.628476,"line_deviation":0.721624,"shoulder_angle":-0.565645,"hip_angle":0.456235,"knee_angle":0.083333,"elbow_angle":-2.234002,"banana":-0.443268,"head":-0.403342,"leg_separation":-0.013333,"com_forward":-1.775505,"com_sway_sd":-1.112631,"hip_angle_sd":-1.592111},"top_faults":[["elbow_angle",159.775,176.193333,-2.234002],["com_forward",-0.071935,0.001333,-1.775505],["shoulder_angle",167.815,172.983333,-0.565645]],"missing_groups":[]}
+   ],
+   "clip_hold_id": 0
+  }
  }
 }

@@ -151,6 +151,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Port Scorer + reference loading to Swift, with a Python→Swift scorer parity
+  fixture: `golden.py` now writes `expected.score` per hold and the folder's
+  `parity_reference.json` (synthetic holds, not a real reference), and
+  `HandstandCore.Scorer` mirrors `handstand.score` over
+  `ClipFeatures.tableRounded()` (#41)
 - Weighted z-score scorer (#29)
 - Port FeatureExtractor + CentreOfMass + hold summary to Swift (#81)
 - Port PhaseSegmenter to Swift (phases only; features are #81) (#40)

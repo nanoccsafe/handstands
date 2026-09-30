@@ -4,7 +4,9 @@ One JSON file per case: a **synthetic** clip, the real Python pipeline's answer
 to it, and the tolerance a Swift port may differ by. They are the parity checks
 for the Swift ports of post-process (chainlink #39), phases + features (#40)
 and the scorer (#41): a port is right when it reproduces `expected`, frame by
-frame, inside `meta.tolerances`.
+frame, inside `meta.tolerances`. Beside the five cases sits
+`parity_reference.json`, the reference every `expected.score` was scored
+against (below).
 
 **Parity only, not ground truth.** The stick figures are crude: `banana_hold` has
 far less arch than a real banana or Mexican handstand, and `hand_step` and
@@ -25,8 +27,9 @@ uv run pytest tests/test_golden.py                   # what the tests check
 
 The generator (`pipeline/handstand/golden.py`) draws a kinematic stick figure
 from a timeline — stand, plant, kick up, hold, come down, stand up — and runs
-the **real** `handstand.postprocess`, `handstand.phases` and
-`handstand.features` over it in memory, calling them as libraries. No file ever
+the **real** `handstand.postprocess`, `handstand.phases`,
+`handstand.features` and `handstand.score` over it in memory, calling them as
+libraries. No file ever
 touches the shared data directory, and the coordinates are rounded to the
 writing precision *before* the pipeline sees them, so the committed `input` is
 byte-for-byte the input the committed `expected` was computed from.
@@ -60,7 +63,8 @@ under `swift/`.
   "postprocess": { "body_length": {…}, "frames": [{frame}, …] },
   "phases":      [ {"phase": "hold", "hold_id": 0}, … ],
   "features":    [ {"off_shoulder": 0.0, …}, … ],
-  "hold_summary":[ { … } ]
+  "hold_summary":[ { … } ],
+  "score":       { "holds": [ { … }, … ], "clip_hold_id": 0 }
  }
 }
 ```
@@ -134,6 +138,21 @@ What the three real stages answered.
   feature and the balance columns (`com_forward_median`, `com_sway_sd`,
   `com_sway_range`, `com_speed_rms`, `hip_angle_sd`, `shoulder_angle_sd`,
   `pct_over`, `pct_under`).
+* **`score`** — the scorer's answer (#41), from
+  `handstand.score.score_clip` over the rounded per-frame table
+  (`features.feature_table`, the same numbers the parquet carries) scored
+  against this folder's `parity_reference.json`:
+  * `holds` — one object per hold, in `hold_id` order: `hold_id`,
+    `hold_frames`, `valid_frames`, `hold_start_ms`, `hold_end_ms`,
+    `hold_duration_s` (the `hold_summary` row's own fields, so the two line
+    up), `score` (`null` when the hold is not scored) and `reason` (`""` when
+    it is), `deviation`, `penalty`, `groups` (one entry per group, `null`
+    where the group is missing), `values` (all sixteen `SCORE_FEATURES`,
+    `null` for an unmeasured one), `z` (only the features that could be
+    compared), `top_faults` as `[feature, value, mean, z]` triples and
+    `missing_groups`;
+  * `clip_hold_id` — the `hold_id` of `handstand.score.clip_score` (the
+    longest scored hold), `null` when no hold of the clip was scored.
 
 ### `tolerances`
 
@@ -149,11 +168,37 @@ of the field it covers and the longest match wins (`default` is the fallback):
 | `expected.phases.*` | 0 | a label is not a quantity |
 | `expected.features` | 1e-3 | measured off filtered positions |
 | `expected.hold_summary` | 1e-3 | medians and IQRs of the same |
+| `expected.score.values` | 1e-6 | medians of already-rounded columns |
+| `expected.score.z` | 1e-4 | a z-score from those values and a 6-decimal reference |
+| `expected.score.deviation`, `.penalty` | 1e-4 | weighted sums of those z-scores |
+| `expected.score.groups` | 1e-4 | the mean capped \|z\| over one group |
+| `expected.score.score` | 0.1 | the score carries one decimal |
 
 A comparison walks a value's path (list indices such as `frames.12` are
 dropped), takes the longest key that prefixes it, and compares within it —
 except that booleans, strings and `null` are always compared exactly: a category
-rounded is a different category.
+rounded is a different category. That covers the score's integers
+(`hold_id`, `hold_frames`, `valid_frames`, the times), its `reason`, its
+`missing_groups` and the fault *names* in `top_faults`: those are exact
+whatever a numeric tolerance says.
+
+### `parity_reference.json`
+
+The one reference every fixture's `expected.score` was scored against, in
+`docs/scoring.md`'s schema v1: `schema`/`version`/`signs` markers,
+`built_from`, `n_holds`, and per `SCORE_FEATURES` name the mean, the
+**population** SD and `n` of the hold values of the five synthetic cases (holds
+with at least `MIN_SCORE_FRAMES` valid frames), rounded to the same 1e-6 the
+fixtures write floats at.
+
+**It is not a real reference.** Its `built_from` says so —
+`synthetic golden holds: Python->Swift parity only, NOT a real reference
+(chainlink #80, #28)` — and so does this paragraph: no number in it may be read
+as what a good handstand looks like. Chainlink #28 builds the real reference
+from the labelled clips of #27, and nothing here is a substitute for it. The
+file exists so the Python and the Swift scorer are handed *the same* yardstick
+and the stored `expected.score` can be reproduced from the committed files
+alone (`tests/test_golden.py` re-checks both directions).
 
 ## The cases
 
@@ -169,6 +214,10 @@ rounded is a different category.
 
 `Tests/HandstandCoreTests/GoldenFixtureTests.swift` loads every file through
 `Bundle.module` (the test target copies this whole folder as a resource) and
-checks that it decodes and that the row arrays line up. The ports will decode
+checks that it decodes and that the row arrays line up — the five case files;
+`parity_reference.json` sits in the same folder and is read by name, as a
+reference rather than as a fixture. The ports will decode
 the same shape — `meta.joint_names` is the key that says which joint each
-element of a `valid` array belongs to.
+element of a `valid` array belongs to — and `ScorerTests.swift` runs the whole
+chain to `Scorer.scoreClip` and compares it with `expected.score` against
+`parity_reference.json` at `meta.tolerances`.

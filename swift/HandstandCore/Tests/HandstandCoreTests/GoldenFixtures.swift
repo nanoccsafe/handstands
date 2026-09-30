@@ -130,6 +130,43 @@ enum GoldenFixtures {
         }
     }
 
+    /// A whole JSON document as a tree, for the sections too deep to give a
+    /// `Decodable` shape to without writing that shape down twice —
+    /// `expected.score`, which the scorer's parity test walks field by field
+    /// against `meta.tolerances` the way Python's `tests/test_golden.py`
+    /// does.
+    enum JSONValue: Decodable {
+        case null
+        case bool(Bool)
+        case number(Double)
+        case text(String)
+        case array([JSONValue])
+        case object([String: JSONValue])
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if container.decodeNil() {
+                self = .null
+            } else if let value = try? container.decode(Bool.self) {
+                // Only JSON `true`/`false` decode as a Bool: `JSONSerialization`
+                // (and the decoder built on it) refuses a number here, so `1`
+                // falls through to the number case.
+                self = .bool(value)
+            } else if let value = try? container.decode(Double.self) {
+                self = .number(value)
+            } else if let value = try? container.decode(String.self) {
+                self = .text(value)
+            } else if let value = try? container.decode([JSONValue].self) {
+                self = .array(value)
+            } else if let value = try? container.decode([String: JSONValue].self) {
+                self = .object(value)
+            } else {
+                throw DecodingError.dataCorruptedError(
+                    in: container, debugDescription: "unsupported JSON value")
+            }
+        }
+    }
+
     struct Expected: Decodable {
         struct Postprocess: Decodable {
             let bodyLength: BodyLength
@@ -145,12 +182,17 @@ enum GoldenFixtures {
         let phases: [PhaseRow]
         let features: [[String: Value]]
         let holdSummary: [[String: Value]]
+        /// `{"holds": [...], "clip_hold_id": ...}` — the scorer's answers
+        /// (#41), read as a tree because every leaf is a number, a string, a
+        /// `null` or a nested container.
+        let score: JSONValue
 
         enum CodingKeys: String, CodingKey {
             case postprocess
             case phases
             case features
             case holdSummary = "hold_summary"
+            case score
         }
     }
 
@@ -162,12 +204,23 @@ enum GoldenFixtures {
 
     // MARK: - Loading
 
-    /// Every committed fixture, in file-name order so a failure names a stable list.
+    /// The one reference the fixtures' `expected.score` was scored against,
+    /// beside them in `Fixtures/golden/` — `parity_reference.json`.
+    ///
+    /// It is a reference file (`docs/scoring.md`'s schema v1), not a fixture
+    /// document, so `urls()` excludes it and the scorer's parity test loads it
+    /// by name through `parityReferenceData()`.
+    static let parityReferenceName = "parity_reference"
+
+    /// Every committed **fixture**, in file-name order so a failure names a
+    /// stable list. `parity_reference.json` is not one — see above.
     static func urls() -> [URL] {
         let urls =
             Bundle.module.urls(forResourcesWithExtension: "json", subdirectory: "Fixtures/golden")
             ?? []
-        return urls.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        return urls
+            .filter { $0.lastPathComponent != "\(parityReferenceName).json" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     /// The URL of one case, e.g. `url(for: "line_hold")`.
@@ -187,5 +240,17 @@ enum GoldenFixtures {
     /// One case by name, e.g. `load("hand_step")`.
     static func load(_ name: String) throws -> Fixture {
         try load(url(for: name))
+    }
+
+    /// The bytes of `parity_reference.json`, for `ScoreReference.decode`.
+    static func parityReferenceData() throws -> Data {
+        guard let url = Bundle.module.url(
+            forResource: parityReferenceName,
+            withExtension: "json",
+            subdirectory: "Fixtures/golden")
+        else {
+            throw FixtureMissing(name: parityReferenceName)
+        }
+        return try Data(contentsOf: url)
     }
 }
