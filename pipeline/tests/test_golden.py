@@ -714,3 +714,177 @@ def test_real_mode_reports_a_missing_clip_rather_than_writing(tmp_path) -> None:
     """A clip that is not there is a failure of that clip, not of the guard."""
     assert golden.main(["--real", "000000000000", "--real-out", str(tmp_path)]) == 1
     assert list(tmp_path.glob("*.json")) == []
+
+
+# --------------------------------------------------------------------------- #
+# --real takes several ids, --real-sample N takes the first N that hold (#42)
+# --------------------------------------------------------------------------- #
+
+
+def athlete_keypoints_path(data: pathlib.Path, clip_id: str) -> pathlib.Path:
+    """Where ``--real`` looks for one clip's athlete keypoints inside ``data``."""
+    return (
+        data
+        / "keypoints"
+        / postprocess.input_dirname(postprocess.DEFAULT_SOURCE)
+        / postprocess.DEFAULT_ROTATE
+        / f"{clip_id}.parquet"
+    )
+
+
+def write_athlete_keypoints(data: pathlib.Path, clip_id: str, document: Mapping) -> pathlib.Path:
+    """A fixture's ``input`` written where ``--real`` reads athlete keypoints.
+
+    The real keypoints are private and no test touches them; this is the same
+    parquet shape built from a committed **synthetic** fixture, which is all
+    ``real_fixture`` needs to find and read a clip in a temporary data
+    directory.
+    """
+    path = athlete_keypoints_path(data, clip_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clip = golden.clip_from_frames(document["input"], joints_of(document))
+    clip.table.to_parquet(path, index=False)
+    return path
+
+
+def no_hold_document() -> dict:
+    """``line_hold`` turned upside down: the feet under the hands, so nothing holds.
+
+    A reflection in ``y`` is the same body the other way up — the same lengths,
+    the same speeds, the same post-process — but nothing is ever above the
+    hands, so the segmenter finds no hold and ``--real-sample`` has to skip it.
+    """
+    document = fixture("line_hold")
+    heights = [
+        values[1]
+        for row in document["input"]
+        for values in row["joints"].values()
+        if values[1] is not None
+    ]
+    flip = min(heights) + max(heights)
+    for row in document["input"]:
+        for values in row["joints"].values():
+            if values[1] is not None:
+                values[1] = flip - values[1]
+    return document
+
+
+def test_real_clip_ids_lists_the_keypoint_directory_sorted(tmp_path) -> None:
+    """The candidate pool of ``--real-sample``: every clip with keypoints, sorted."""
+    data = tmp_path / "data"
+    write_athlete_keypoints(data, "b_clip", fixture("line_hold"))
+    write_athlete_keypoints(data, "a_clip", fixture("banana_hold"))
+    assert golden.real_clip_ids(data) == ["a_clip", "b_clip"]
+    assert golden.real_clip_ids(tmp_path / "never_generated") == []
+
+
+def test_real_mode_writes_several_clip_ids_in_one_run(tmp_path, capsys) -> None:
+    """``--real`` takes as many ids as the command line gives it: one fixture each."""
+    data = tmp_path / "data"
+    write_athlete_keypoints(data, "clip_a", fixture("line_hold"))
+    write_athlete_keypoints(data, "clip_b", fixture("banana_hold"))
+    out = tmp_path / "out"
+
+    assert (
+        golden.main(["--real", "clip_a", "clip_b", "--data", str(data), "--real-out", str(out)])
+        == 0
+    )
+
+    assert sorted(path.name for path in out.glob("*.json")) == ["clip_a.json", "clip_b.json"]
+    for name in ("clip_a", "clip_b"):
+        assert golden.read_fixture(out / f"{name}.json")["meta"]["mode"] == "real"
+    assert "fail" not in capsys.readouterr().out
+
+
+def test_real_sample_writes_the_first_clip_that_holds_and_notes_the_others(
+    tmp_path, capsys
+) -> None:
+    """Sorted order, keypoints and at least one hold — the others one line each."""
+    data = tmp_path / "data"
+    write_athlete_keypoints(data, "a_no_hold", no_hold_document())
+    write_athlete_keypoints(data, "b_hold", fixture("line_hold"))
+    write_athlete_keypoints(data, "c_hold", fixture("banana_hold"))
+    out = tmp_path / "out"
+
+    assert golden.main(["--real-sample", "1", "--data", str(data), "--real-out", str(out)]) == 0
+
+    # One fixture: the first clip with keypoints *and* a hold. The clip after
+    # it is never even looked at, so it gets no note either.
+    assert [path.name for path in out.glob("*.json")] == ["b_hold.json"]
+    lines = capsys.readouterr().out.splitlines()
+    assert "skip  a_no_hold: no hold" in lines
+    assert sum(line.startswith("skip") for line in lines) == 1
+    assert any(line.startswith("b_hold") and "mode=real" in line for line in lines)
+    assert any(line.startswith("wrote 1 fixture(s)") for line in lines)
+
+
+def test_real_sample_keeps_going_until_it_has_n(tmp_path, capsys) -> None:
+    """Fewer qualifying clips than asked for is not a failure: it writes what is there."""
+    data = tmp_path / "data"
+    write_athlete_keypoints(data, "a_hold", fixture("line_hold"))
+    write_athlete_keypoints(data, "b_no_hold", no_hold_document())
+    write_athlete_keypoints(data, "c_hold", fixture("banana_hold"))
+    out = tmp_path / "out"
+
+    assert golden.main(["--real-sample", "5", "--data", str(data), "--real-out", str(out)]) == 0
+
+    assert sorted(path.name for path in out.glob("*.json")) == ["a_hold.json", "c_hold.json"]
+    text = capsys.readouterr().out
+    assert "skip  b_no_hold: no hold" in text
+    assert "wrote 2 fixture(s)" in text and "requested 5" in text
+
+
+def test_real_sample_skips_an_id_without_keypoints(tmp_path, capsys) -> None:
+    """With ids given they are the candidate pool, sorted: a missing one is a note."""
+    data = tmp_path / "data"
+    write_athlete_keypoints(data, "b_hold", fixture("line_hold"))
+    out = tmp_path / "out"
+
+    assert (
+        golden.main(
+            [
+                "--real",
+                "a_missing",
+                "b_hold",
+                "--real-sample",
+                "1",
+                "--data",
+                str(data),
+                "--real-out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    assert [path.name for path in out.glob("*.json")] == ["b_hold.json"]
+    assert "skip  a_missing: no athlete keypoints" in capsys.readouterr().out
+
+
+def test_real_sample_defaults_to_the_ignored_data_tree(tmp_path, monkeypatch) -> None:
+    """No ``--real-out``: the sample writes to ``<data_dir>/golden_real``, ignored here."""
+    root = checkout_like_the_main_one(tmp_path)
+    monkeypatch.setattr(golden, "repo_root", lambda: root)
+    monkeypatch.setattr(golden, "data_dir", lambda: root / "data")
+    write_athlete_keypoints(root / "data", "clip_a", fixture("line_hold"))
+
+    assert golden.main(["--real-sample", "1"]) == 0
+
+    written = root / "data" / golden.REAL_SUBDIR / "clip_a.json"
+    assert written.is_file()
+    assert golden.read_fixture(written)["meta"]["mode"] == "real"
+
+
+def test_real_sample_is_refused_inside_a_source_tree_like_real(tmp_path) -> None:
+    """The public-repository guard runs before the sample looks at a single clip."""
+    target = golden.repo_root() / "swift" / golden.REAL_SUBDIR
+    assert not target.exists()
+    assert golden.main(["--real-sample", "1", "--real-out", str(target)]) == 2
+    assert not target.exists()
+
+
+def test_real_sample_must_be_at_least_one() -> None:
+    """Zero clips to sample is a usage error, like a ``--frames`` below one."""
+    with pytest.raises(SystemExit) as exit_info:
+        golden.main(["--real-sample", "0"])
+    assert exit_info.value.code == 2

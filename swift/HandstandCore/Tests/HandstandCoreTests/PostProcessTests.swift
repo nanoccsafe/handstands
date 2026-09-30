@@ -61,135 +61,24 @@ final class PostProcessTests: XCTestCase {
         }
     }
 
-    /// The fixture's `input` as the post-process sees it: `[x, y, visibility]`
-    /// with all three `null` is the schema's NaN, i.e. a joint that was not
-    /// seen at all, and a joint with no entry in `joints` is the same thing.
-    private func inputFrames(from fixture: GoldenFixtures.Fixture) -> [PostProcessInputFrame] {
-        fixture.input.map { frame in
-            var joints: [Joint: Keypoint] = [:]
-            for (name, values) in frame.joints {
-                guard let joint = Joint(rawValue: name) else { continue }
-                guard values.count >= 3, let x = values[0], let y = values[1],
-                    let visibility = values[2]
-                else { continue }
-                joints[joint] = Keypoint(x: x, y: y, visibility: visibility)
-            }
-            return PostProcessInputFrame(
-                tMs: frame.tMs,
-                detected: frame.detected,
-                trainerContact: frame.trainerContact,
-                joints: joints
-            )
-        }
-    }
-
     // MARK: - Parity against the golden fixtures of chainlink #25
 
     /// Every committed fixture, decoded, run through `PostProcess.process`
-    /// and compared with `expected.postprocess`: the body length at
+    /// and compared with `expected.postprocess` by the shared
+    /// `GoldenComparison.postprocess`: the body length at
     /// `meta.tolerances["expected.postprocess.body_length"]`, `valid` and
     /// `filled` exactly (booleans are categories, not quantities), and the
     /// joint positions at `meta.tolerances["expected.postprocess.frames.joints"]`.
+    /// The comparison itself lives in `GoldenComparison.swift`, shared with
+    /// `AnalyzerTests` and `RealParityTests` (chainlink #42).
     func testEveryGoldenFixtureMatchesThePythonPostProcess() throws {
         let urls = GoldenFixtures.urls()
         XCTAssertGreaterThanOrEqual(urls.count, 5, "the five committed cases")
         for url in urls {
             let fixture = try GoldenFixtures.load(url)
-            let name = fixture.meta.caseName
-            let processed = PostProcess.process(inputFrames(from: fixture))
-
-            // The body length.
-            let expectedBody = fixture.expected.postprocess.bodyLength
-            let bodyTolerance = try XCTUnwrap(
-                fixture.meta.tolerances["expected.postprocess.body_length"],
-                "\(name): meta.tolerances has no body_length entry"
-            )
-            XCTAssertEqual(
-                processed.bodyLength.usable, expectedBody.usable, "\(name): body_length.usable")
-            XCTAssertEqual(
-                processed.bodyLength.reason, expectedBody.reason, "\(name): body_length.reason")
-            let parts: [(String, Double?, Double?)] = [
-                ("torso_px", processed.bodyLength.torsoPx, expectedBody.torsoPx),
-                ("thigh_px", processed.bodyLength.thighPx, expectedBody.thighPx),
-                ("shin_px", processed.bodyLength.shinPx, expectedBody.shinPx),
-                ("total_px", processed.bodyLength.totalPx, expectedBody.totalPx),
-            ]
-            for (label, mine, theirs) in parts {
-                switch (mine, theirs) {
-                case let (got?, want?):
-                    XCTAssertEqual(
-                        got, want, accuracy: bodyTolerance,
-                        "\(name): body_length.\(label): got \(got), want \(want)")
-                case (nil, nil):
-                    continue
-                default:
-                    XCTFail(
-                        "\(name): body_length.\(label): got \(mine.map { "\($0)" } ?? "nil"), "
-                            + "want \(theirs.map { "\($0)" } ?? "nil")")
-                }
-            }
-            XCTAssertEqual(
-                processed.bodyLength.frames, expectedBody.frames,
-                "\(name): body_length frame counts")
-
-            // valid and filled, exactly.
-            let jointTolerance = try XCTUnwrap(
-                fixture.meta.tolerances["expected.postprocess.frames.joints"],
-                "\(name): meta.tolerances has no frames.joints entry"
-            )
-            XCTAssertEqual(
-                processed.frames.count, fixture.expected.postprocess.frames.count,
-                "\(name): frame count")
-            for (index, row) in fixture.expected.postprocess.frames.enumerated() {
-                let mine = processed.frames[index]
-                for (column, jointName) in fixture.meta.jointNames.enumerated() {
-                    let joint = try XCTUnwrap(
-                        Joint(rawValue: jointName), "\(name): unknown joint \(jointName)")
-                    let at = "frame \(index) \(jointName)"
-                    XCTAssertEqual(
-                        mine.valid.contains(joint), row.valid[column], "\(name): \(at) valid")
-                    XCTAssertEqual(
-                        mine.filled.contains(joint), row.filled[column], "\(name): \(at) filled")
-
-                    // The position, at the joint tolerance.
-                    let pair = try XCTUnwrap(
-                        row.joints[jointName], "\(name): \(at) has no expected position")
-                    guard pair.count == 2 else {
-                        XCTFail("\(name): \(at) expected position is not [x, y]")
-                        continue
-                    }
-                    let wantX = pair[0]
-                    let wantY = pair[1]
-                    guard row.valid[column] else {
-                        if let point = mine.joints[joint] {
-                            XCTFail(
-                                "\(name): \(at): invalid in Python, but Swift has "
-                                    + "(\(point.x), \(point.y))")
-                        }
-                        continue
-                    }
-                    guard let point = mine.joints[joint] else {
-                        XCTFail(
-                            "\(name): \(at): Python has "
-                                + "(\(wantX.map { "\($0)" } ?? "nil"), "
-                                + "\(wantY.map { "\($0)" } ?? "nil")), Swift has none")
-                        continue
-                    }
-                    if let wantX {
-                        XCTAssertEqual(
-                            point.x, wantX, accuracy: jointTolerance,
-                            "\(name): \(at) x: got \(point.x), want \(wantX)")
-                    } else {
-                        XCTFail("\(name): \(at) x: Python has null, Swift has \(point.x)")
-                    }
-                    if let wantY {
-                        XCTAssertEqual(
-                            point.y, wantY, accuracy: jointTolerance,
-                            "\(name): \(at) y: got \(point.y), want \(wantY)")
-                    } else {
-                        XCTFail("\(name): \(at) y: Python has null, Swift has \(point.y)")
-                    }
-                }
+            let processed = PostProcess.process(GoldenFixtures.inputFrames(from: fixture))
+            for mismatch in GoldenComparison.postprocess(processed, fixture: fixture) {
+                XCTFail(mismatch)
             }
         }
     }

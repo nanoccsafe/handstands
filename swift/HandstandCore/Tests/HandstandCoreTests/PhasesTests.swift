@@ -232,84 +232,30 @@ final class PhasesTests: XCTestCase {
         result.phase.lazy.filter { $0 == phase }.count
     }
 
-    /// One frame's signals as a single line, for a parity failure message.
-    private func describe(_ signals: FrameSignals, at index: Int) -> String {
-        guard index < signals.frames else { return "no signals for this frame" }
-        return """
-            known=\(signals.known[index]) reason=\(signals.unknownReason[index]) \
-            v_ankle=\(signals.vAnkleMid[index]) u_ankle=\(signals.uAnkleMid[index]) \
-            v_hip=\(signals.vHipMid[index]) angle=\(signals.bodyAngleDeg[index]) \
-            inverted=\(signals.inverted[index]) hands_low=\(signals.handsLow[index]) \
-            wrist_speed=\(signals.wristSpeedLPerS[index]) wrist_step=\(signals.wristStepL[index]) \
-            hands_down=\(signals.handsDown[index]) hand_step=\(signals.handStep[index]) \
-            legs_velocity=\(signals.legsVelocityLPerS[index]) \
-            legs_rising=\(signals.legsRising[index]) legs_falling=\(signals.legsFalling[index])
-            """
-    }
-
     // MARK: - Parity against the golden fixtures of chainlink #25
 
     /// Every committed fixture, decoded, run through the Swift post-process
     /// and then `PhaseSegmenter.classify`, compared with `expected.phases`
     /// frame by frame at **zero** tolerance, and the hold count with
-    /// `meta.hold_count`. A mismatch names the case, the frame, `t_ms`, both
-    /// answers and that frame's signals.
+    /// `meta.hold_count` — by the shared `GoldenComparison.phases`, so a
+    /// mismatch names the case, the frame, `t_ms`, both answers and that
+    /// frame's signals. The comparison itself lives in
+    /// `GoldenComparison.swift`, shared with `AnalyzerTests` and
+    /// `RealParityTests` (chainlink #42).
     func testEveryGoldenFixtureMatchesThePythonPhases() throws {
         let urls = GoldenFixtures.urls()
         XCTAssertGreaterThanOrEqual(urls.count, 5, "the five committed cases")
         for url in urls {
             let fixture = try GoldenFixtures.load(url)
-            let name = fixture.meta.caseName
-            let processed = PostProcess.process(inputFrames(from: fixture))
+            let processed = PostProcess.process(GoldenFixtures.inputFrames(from: fixture))
             let result = PhaseSegmenter.classify(
                 tMs: fixture.input.map(\.tMs),
                 processed: processed,
                 trainerContact: fixture.input.map(\.trainerContact)
             )
-
-            guard result.phase.count == fixture.expected.phases.count else {
-                XCTFail(
-                    "\(name): frame count: Python \(fixture.expected.phases.count), "
-                        + "Swift \(result.phase.count)")
-                continue
+            for mismatch in GoldenComparison.phases(result, fixture: fixture) {
+                XCTFail(mismatch)
             }
-            for (index, row) in fixture.expected.phases.enumerated() {
-                guard result.phase[index].rawValue == row.phase,
-                    result.holdId[index] == row.holdId
-                else {
-                    let tMs = index < fixture.input.count ? fixture.input[index].tMs : -1
-                    XCTFail(
-                        "\(name): frame \(index) t_ms=\(tMs): "
-                            + "Python \(row.phase)/\(row.holdId), "
-                            + "Swift \(result.phase[index].rawValue)/\(result.holdId[index])\n"
-                            + "signals: \(describe(result.signals, at: index))")
-                    break
-                }
-            }
-            XCTAssertEqual(
-                result.holdCount, fixture.meta.holdCount, "\(name): meta.hold_count")
-        }
-    }
-
-    /// The fixture's `input` as the post-process sees it: `[x, y, visibility]`
-    /// with all three `null` is the schema's NaN, i.e. a joint that was not
-    /// seen at all, and a joint with no entry in `joints` is the same thing.
-    private func inputFrames(from fixture: GoldenFixtures.Fixture) -> [PostProcessInputFrame] {
-        fixture.input.map { frame in
-            var joints: [Joint: Keypoint] = [:]
-            for (name, values) in frame.joints {
-                guard let joint = Joint(rawValue: name) else { continue }
-                guard values.count >= 3, let x = values[0], let y = values[1],
-                    let visibility = values[2]
-                else { continue }
-                joints[joint] = Keypoint(x: x, y: y, visibility: visibility)
-            }
-            return PostProcessInputFrame(
-                tMs: frame.tMs,
-                detected: frame.detected,
-                trainerContact: frame.trainerContact,
-                joints: joints
-            )
         }
     }
 

@@ -20,6 +20,7 @@ for one, with the expectations hard-coded in both.
 | `swift/VisionPose/` | the Apple Vision keypoint runner (chainlink #15) — a separate package, untouched by this work |
 | `ios/` | the app (chainlink #44) that will import `HandstandCore` |
 | `tools/mac/swift_test.sh` | build and test a package on the Mac mini, from Linux |
+| `tools/mac/real_parity.sh` | the real-clip parity run: fixtures → the Mac → `RealParityTests` (chainlink #42) |
 | `docs/swift.md` | this note |
 
 `HandstandCore` is one library product with two targets and **no third-party
@@ -37,6 +38,7 @@ swift/HandstandCore/
 │   ├── CentreOfMass.swift              handstand.com — the segment model and balance (#81)
 │   ├── Features.swift                  handstand.features — per-frame features + hold rows (#81)
 │   ├── Scorer.swift                    handstand.score — the weighted z-score scorer + reference (#41)
+│   ├── Analyzer.swift                  the whole chain, one entry point (#42)
 │   ├── BodyFrame.swift                 handstand.bodyframe
 │   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
@@ -47,6 +49,9 @@ swift/HandstandCore/
     ├── CentreOfMassTests.swift         mirrors pipeline/tests/test_com.py (#81)
     ├── FeaturesTests.swift             golden parity + the feature tests (#81)
     ├── ScorerTests.swift               golden parity (expected.score) + the scorer tests (#41)
+    ├── AnalyzerTests.swift             the end-to-end chain over every fixture (#42)
+    ├── RealParityTests.swift           the same over real clips, skipped without HANDSTAND_REAL_GOLDEN (#42)
+    ├── GoldenComparison.swift          the one comparison every parity test runs (#42)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
     ├── FramingCheckTests.swift         whole body in frame / cut off / too small / alone (#46)
     ├── PoseFrameTests.swift            midpoint / isValid
@@ -100,6 +105,10 @@ Conventions the sources keep, so the package builds for **both iOS and macOS**:
 * `Scorer` — `handstand.score`: the weighted z-score of each hold against a
   reference of good holds, and the reference file's own reader, in the section
   below (chainlink #41).
+* `Analyzer` — the whole chain behind one call, `Analyzer.analyze(_:reference:)`
+  → `Analysis` (`processed`, `phases`, `features`, `holdScores`, `clipScore`),
+  in the section below (chainlink #42). It wires the four ports above; it
+  contains no maths of its own.
 * `BodyFrame` — `handstand.bodyframe.to_body_frame` /
   `body_frame_points` / `midpoint`: origin at the wrist midpoint, `u` to the
   right, `v` up, divided by `L`. A `body_length` that is not a positive finite
@@ -463,6 +472,110 @@ two "not scored" reasons, invalid frames and hold −1 ignored, the population
 SD, `clip_score`, reference validation — plus `tableRounded`'s half-way
 rounding checked against numpy's answers.
 
+## Analyzer (chainlink #42)
+
+`Sources/HandstandCore/Analyzer.swift` is the whole on-device chain behind one
+entry point — what `handstand.golden.run_pipeline` plus the scorer's run over
+it do in Python, in the same order:
+
+```swift
+Analyzer.analyze(_ frames: [PostProcessInputFrame], reference: ScoreReference?) -> Analysis
+```
+
+`Analysis` bundles what each stage answered: `processed` (`PostProcess.process`),
+`phases` (`PhaseSegmenter.classify`), `features` (`Features.extract`) and — with
+a reference — `holdScores` (`Scorer.scoreClip`) plus `clipScore`
+(`Scorer.clipScore`). With `reference == nil` the scores are **empty** rather
+than guessed: scoring against no reference is something the pipeline never
+does. `analyze` calls the stages with exactly the arguments the per-stage
+parity tests pass (`tMs` and the raw `trainerContact` flags through the chain);
+no new maths lives here, so a fix belongs in the stage that computed the
+number and lands in this chain for free.
+
+### The end-to-end test
+
+`AnalyzerTests.testEveryFixtureMatchesTheWholePythonChain` runs all five
+synthetic fixtures through `analyze` with the folder's own
+`parity_reference.json` and compares **all** of `expected` in one test —
+`postprocess`, `phases`, `features`, `hold_summary` (through
+`Features.holdRows`) and `score` — at `meta.tolerances`.
+
+The comparison itself is `Tests/HandstandCoreTests/GoldenComparison.swift`:
+one function per section returning a list of mismatch strings (case, frame or
+hold, key, both values and the tolerance), which the per-stage tests
+(`PostProcessTests`, `PhasesTests`, `FeaturesTests`, `ScorerTests`) report
+through `XCTFail` as well — one comparison implementation, so the per-stage
+and the end-to-end checks cannot drift into two different statements. The
+scorer's per-field tolerance lookup moved there with the score walk, and its
+unit test (`ScorerTests.testTheScoreToleranceLookupMapsEachFieldToItsOwnKey`)
+still pins it down. Nothing was made more lenient in the move: categories
+(`valid`/`filled`, phase labels, hold ids, `balance_zone`, integers, `null`)
+stay exact and every number keeps the tolerance `meta.tolerances` declares
+for its own dotted path.
+
+`AnalyzerTests.testWithoutAReferenceThereAreNoScores` covers the other half of
+the contract (no reference → no scores, every earlier stage still ran), and
+`testTheChainIsTheStagesCalledInOrder` that `analyze` really is the stages
+wired together — field by field, because `FrameSignals` and the feature
+columns hold `NaN` and `NaN != NaN` would call two identical runs different.
+
+### The real-clip parity
+
+The synthetic fixtures are crude (chainlink #80), so the check that counts
+runs the chain over **real** clips, on the Mac:
+
+```bash
+tools/mac/real_parity.sh        # 20 clips, the default
+tools/mac/real_parity.sh 5      # five of them
+tools/mac/real_parity.sh 20 wt/other-parity   # a different remote directory
+```
+
+What it does, from the repo root on Linux:
+
+1. `cd pipeline && uv run python -m handstand.golden --real-sample N` — the
+   first N clips (sorted by clip id) that have athlete keypoints **and** at
+   least one hold, written to `<data_dir>/golden_real/<clip_id>.json`; the
+   others are skipped with a one-line note (`skip <id>: no hold`, `skip <id>:
+   no athlete keypoints`), and `golden --real` likewise takes several ids in
+   one run (`--real <id> <id> …`).
+2. The repo's synthetic `Fixtures/golden/parity_reference.json` is copied
+   beside the fixtures so the directory is self-contained.
+3. `<data_dir>/golden_real/` is rsynced to `macmini:~/handstand-private/golden_real/`,
+   and `swift/` to `macmini:wt/real-parity/swift/` through the same
+   `swift_sync` function `swift_test.sh` uses (`tools/mac/swift_sync.sh`).
+4. On the Mac:
+
+   ```bash
+   HANDSTAND_REAL_GOLDEN=~/handstand-private/golden_real swift test --filter RealParityTests
+   ```
+
+   `RealParityTests` reads every `*.json` in that directory (`parity_reference.json`
+   excluded), asserts `meta.mode == "real"` for each, runs `Analyzer.analyze`
+   with the reference beside them and compares every section with
+   `GoldenComparison` at the fixture's own tolerances. It reports **all**
+   mismatching clips rather than stopping at the first: per clip, the
+   mismatch count of each section and the first three mismatch strings of
+   each, then one summary line `real parity: X/Y clips identical` — which is
+   also what it fails on, so the script exits non-zero if any clip differs.
+
+Where the private data lives, and what never happens to it:
+
+* `<data_dir>/golden_real/` on Linux — inside the git-ignored data tree, and
+  `golden.require_outside_repo` refuses to write real fixtures anywhere git
+  would commit them: never under `swift/`, `ios/`, `pipeline/` or `docs/`,
+  ignore rules or not.
+* `~/handstand-private/golden_real/` on the Mac — a private folder **outside**
+  `~/wt` and `~/GitRepo`, created if missing; the script's rsync runs without
+  `--delete`, never touches `~/GitRepo`, and never uses `sudo`.
+* Nothing derived from the real videos is ever committed. The fixtures under
+  `Fixtures/golden/` are the five synthetic cases —
+  `GoldenFixtureTests.testEveryFixtureUnderSwiftIsSynthetic` and
+  `pipeline/tests/test_golden.py::test_no_real_fixture_is_committed_under_swift`
+  pin that down — and `golden_real` stays out of git with the rest of `data/`.
+* Without `HANDSTAND_REAL_GOLDEN` (a plain `swift test`) `RealParityTests`
+  skips with a message saying how to point it at the data, so the public tree
+  alone is always enough to build and test.
+
 ## Running the tests
 
 Swift cannot build on Linux, so the tests run on the Mac mini. From the repo
@@ -485,7 +598,10 @@ What it does:
 4. exit non-zero if the rsync, the build or the tests failed.
 
 The Mac is `macmini` by default; override it with `HANDSTAND_MAC_HOST` if your
-SSH config names it differently.
+SSH config names it differently. The rsync itself lives in
+`tools/mac/swift_sync.sh`, which this script and `tools/mac/real_parity.sh`
+share. The real-clip parity run has its own driver —
+`tools/mac/real_parity.sh`, described in the Analyzer section above.
 
 To check the package still builds for iOS (the app's platform, which macOS
 tests do not exercise):

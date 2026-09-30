@@ -25,7 +25,8 @@ CLI::
     cd pipeline
     uv run python -m handstand.golden                       # regenerate every case
     uv run python -m handstand.golden --only line_hold hand_step
-    uv run python -m handstand.golden --real 6508f9b355bd   # local-only, never under swift/
+    uv run python -m handstand.golden --real 6508f9b355bd 6f2a11c07e42   # local-only
+    uv run python -m handstand.golden --real-sample 20      # the first 20 that hold
 
 What is in a fixture
 --------------------
@@ -112,6 +113,7 @@ __all__ = [
     "parity_reference",
     "parity_reference_payload",
     "read_fixture",
+    "real_clip_ids",
     "real_fixture",
     "recompute",
     "reference_from_runs",
@@ -1434,6 +1436,28 @@ def real_fixture(
     }
 
 
+def real_clip_ids(
+    data: str | pathlib.Path | None = None,
+    *,
+    rotate: str = postprocess.DEFAULT_ROTATE,
+    source: str = postprocess.DEFAULT_SOURCE,
+) -> list[str]:
+    """Every clip id with athlete keypoints under ``<data>/keypoints/…``, sorted.
+
+    The candidates :func:`main`'s ``--real-sample`` picks from: one
+    ``<clip_id>.parquet`` per clip in the very directory :func:`real_fixture`
+    reads, so a name here is a clip whose keypoints exist. Sorted by clip id —
+    the order the sample takes them in. An empty list when that directory is
+    not there yet (nothing generated): there is nothing to sample, and saying
+    so is better than raising on an empty data tree.
+    """
+    root = pathlib.Path(data) if data is not None else data_dir()
+    directory = root / "keypoints" / postprocess.input_dirname(source) / rotate
+    if not directory.is_dir():
+        return []
+    return sorted(path.stem for path in directory.glob("*.parquet"))
+
+
 def _sidecar_display(parquet_path: pathlib.Path) -> tuple[int, int] | None:
     """The clip's display size, from its own sidecar or from the one it was read from.
 
@@ -1686,6 +1710,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"where --real writes (default: <data_dir>/{REAL_SUBDIR})",
     )
     parser.add_argument(
+        "--real-sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "instead of (or on top of) --real's ids: the first N clips, sorted "
+            "by clip_id, that have athlete keypoints and at least one hold; the "
+            "others are skipped with a one-line note. With no ids given, the "
+            "candidates are every clip under the data directory"
+        ),
+    )
+    parser.add_argument(
         "--data",
         type=pathlib.Path,
         default=None,
@@ -1713,14 +1749,71 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_real_sample(
+    args: argparse.Namespace, root: pathlib.Path, target: pathlib.Path
+) -> int:
+    """The ``--real-sample N`` run: the first ``N`` qualifying clips, nothing else.
+
+    Candidates are ``--real``'s own ids when those were given (sorted, so the
+    sample is the same whatever order the command line used) and every clip
+    with athlete keypoints under ``root`` otherwise — see :func:`real_clip_ids`.
+    A candidate qualifies when its keypoints exist **and** the pipeline finds
+    at least one hold in it; anything else is skipped with one line saying
+    which of the two it was, and the run carries on until ``N`` fixtures are
+    written or the candidates run out. Skipping is normal — most clips do not
+    hold — so only a candidate the stages themselves refuse counts as a
+    failure of the run (exit 1).
+    """
+    candidates = (
+        sorted(set(args.real))
+        if args.real is not None
+        else real_clip_ids(root, rotate=args.rotate, source=args.source)
+    )
+    written = skipped = failed = 0
+    for clip_id in candidates:
+        if written >= args.real_sample:
+            break
+        try:
+            fixture = real_fixture(
+                clip_id,
+                data=root,
+                rotate=args.rotate,
+                source=args.source,
+                frames=args.frames,
+            )
+        except FileNotFoundError:
+            print(f"skip  {clip_id}: no athlete keypoints", flush=True)
+            skipped += 1
+            continue
+        except (ValueError, KeyError) as error:
+            print(f"fail  {clip_id}: {error}", flush=True)
+            failed += 1
+            continue
+        if int(fixture["meta"]["hold_count"]) < 1:
+            print(f"skip  {clip_id}: no hold", flush=True)
+            skipped += 1
+            continue
+        path = write_fixture(target, fixture)
+        written += 1
+        print(_line(fixture, path), flush=True)
+    wanted = int(args.real_sample)
+    print(
+        f"wrote {written} fixture(s) to {target} "
+        f"(requested {wanted}, skipped {skipped}, failed {failed})"
+    )
+    return 1 if failed else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Write the fixtures and print one summary line per clip. See the module docstring."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if args.frames < 1:
         parser.error("--frames must be >= 1")
+    if args.real_sample is not None and args.real_sample < 1:
+        parser.error("--real-sample must be >= 1")
 
-    if args.real is not None:
+    if args.real is not None or args.real_sample is not None:
         root = pathlib.Path(args.data) if args.data is not None else data_dir()
         target = args.real_out if args.real_out is not None else root / REAL_SUBDIR
         try:
@@ -1728,8 +1821,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ValueError as error:
             print(f"golden: {error}")
             return 2
+        if args.real_sample is not None:
+            return _write_real_sample(args, root, target)
         failures = 0
-        for clip_id in args.real:
+        for clip_id in args.real or ():
             try:
                 fixture = real_fixture(
                     clip_id,

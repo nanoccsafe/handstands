@@ -330,186 +330,38 @@ final class FeaturesTests: XCTestCase {
         [Pose](repeating: pose, count: count)
     }
 
-    /// The fixture's `input` as the post-process sees it — the same helper the
-    /// other parity tests use.
-    private func inputFrames(from fixture: GoldenFixtures.Fixture) -> [PostProcessInputFrame] {
-        fixture.input.map { frame in
-            var joints: [Joint: Keypoint] = [:]
-            for (name, values) in frame.joints {
-                guard let joint = Joint(rawValue: name) else { continue }
-                guard values.count >= 3, let x = values[0], let y = values[1],
-                    let visibility = values[2]
-                else { continue }
-                joints[joint] = Keypoint(x: x, y: y, visibility: visibility)
-            }
-            return PostProcessInputFrame(
-                tMs: frame.tMs,
-                detected: frame.detected,
-                trainerContact: frame.trainerContact,
-                joints: joints
-            )
-        }
-    }
-
     // MARK: - Parity against the golden fixtures of chainlink #25
 
     /// Every committed fixture, decoded, run through the Swift post-process,
     /// the phase segmenter and `Features.extract`, then compared with
     /// `expected.features` (per frame, per column) and `expected.hold_summary`
-    /// (per hold) at `meta.tolerances`. A number must be within the tolerance
-    /// and a `null` must be a `NaN` — and `balance_zone`, the hold's integer
-    /// fields and the two identity columns are compared exactly, because a
-    /// category is not a quantity.
+    /// (per hold) at `meta.tolerances` — by the shared
+    /// `GoldenComparison.features` and `GoldenComparison.holdSummary`: a
+    /// number must be within the tolerance and a `null` must be a `NaN` — and
+    /// `balance_zone`, the hold's integer fields and the two identity columns
+    /// are compared exactly, because a category is not a quantity. The
+    /// comparison itself lives in `GoldenComparison.swift`, shared with
+    /// `AnalyzerTests` and `RealParityTests` (chainlink #42).
     func testEveryGoldenFixtureMatchesThePythonFeatures() throws {
         let urls = GoldenFixtures.urls()
         XCTAssertGreaterThanOrEqual(urls.count, 5, "the five committed cases")
 
         for url in urls {
             let fixture = try GoldenFixtures.load(url)
-            let name = fixture.meta.caseName
             let tMs = fixture.input.map(\.tMs)
             let trainerContact = fixture.input.map(\.trainerContact)
-            let processed = PostProcess.process(inputFrames(from: fixture))
+            let processed = PostProcess.process(GoldenFixtures.inputFrames(from: fixture))
             let phases = PhaseSegmenter.classify(
                 tMs: tMs, processed: processed, trainerContact: trainerContact)
             let features = Features.extract(
                 tMs: tMs, processed: processed, phases: phases, trainerContact: trainerContact)
-            let tolerance = try XCTUnwrap(
-                fixture.meta.tolerances["expected.features"],
-                "\(name): meta.tolerances has no features entry")
-
-            // Per frame, per column.
-            XCTAssertEqual(
-                features.frames, fixture.expected.features.count, "\(name): feature rows")
-            for (index, row) in fixture.expected.features.enumerated() {
-                for column in fixture.meta.featureColumns {
-                    let want = row[column] ?? .missing
-                    if column == "balance_zone" {
-                        let zone = features.balanceZone[index]
-                        switch want {
-                        case .text(let word):
-                            XCTAssertEqual(
-                                zone?.rawValue, word,
-                                "\(name): frame \(index) column balance_zone: "
-                                    + "Python \(word), Swift \(zone.map { "\($0)" } ?? "nil")")
-                        case .missing:
-                            XCTAssertNil(
-                                zone,
-                                "\(name): frame \(index) column balance_zone: "
-                                    + "Python null, Swift \(zone.map { "\($0)" } ?? "nil")")
-                        case .number:
-                            XCTFail(
-                                "\(name): frame \(index) column balance_zone: "
-                                    + "the fixture has a number where the port has a zone")
-                        }
-                        continue
-                    }
-                    let mine = features.value(column)
-                    guard index < mine.count else {
-                        XCTFail("\(name): frame \(index): Swift has no column \(column)")
-                        continue
-                    }
-                    switch want {
-                    case .number(let expected):
-                        if mine[index].isFinite {
-                            XCTAssertEqual(
-                                mine[index], expected, accuracy: tolerance,
-                                "\(name): frame \(index) column \(column): "
-                                    + "Python \(expected), Swift \(mine[index])")
-                        } else {
-                            XCTFail(
-                                "\(name): frame \(index) column \(column): "
-                                    + "Python \(expected), Swift NaN")
-                        }
-                    case .missing:
-                        XCTAssertTrue(
-                            mine[index].isNaN,
-                            "\(name): frame \(index) column \(column): "
-                                + "Python null, Swift \(mine[index])")
-                    case .text(let word):
-                        XCTFail(
-                            "\(name): frame \(index) column \(column): "
-                                + "Python text \(word), Swift \(mine[index])")
-                    }
-                }
+            for mismatch in GoldenComparison.features(features, fixture: fixture) {
+                XCTFail(mismatch)
             }
-
-            // One row per hold.
-            let summaryTolerance = try XCTUnwrap(
-                fixture.meta.tolerances["expected.hold_summary"],
-                "\(name): meta.tolerances has no hold_summary entry")
-            let rows = Features.holdRows(features)
-            XCTAssertEqual(
-                rows.count, fixture.expected.holdSummary.count, "\(name): hold rows")
-            let exactFields: Set<String> = [
-                "hold_id", "hold_frames", "valid_frames", "hold_start_ms", "hold_end_ms",
-            ]
-            for (index, want) in fixture.expected.holdSummary.enumerated() {
-                let row = rows[index]
-                let label = "\(name): hold \(index) (\(row.holdId))"
-                for field in exactFields {
-                    guard let value = want[field] else {
-                        XCTFail("\(label): fixture row has no \(field)")
-                        continue
-                    }
-                    guard case .number(let number) = value else {
-                        XCTFail("\(label): \(field) is not a number in the fixture")
-                        continue
-                    }
-                    let mine: Int
-                    switch field {
-                    case "hold_id": mine = row.holdId
-                    case "hold_frames": mine = row.holdFrames
-                    case "valid_frames": mine = row.validFrames
-                    case "hold_start_ms": mine = row.holdStartMs
-                    default: mine = row.holdEndMs
-                    }
-                    XCTAssertEqual(
-                        mine, Int(number), "\(label): column \(field)")
-                }
-                if let value = want["hold_duration_s"] {
-                    guard case .number(let expected) = value else {
-                        XCTFail("\(label): hold_duration_s is not a number")
-                        continue
-                    }
-                    XCTAssertEqual(
-                        row.holdDurationS, expected, accuracy: summaryTolerance,
-                        "\(label): column hold_duration_s: Python \(expected), "
-                            + "Swift \(row.holdDurationS)")
-                }
-
-                // Every other key of the row is a stat, and every stat is one
-                // of those keys: nothing is left un-compared either way.
-                let nonStats: Set<String> = exactFields.union([
-                    "clip_id", "source", "hold_duration_s",
-                ])
-                var comparedStats = Set<String>()
-                for (key, value) in want where !nonStats.contains(key) {
-                    comparedStats.insert(key)
-                    guard let mine = row.stats[key] else {
-                        XCTFail("\(label): Swift has no stat \(key)")
-                        continue
-                    }
-                    switch value {
-                    case .number(let expected):
-                        if mine.isFinite {
-                            XCTAssertEqual(
-                                mine, expected, accuracy: summaryTolerance,
-                                "\(label): column \(key): Python \(expected), Swift \(mine)")
-                        } else {
-                            XCTFail(
-                                "\(label): column \(key): Python \(expected), Swift NaN")
-                        }
-                    case .missing:
-                        XCTAssertTrue(
-                            mine.isNaN, "\(label): column \(key): Python null, Swift \(mine)")
-                    case .text(let word):
-                        XCTFail("\(label): column \(key): Python text \(word)")
-                    }
-                }
-                XCTAssertEqual(
-                    Set(row.stats.keys), comparedStats,
-                    "\(label): the stats Swift writes are not the fixture's columns")
+            for mismatch in GoldenComparison.holdSummary(
+                Features.holdRows(features), fixture: fixture)
+            {
+                XCTFail(mismatch)
             }
         }
     }

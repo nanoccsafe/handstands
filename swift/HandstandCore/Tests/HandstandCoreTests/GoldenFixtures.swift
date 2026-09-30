@@ -1,5 +1,7 @@
 import Foundation
 
+import HandstandCore
+
 /// The golden fixture schema of chainlink #25, shared by every test that
 /// reads `Fixtures/golden/*.json`: the `meta`, `input` and `expected`
 /// sections exactly as `pipeline/handstand/golden.py` writes them, plus the
@@ -135,7 +137,7 @@ enum GoldenFixtures {
     /// `expected.score`, which the scorer's parity test walks field by field
     /// against `meta.tolerances` the way Python's `tests/test_golden.py`
     /// does.
-    enum JSONValue: Decodable {
+    enum JSONValue: Decodable, Equatable {
         case null
         case bool(Bool)
         case number(Double)
@@ -252,5 +254,29 @@ enum GoldenFixtures {
             throw FixtureMissing(name: parityReferenceName)
         }
         return try Data(contentsOf: url)
+    }
+
+    /// The fixture's `input` as the post-process sees it — the conversion
+    /// every parity test and `AnalyzerTests` start from, spelled once:
+    /// `[x, y, visibility]` with all three `null` is the schema's NaN (a
+    /// joint that was not seen at all), and a joint with no entry in
+    /// `joints` is the same thing.
+    static func inputFrames(from fixture: Fixture) -> [PostProcessInputFrame] {
+        fixture.input.map { frame in
+            var joints: [Joint: Keypoint] = [:]
+            for (name, values) in frame.joints {
+                guard let joint = Joint(rawValue: name) else { continue }
+                guard values.count >= 3, let x = values[0], let y = values[1],
+                    let visibility = values[2]
+                else { continue }
+                joints[joint] = Keypoint(x: x, y: y, visibility: visibility)
+            }
+            return PostProcessInputFrame(
+                tMs: frame.tMs,
+                detected: frame.detected,
+                trainerContact: frame.trainerContact,
+                joints: joints
+            )
+        }
     }
 }
