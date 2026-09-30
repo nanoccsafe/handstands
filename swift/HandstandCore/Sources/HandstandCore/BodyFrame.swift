@@ -55,6 +55,31 @@ public enum BodyFrame {
         return ((x - wristMidX) / scale, (wristMidY - y) / scale)
     }
 
+    /// One body-frame position back in the display frame — the exact inverse
+    /// of `toBodyFrame`: `x = wristMidX + u * bodyLength`,
+    /// `y = wristMidY - v * bodyLength`.
+    ///
+    /// Python has no twin of this (nothing there needs to undo the
+    /// transform), but the stress diagram (#48) does: the centre of mass is
+    /// *measured* in body frames and *drawn* in display pixels, and it must
+    /// land exactly where the feature was measured from — `toBodyFrame` of
+    /// this answer is the `(u, v)` it was given, to the last bit.
+    ///
+    /// Unlike `toBodyFrame` this never throws: a caller that has a usable
+    /// scale got it from `toBodyFrame` (or from `BodyLength.totalPx`, which
+    /// is checked there), and a `bodyLength` of 0, negative or non-finite
+    /// simply maps every point onto the wrist midpoint rather than trapping
+    /// mid-drawing.
+    public static func fromBodyFrame(
+        u: Double,
+        v: Double,
+        wristMidX: Double,
+        wristMidY: Double,
+        bodyLength: Double
+    ) -> (x: Double, y: Double) {
+        (wristMidX + u * bodyLength, wristMidY - v * bodyLength)
+    }
+
     /// A whole batch of display-frame points in the body frame —
     /// `handstand.bodyframe.body_frame_points`, for one clip's joints or a
     /// trajectory. The scale is checked once, up front.
