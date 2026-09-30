@@ -45,14 +45,29 @@ final class CaptureService {
     private(set) var elapsed: TimeInterval = 0
     /// The last finished recording, ready for `RecordingDoneView`.
     private(set) var finished: VideoInfo?
+    /// The hold the take on the done screen was recorded for (chainlink
+    /// #66): the one that was selected when *that* recording started, not
+    /// whatever the picker says now.
+    private(set) var finishedHoldType: HoldType = .default
     private(set) var errorMessage: String?
     /// The session the preview layer displays (set once the engine exists).
     private(set) var session: AVCaptureSession?
+
+    /// The hold the picker shows. The Record screen keeps it in step with
+    /// `@AppStorage("holdType")`; it is copied into `activeTake` the moment
+    /// recording starts, so a tap on the picker afterwards cannot rewrite
+    /// what the sidecar says. Hold type is the only setup the user does —
+    /// wall, steps, camera angle and phases are detected (#72).
+    var holdType: HoldType = .default
 
     private var engine: CaptureEngine?
     private var didStart = false
     private var isShutdown = false
     private var recordStart: Date?
+    /// The take in flight: which hold was selected when the record button
+    /// went down, and when — the sidecar's `hold_type` and `recorded_at`
+    /// come from here (both captured at START).
+    private var activeTake: (hold: HoldType, startedAt: Date)?
     private var ticker: Task<Void, Never>?
 
     /// The sentence under the border — `HandstandCore` decides it.
@@ -164,7 +179,11 @@ final class CaptureService {
             errorMessage = nil
             finished = nil
             elapsed = 0
-            recordStart = Date()
+            // Captured at START: the sidecar records the hold (and the time)
+            // this take began with, whatever the picker says while it runs.
+            let startedAt = Date()
+            recordStart = startedAt
+            activeTake = (hold: holdType, startedAt: startedAt)
             isRecording = true
             startTicker()
             engine.startRecording(url: url)
@@ -201,6 +220,24 @@ final class CaptureService {
     private func recordingFinished(_ result: Result<URL, any Error>) {
         switch result {
         case let .success(url):
+            // The sidecar rides next to the movie (`20260928-143059.json`),
+            // written for every successful recording: the hold captured when
+            // this take started plus its start time. If it cannot be
+            // written, the video is kept — never deleted — and errorMessage
+            // explains the problem.
+            let take = activeTake ?? (hold: HoldType.default, startedAt: Date())
+            activeTake = nil
+            finishedHoldType = take.hold
+            do {
+                try RecordingMetadata(
+                    holdType: take.hold,
+                    recordedAt: take.startedAt,
+                    appVersion: RecordingMetadata.currentAppVersion
+                ).write(for: url)
+            } catch {
+                errorMessage = "The recording was kept, but its sidecar could not be written: "
+                    + error.localizedDescription
+            }
             // The done screen shows what the *file* says, not what the
             // stopwatch said — same VideoInfo the picker screen reads.
             Task { [weak self] in
@@ -212,6 +249,7 @@ final class CaptureService {
                 }
             }
         case let .failure(error):
+            activeTake = nil
             if let writerError = error as? RecordingWriter.WriterError,
                case .noFrames = writerError {
                 errorMessage = "That take was too short to save — hold it a moment longer."

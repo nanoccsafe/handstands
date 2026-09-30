@@ -1,11 +1,15 @@
+import HandstandCore
 import SwiftUI
 
 /// What comes after Stop: the file that was just written, as the same two
 /// numbers the video-picker screen shows — duration and pixel size, read
-/// from the file itself by `VideoInfoReader` — and the two ways out:
-/// another take, or back home.
+/// from the file itself by `VideoInfoReader` — plus the hold this take was
+/// recorded for (chainlink #66), and the two ways out: another take, or
+/// back home.
 struct RecordingDoneView: View {
     let info: VideoInfo
+    /// The hold selected when this recording started — what its sidecar says.
+    let holdType: HoldType
     let onRecordAgain: () -> Void
     let onDone: () -> Void
 
@@ -24,6 +28,7 @@ struct RecordingDoneView: View {
                     "Frame",
                     value: VideoInfoFormatter.pixelSize(width: info.width, height: info.height)
                 )
+                LabeledContent("Hold", value: holdType.displayName)
             }
             .frame(maxWidth: 300)
 
