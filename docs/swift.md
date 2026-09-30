@@ -17,8 +17,8 @@ for one, with the expectations hard-coded in both.
 | path | what |
 |---|---|
 | `swift/HandstandCore/` | SwiftPM package: the port of the pipeline (this issue) |
-| `swift/VisionPose/` | the Apple Vision keypoint runner (chainlink #15) — a separate package, untouched by this work |
-| `ios/` | the app (chainlink #44) that will import `HandstandCore` |
+| `swift/VisionPose/` | the Apple Vision keypoint runner (chainlink #15) and **VisionPoseKit**, the shared `PoseService` backend (chainlink #82) |
+| `ios/` | the app (chainlink #44): `HandstandCore` for the maths, `VisionPoseKit` for the pose backend |
 | `tools/mac/swift_test.sh` | build and test a package on the Mac mini, from Linux |
 | `tools/mac/real_parity.sh` | the real-clip parity run: fixtures → the Mac → `RealParityTests` (chainlink #42) |
 | `docs/swift.md` | this note |
@@ -575,6 +575,84 @@ Where the private data lives, and what never happens to it:
 * Without `HANDSTAND_REAL_GOLDEN` (a plain `swift test`) `RealParityTests`
   skips with a message saying how to point it at the data, so the public tree
   alone is always enough to build and test.
+
+## VisionPoseKit / PoseService (chainlink #82)
+
+`swift/VisionPose` is two packages' worth of work now: `VisionPoseCore` (the
+pure maths) and **VisionPoseKit**, the Apple Vision backend behind one protocol,
+shared by the macOS runner *and* the iOS app:
+
+```swift
+public protocol PoseService: AnyObject {
+    var backendName: String { get }          // "vision"
+    func reset()                             // call before each new clip
+    func process(_ displayFrame: CVPixelBuffer, tMs: Int) throws -> PostProcessInputFrame
+}
+```
+
+`process` takes one frame that is **already in display orientation** — the
+orientation a person watching the video sees — and returns one
+`PostProcessInputFrame`, the input `Analyzer.analyze` takes. Display orientation
+is the caller's job, and `DisplayFrames.displayBuffer(from:transform:)` is the
+shared way to do it: a decoded buffer plus the track's `preferredTransform` in,
+a display-oriented buffer out (`nil` when the track is already upright, so the
+decoder's own buffer is used as it is, with no copy). The runner applies it
+while decoding; chainlink #47 will apply it over the frames it analyses.
+
+Per frame, in this order — exactly what the runner used to do inline:
+
+1. `rotated = rotate.isRotated(autoRotation.rotateNextFrame)`: the `--rotate`
+   mode against the state the previous frames left behind (never rotated for
+   the first frame of a clip).
+2. `detector.detect(frame, rotated:)`: the Vision call, behind the
+   `BodyPoseDetecting` protocol. `VisionBodyPoseDetector` is the real one —
+   one `VNDetectHumanBodyPoseRequest` for the whole clip, `.up`/`.down`
+   orientation as the runner always did — and tests inject a fake, so no test
+   image of a person is ever needed.
+3. Normalised → display pixels: `CoordinateMath.normalizedToPixels` (the y-origin
+   flip) first, then `CoordinateMath.mapBackHalfTurn` when `rotated`, so no
+   rotated coordinate ever escapes.
+4. One `DisplayPerson` per person Vision found: display pixels **with** the
+   confidence beside each point.
+5. `AutoRotation.chosenPose` picks the person reported — the app assumes one
+   athlete, so this is a guard. The full list stays available through
+   `processAll` → `PoseFrameResult.people`, which is what the runner's
+   multi-person CSV rows are built from (`result.rotated` is its `rotated`
+   column).
+6. With `.auto`, `autoRotation.update(with:)` judges the *next* frame from
+   everyone seen now; a frame with nobody keeps the previous decision.
+7. The chosen person becomes a `PostProcessInputFrame`: joints keyed by
+   `HandstandCore.Joint` through `VisionJoint.columnName` (so the 13 joints the
+   skeletons share resolve, and `foot_index` is absent — Vision has no such
+   joint), `visibility` = Vision's confidence, `detected` = a person was found,
+   `trainerContact` = false (no trainer logic on the device).
+
+`reset()` clears the auto-rotation state, so clip two starts exactly where
+clip one did.
+
+**The runner runs this code.** `Sources/vision-pose/RunVisionPose.swift` no
+longer keeps its own copy of the inference, the point mapping or the rotation
+state: it calls `VisionPoseService.processAll`, turns `PoseFrameResult.people`
+into the CSV rows, and lets `DisplayFrames` do the display conversion;
+`VisionBodyPoseDetector` owns the request whose `revision` the run manifest
+records. The CSV itself is unchanged — same columns, same rounding, same row
+order — so a run before and after this issue is byte-identical for the same
+video. What is left in the runner is what only a runner has: decode, the CSV,
+the summary and the manifest.
+
+**MediaPipe comes in chainlink #45**, after the bake-off (#16) decides which
+backend is the default. The app's switchboard already exists:
+`ios/HandstandApp/Pose/PoseBackend.swift` lists `vision` and `mediapipe` with
+`isAvailable`, `displayName` and `makeService() -> PoseService?` (nil for the
+backend that does not exist yet), and #47 asks for
+`PoseBackend.vision.makeService()` — no UI, no hard-coded backend further down.
+
+Tests: `swift/VisionPose/Tests/VisionPoseKitTests/` — the y flip, the map-back
+checked against `CoordinateMath`, the `.auto` sequence including `reset()`, the
+rotate modes, the lowest-wrist choice, missing joints and the absent
+`foot_index`, `visibility` == confidence, the empty frame, `tMs` /
+`trainerContact`, `DisplayFrames`, and one smoke test that runs the real
+detector over a blank 64×64 buffer made in the test.
 
 ## Running the tests
 

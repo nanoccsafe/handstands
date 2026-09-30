@@ -18,14 +18,20 @@
 // * `--rotate 180` and `--rotate auto` hand Vision the frame turned upside down
 //   (via `CGImagePropertyOrientation.down`, which costs no pixel copy) and map
 //   the points back, so no rotated coordinate ever reaches the CSV.
+//
+// Neither happens here any more: per-frame inference, point mapping and the
+// auto-rotation state live in `VisionPoseService`, and the display-orientation
+// conversion in `DisplayFrames` (chainlink #82), so the runner and the iOS app
+// run the same code. What is left below is the parts only a runner has: decode,
+// CSV rows, the report and the manifest.
 
 import AVFoundation
-import CoreImage
 import CoreMedia
 import CoreVideo
 import Foundation
 import Vision
 import VisionPoseCore
+import VisionPoseKit
 
 /// Something that went wrong while decoding or running the model.
 enum RunnerError: Error, CustomStringConvertible {
@@ -33,7 +39,6 @@ enum RunnerError: Error, CustomStringConvertible {
     case cannotStartReading(String)
     case readFailed(String)
     case noPixelBuffer(frame: Int)
-    case pixelBufferAllocation(Int, Int)
     case noFramesDecoded(String)
     case cannotRecognizePoints(Int)
 
@@ -47,8 +52,6 @@ enum RunnerError: Error, CustomStringConvertible {
             return "reading failed: \(message)"
         case .noPixelBuffer(let frame):
             return "frame \(frame) has no pixel buffer"
-        case .pixelBufferAllocation(let width, let height):
-            return "could not allocate a \(width)x\(height) pixel buffer"
         case .noFramesDecoded(let path):
             return "no frames decoded from \(path)"
         case .cannotRecognizePoints(let frame):
@@ -78,51 +81,6 @@ struct ClipReport {
 
     var peopleSummary: String {
         framesByPeople.keys.sorted().map { "\($0):\(framesByPeople[$0]!)" }.joined(separator: " ")
-    }
-}
-
-/// Turns decoded frames into display-orientation frames.
-struct DisplayOrienter {
-    private let transform: AffineTransform2D
-    private let displaySize: PixelSize
-    private let context: CIContext
-
-    init(transform: DisplayTransform) {
-        self.transform = transform.pixelTransform
-        self.displaySize = transform.displaySize
-        // Working in a known colour space keeps the render from shifting the
-        // colours; sRGB is what the pixel buffers are.
-        self.context = CIContext(options: [.workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
-    }
-
-    /// `nil` when the stored frame is already upright, in which case the
-    /// decoder's own buffer is used as it is.
-    func displayBuffer(from pixelBuffer: CVPixelBuffer) throws -> CVPixelBuffer? {
-        if transform.a == 1, transform.b == 0, transform.c == 0, transform.d == 1,
-            transform.tx == 0, transform.ty == 0
-        {
-            return nil
-        }
-        let image = CIImage(cvPixelBuffer: pixelBuffer).transformed(
-            by: CGAffineTransform(
-                a: transform.a, b: transform.b, c: transform.c,
-                d: transform.d, tx: transform.tx, ty: transform.ty
-            )
-        )
-        var rotated: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            displaySize.width,
-            displaySize.height,
-            kCVPixelFormatType_32BGRA,
-            nil,
-            &rotated
-        )
-        guard status == kCVReturnSuccess, let rotated else {
-            throw RunnerError.pixelBufferAllocation(displaySize.width, displaySize.height)
-        }
-        context.render(image, to: rotated)
-        return rotated
     }
 }
 
@@ -200,7 +158,6 @@ struct RunVisionPose {
             storedSize: storedSize
         )
         let displaySize = displayTransform.displaySize
-        let orienter = DisplayOrienter(transform: displayTransform)
 
         // `add`/`startReading`/`copyNextSampleBuffer` are the spellings that
         // have existed since macOS 10.7; the SDK's newer
@@ -224,8 +181,11 @@ struct RunVisionPose {
         defer { try? writer.close() }
         try writer.write(contentsOf: Data((KeypointRow.header + "\n").utf8))
 
-        let request = VNDetectHumanBodyPoseRequest()
-        var auto = AutoRotation()
+        // One detector owns one Vision request for the whole clip (its
+        // `revision` goes into the manifest); the service owns the mapping and
+        // the `--rotate auto` state — the same class the iOS app runs.
+        let detector = VisionBodyPoseDetector()
+        let service = VisionPoseService(rotate: options.rotate, detector: detector)
         var report = ClipReport()
         report.displaySize = displaySize
 
@@ -235,84 +195,39 @@ struct RunVisionPose {
             guard let stored = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                 throw RunnerError.noPixelBuffer(frame: frameIdx)
             }
-            // `nil` from the orienter means the frame is already upright.
-            let display = try orienter.displayBuffer(from: stored) ?? stored
+            // `nil` from `DisplayFrames` means the frame is already upright,
+            // in which case the decoder's own buffer goes to the model.
+            let display = try DisplayFrames.displayBuffer(
+                from: stored, transform: displayTransform
+            ) ?? stored
             let tMs = Int(
                 (CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) * 1000)
                     .rounded()
             )
-            let rotated = options.rotate.isRotated(auto.rotateNextFrame)
 
-            // `.down` is a 180° turn, and telling Vision the orientation is
-            // free where turning the pixels would not be.
-            let handler = VNImageRequestHandler(
-                cvPixelBuffer: display,
-                orientation: rotated ? .down : .up,
-                options: [:]
-            )
+            // The whole per-frame pipeline — Vision, the point mapping, the
+            // `--rotate auto` state — in one call to the shared backend.
+            let result: PoseFrameResult
             do {
-                try handler.perform([request])
-            } catch {
+                result = try service.processAll(display, tMs: tMs)
+            } catch is PoseServiceError {
+                // Which frame failed is the runner's to know, not the kit's.
                 throw RunnerError.cannotRecognizePoints(frameIdx)
             }
+            try write(
+                csvRows(
+                    for: result.people, frameIdx: frameIdx, tMs: tMs,
+                    rotated: result.rotated
+                ),
+                to: writer
+            )
 
-            let observations = request.results ?? []
-            var people: [DisplayPose] = []
-            for (personIdx, observation) in observations.enumerated() {
-                let recognized: [VNHumanBodyPoseObservation.JointName: VNRecognizedPoint]
-                do {
-                    recognized = try observation.recognizedPoints(.all)
-                } catch {
-                    throw RunnerError.cannotRecognizePoints(frameIdx)
-                }
-                var points: [VisionJoint: PixelPoint] = [:]
-                var rows: [KeypointRow] = []
-                for joint in VisionJoint.allCases {
-                    guard let found = recognized[joint.visionJointName] else { continue }
-                    var pixel = try CoordinateMath.normalizedToPixels(
-                        NormalizedPoint(x: found.location.x, y: found.location.y),
-                        in: displaySize
-                    )
-                    if rotated {
-                        pixel = try CoordinateMath.mapBackHalfTurn(pixel, in: displaySize)
-                    }
-                    points[joint] = pixel
-                    rows.append(
-                        KeypointRow(
-                            frameIdx: frameIdx,
-                            tMs: tMs,
-                            personIdx: personIdx,
-                            joint: joint.columnName,
-                            point: pixel,
-                            confidence: Double(found.confidence),
-                            rotated: rotated,
-                            detected: true
-                        )
-                    )
-                }
-                people.append(DisplayPose(points: points))
-                try write(rows, to: writer)
-            }
-            if people.isEmpty {
-                try write(
-                    KeypointRow.missingFrame(
-                        frameIdx: frameIdx,
-                        tMs: tMs,
-                        joints: VisionJoint.columnNames,
-                        rotated: rotated
-                    ),
-                    to: writer
-                )
-            }
-
+            let people = result.people
             report.frameCount += 1
-            report.rotatedFrames += rotated ? 1 : 0
+            report.rotatedFrames += result.rotated ? 1 : 0
             report.detectedFrames += people.isEmpty ? 0 : 1
             report.maxPeople = max(report.maxPeople, people.count)
             report.framesByPeople[people.count, default: 0] += 1
-            if options.rotate == .auto {
-                auto.update(with: people)
-            }
             frameIdx += 1
         }
 
@@ -323,8 +238,47 @@ struct RunVisionPose {
             throw RunnerError.noFramesDecoded(options.videoPath)
         }
         report.runtimeSeconds = Date().timeIntervalSince(started)
-        try writeManifest(options: options, report: report, request: request)
+        try writeManifest(options: options, report: report, request: detector.request)
         return report
+    }
+
+    /// The CSV rows of one frame: one block per person, or the placeholder
+    /// block when nobody was found. Joint order is `VisionJoint.allCases`,
+    /// person order is Vision's — exactly the order the rows have always been
+    /// written in.
+    private static func csvRows(
+        for people: [DisplayPerson],
+        frameIdx: Int,
+        tMs: Int,
+        rotated: Bool
+    ) -> [KeypointRow] {
+        guard !people.isEmpty else {
+            return KeypointRow.missingFrame(
+                frameIdx: frameIdx,
+                tMs: tMs,
+                joints: VisionJoint.columnNames,
+                rotated: rotated
+            )
+        }
+        var rows: [KeypointRow] = []
+        for (personIdx, person) in people.enumerated() {
+            for joint in VisionJoint.allCases {
+                guard let found = person.points[joint] else { continue }
+                rows.append(
+                    KeypointRow(
+                        frameIdx: frameIdx,
+                        tMs: tMs,
+                        personIdx: personIdx,
+                        joint: joint.columnName,
+                        point: found.point,
+                        confidence: found.confidence,
+                        rotated: rotated,
+                        detected: true
+                    )
+                )
+            }
+        }
+        return rows
     }
 
     private static func write(_ rows: [KeypointRow], to writer: FileHandle) throws {

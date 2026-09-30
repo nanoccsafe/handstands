@@ -17,10 +17,13 @@ options:
   createIntermediateGroups: true
 
 # The app links HandstandCore — the package swift_test.sh builds and tests on
-# the Mac — as a local dependency. No network fetch, same sources as Linux.
+# the Mac — and VisionPoseKit (the Apple Vision PoseService backend, chainlink
+# #82) as local dependencies. No network fetch, same sources as Linux.
 packages:
   HandstandCore:
     path: ../swift/HandstandCore
+  VisionPose:
+    path: ../swift/VisionPose
 
 # Applied to every target: CODE_SIGN_STYLE and the (empty by default)
 # DEVELOPMENT_TEAM come from here, never from this file.
@@ -60,6 +63,8 @@ targets:
     dependencies:
       - package: HandstandCore
         product: HandstandCore
+      - package: VisionPose
+        product: VisionPoseKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nanoccsafe.handstand
@@ -77,6 +82,8 @@ targets:
       - target: HandstandApp
       - package: HandstandCore
         product: HandstandCore
+      - package: VisionPose
+        product: VisionPoseKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nanoccsafe.handstand.HandstandAppTests
