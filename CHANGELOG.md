@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- PoseService protocol + Apple Vision backend (VisionPoseKit), shared by app and runner (#82)
 - SessionStore with SwiftData (history, progress) (#51)
 - Hold-type picker in recording flow (MVP: line only, others shown as coming soon) (#66)
 - Epic: HandstandCore Swift package (port of pipeline) (#37)
