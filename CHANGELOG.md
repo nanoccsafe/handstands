@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Port Scorer + reference loading to Swift (with a scorer parity fixture) (#41)
 - Port Scorer + reference loading to Swift, with a Python→Swift scorer parity
   fixture: `golden.py` now writes `expected.score` per hold and the folder's
   `parity_reference.json` (synthetic holds, not a real reference), and
