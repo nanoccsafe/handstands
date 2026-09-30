@@ -177,34 +177,15 @@ final class ScorerTests: XCTestCase {
         return try JSONSerialization.data(withJSONObject: payload)
     }
 
-    /// The fixture's `input` as the post-process sees it — the same helper the
-    /// other parity tests use.
-    private func inputFrames(from fixture: GoldenFixtures.Fixture) -> [PostProcessInputFrame] {
-        fixture.input.map { frame in
-            var joints: [Joint: Keypoint] = [:]
-            for (name, values) in frame.joints {
-                guard let joint = Joint(rawValue: name) else { continue }
-                guard values.count >= 3, let x = values[0], let y = values[1],
-                    let visibility = values[2]
-                else { continue }
-                joints[joint] = Keypoint(x: x, y: y, visibility: visibility)
-            }
-            return PostProcessInputFrame(
-                tMs: frame.tMs,
-                detected: frame.detected,
-                trainerContact: frame.trainerContact,
-                joints: joints
-            )
-        }
-    }
-
-    /// The whole on-device chain over one fixture, as the parity test runs it.
+    /// The whole on-device chain over one fixture, as the parity test runs it —
+    /// `Analyzer.analyze` runs the same stages; this keeps the scorer's own
+    /// test independent of that entry point.
     private func scores(
         of fixture: GoldenFixtures.Fixture, against reference: ScoreReference
     ) -> [HoldScore] {
         let tMs = fixture.input.map(\.tMs)
         let trainerContact = fixture.input.map(\.trainerContact)
-        let processed = PostProcess.process(inputFrames(from: fixture))
+        let processed = PostProcess.process(GoldenFixtures.inputFrames(from: fixture))
         let phases = PhaseSegmenter.classify(
             tMs: tMs, processed: processed, trainerContact: trainerContact)
         let features = Features.extract(
@@ -217,10 +198,11 @@ final class ScorerTests: XCTestCase {
     /// Every committed fixture, run through the Swift post-process, the phase
     /// segmenter, the features and the scorer, then compared with
     /// `expected.score` at `meta.tolerances` — the whole document, walked
-    /// leaf by leaf: a number must be within the tolerance, a `null` must be
-    /// `nil`/`NaN`, and integers, the `reason`, `missing_groups` and the
-    /// top-fault names are exact because they are not quantities. A mismatch
-    /// names the case, the hold, the key and both values.
+    /// leaf by leaf by the shared `GoldenComparison.score` (chainlink #42):
+    /// a number must be within the tolerance, a `null` must be `nil`/`NaN`,
+    /// and integers, the `reason`, `missing_groups` and the top-fault names
+    /// are exact because they are not quantities. A mismatch names the case,
+    /// the hold, the key and both values.
     func testEveryGoldenFixtureMatchesThePythonScores() throws {
         let reference = try ScoreReference.decode(GoldenFixtures.parityReferenceData())
         let urls = GoldenFixtures.urls()
@@ -228,12 +210,12 @@ final class ScorerTests: XCTestCase {
 
         for url in urls {
             let fixture = try GoldenFixtures.load(url)
-            let name = fixture.meta.caseName
             let scores = self.scores(of: fixture, against: reference)
-            let mine = scoreJSON(scores, clipHoldId: Scorer.clipScore(scores)?.holdId)
-            compare(
-                stored: fixture.expected.score, mine: mine,
-                path: "expected.score", tolerances: fixture.meta.tolerances, label: name)
+            for mismatch in GoldenComparison.score(
+                scores, clipHoldId: Scorer.clipScore(scores)?.holdId, fixture: fixture)
+            {
+                XCTFail(mismatch)
+            }
         }
     }
 
@@ -260,253 +242,45 @@ final class ScorerTests: XCTestCase {
         }
     }
 
-    // MARK: - The comparison the parity test makes
-
-    /// One scorer answer as the fixture's JSON shape:
-    /// `{"holds": [...], "clip_hold_id": ...}`, with `NaN` written the way
-    /// Python writes it — `null`.
-    private func scoreJSON(_ scores: [HoldScore], clipHoldId: Int?) -> GoldenFixtures.JSONValue {
-        let holds: [GoldenFixtures.JSONValue] = scores.map { hold -> GoldenFixtures.JSONValue in
-            var groups: [String: GoldenFixtures.JSONValue] = [:]
-            for (name, value) in hold.groups {
-                groups[name] = numberJSON(value ?? .nan)
-            }
-            let faults: [GoldenFixtures.JSONValue] = hold.topFaults.map { fault in
-                GoldenFixtures.JSONValue.array([
-                    .text(fault.feature),
-                    numberJSON(fault.value),
-                    numberJSON(fault.mean),
-                    numberJSON(fault.z),
-                ])
-            }
-            return .object([
-                "hold_id": .number(Double(hold.holdId)),
-                "hold_frames": .number(Double(hold.holdFrames)),
-                "valid_frames": .number(Double(hold.validFrames)),
-                "hold_start_ms": .number(Double(hold.holdStartMs)),
-                "hold_end_ms": .number(Double(hold.holdEndMs)),
-                "hold_duration_s": numberJSON(hold.holdDurationS),
-                "score": numberJSON(hold.score ?? .nan),
-                "reason": .text(hold.reason),
-                "deviation": numberJSON(hold.deviation),
-                "penalty": numberJSON(hold.penalty),
-                "groups": .object(groups),
-                "values": .object(hold.values.mapValues { numberJSON($0) }),
-                "z": .object(hold.z.mapValues { numberJSON($0) }),
-                "top_faults": .array(faults),
-                "missing_groups": .array(
-                    hold.missingGroups.map { GoldenFixtures.JSONValue.text($0) }),
-            ])
-        }
-        return .object([
-            "holds": .array(holds),
-            "clip_hold_id": numberJSON(clipHoldId.map { Double($0) }),
-        ])
-    }
-
-    /// One number as JSON: a non-finite one — or no number at all — is
-    /// Python's `null`.
-    private func numberJSON(_ value: Double?) -> GoldenFixtures.JSONValue {
-        guard let value, value.isFinite else { return .null }
-        return .number(value)
-    }
-
-    /// Every place `mine` differs from `stored` past the field's tolerance —
-    /// the recursive walk `tests/test_golden.py` does, reporting through
-    /// `XCTFail` so one mismatch does not hide the rest.
-    private func compare(
-        stored: GoldenFixtures.JSONValue,
-        mine: GoldenFixtures.JSONValue,
-        path: String,
-        tolerances: [String: Double],
-        label: String,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        switch (stored, mine) {
-        case (.null, .null):
-            return
-        case (.null, _):
-            XCTFail(
-                "\(label): \(path): Python null, Swift \(describe(mine))",
-                file: file, line: line)
-        case (_, .null):
-            XCTFail(
-                "\(label): \(path): Python \(describe(stored)), Swift null",
-                file: file, line: line)
-        case (.text(let want), .text(let got)):
-            if want != got {
-                XCTFail(
-                    "\(label): \(path): Python '\(want)', Swift '\(got)'",
-                    file: file, line: line)
-            }
-        case (.bool(let want), .bool(let got)):
-            if want != got {
-                XCTFail(
-                    "\(label): \(path): Python \(want), Swift \(got)", file: file, line: line)
-            }
-        case (.number(let want), .number(let got)):
-            let tolerance = tolerance(for: path, in: tolerances)
-            if abs(want - got) > tolerance {
-                XCTFail(
-                    "\(label): \(path): Python \(want), Swift \(got) "
-                        + "(tolerance \(tolerance))",
-                    file: file, line: line)
-            }
-        case (.object(let want), .object(let got)):
-            let missing = want.keys.filter { got[$0] == nil }.sorted()
-            let extra = got.keys.filter { want[$0] == nil }.sorted()
-            if !missing.isEmpty || !extra.isEmpty {
-                XCTFail(
-                    "\(label): \(path): keys differ (missing=\(missing), extra=\(extra))",
-                    file: file, line: line)
-            }
-            for (key, value) in want {
-                if let other = got[key] {
-                    compare(
-                        stored: value, mine: other, path: "\(path).\(key)",
-                        tolerances: tolerances, label: label, file: file, line: line)
-                }
-            }
-        case (.array(let want), .array(let got)):
-            if want.count != got.count {
-                XCTFail(
-                    "\(label): \(path): \(want.count) entries stored, \(got.count) recomputed",
-                    file: file, line: line)
-                return
-            }
-            for (index, item) in want.enumerated() {
-                compare(
-                    stored: item, mine: got[index], path: "\(path).\(index)",
-                    tolerances: tolerances, label: label, file: file, line: line)
-            }
-        default:
-            XCTFail(
-                "\(label): \(path): Python \(describe(stored)), Swift \(describe(mine))",
-                file: file, line: line)
-        }
-    }
-
-    /// The tolerance that applies to `path`.
-    ///
-    /// Under `expected.score` the **field** names the key of
-    /// `meta.tolerances`: `values.*` is `expected.score.values`, `z.*` is
-    /// `expected.score.z`, `groups.*` is `expected.score.groups`, a top
-    /// fault's value and mean are values and its z is a z, `deviation`,
-    /// `penalty` and `score` are their own keys, and the integer hold fields
-    /// are exact — like the strings, which never ask for a tolerance at all.
-    /// A plain prefix match cannot do that: the `holds.<n>` (and list-index)
-    /// segments in the middle mean `expected.score.score` is no prefix of
-    /// `expected.score.holds.0.score`, which is how every hold field used to
-    /// fall back to `default` and the declared per-field tolerances were
-    /// never applied.
-    ///
-    /// Anywhere else — `expected.features.12.com_u` and friends — the longest
-    /// key that prefixes the path wins, list indices dropped first, as
-    /// `tolerance_for` in `tests/test_golden.py` does.
-    private func tolerance(for path: String, in tolerances: [String: Double]) -> Double {
-        let segments = path.split(separator: ".")
-        if segments.count >= 3, segments[0] == "expected", segments[1] == "score" {
-            // `holds.<n>.<field>…` under the section, or a field of the
-            // section itself (`clip_hold_id`).
-            let rest = Array(segments.dropFirst(2))
-            let field =
-                rest.first == "holds" && rest.count >= 3 ? Array(rest.dropFirst(2)) : rest
-            if let declared = scoreTolerance(field, in: tolerances) {
-                return declared
-            }
-        }
-        let parts = segments.filter { segment in !segment.allSatisfy { $0.isNumber } }
-        var best: [Substring] = []
-        var value = tolerances["default"] ?? 1e-6
-        for (key, tolerance) in tolerances {
-            let keyParts = key.split(separator: ".")
-            guard keyParts.count >= best.count, parts.count >= keyParts.count else { continue }
-            if Array(parts.prefix(keyParts.count)) == keyParts {
-                best = keyParts
-                value = tolerance
-            }
-        }
-        return value
-    }
-
-    /// The tolerance `meta.tolerances` declares for one field of
-    /// `expected.score`, or `nil` for a field with no key of its own — the
-    /// caller then falls back to the longest prefixing key, i.e. `default`
-    /// for every path this section has.
-    private func scoreTolerance(_ field: [Substring], in tolerances: [String: Double]) -> Double? {
-        guard let name = field.first else { return nil }
-        switch name {
-        case "values", "z", "groups":
-            // `values.<feature>`, `z.<feature>`, `groups.<name>` — the
-            // container itself is never a number.
-            guard field.count >= 2 else { return nil }
-            return tolerances["expected.score.\(name)"]
-        case "deviation", "penalty", "score":
-            return tolerances["expected.score.\(name)"]
-        case "top_faults":
-            // `top_faults.<fault>.<element>`: 0 is the feature name, 1 the
-            // value, 2 the mean, 3 the z — the fixture's four-tuple. Value
-            // and mean are measured like values, the z like a z.
-            guard field.count >= 3 else { return nil }
-            switch field[2] {
-            case "1", "2": return tolerances["expected.score.values"]
-            case "3": return tolerances["expected.score.z"]
-            default: return nil
-            }
-        case "hold_id", "hold_frames", "valid_frames", "hold_start_ms", "hold_end_ms",
-            "clip_hold_id":
-            return 0.0  // integers: exact, no decimal place to be lenient about
-        default:
-            return nil
-        }
-    }
+    // MARK: - The shared tolerance lookup
 
     /// The lookup every scored number goes through, on its own: the field
     /// under `expected.score` names the declared key however many `holds.<n>`
     /// segments sit above it, integers are exact, an unclaimed field falls
     /// back to `default`, and outside the score section the prefix rule still
     /// applies.
+    ///
+    /// The lookup itself moved to `GoldenComparison` in chainlink #42, where
+    /// every section's comparison runs it; this test stays here because the
+    /// keys it pins down are the scorer's own declared tolerances.
     func testTheScoreToleranceLookupMapsEachFieldToItsOwnKey() throws {
         let tolerances = try GoldenFixtures.load("line_hold").meta.tolerances
 
-        XCTAssertEqual(tolerance(for: "expected.score.holds.0.score", in: tolerances), 0.1)
-        XCTAssertEqual(tolerance(for: "expected.score.holds.1.z.hip_angle", in: tolerances), 1e-4)
-        XCTAssertEqual(tolerance(for: "expected.score.holds.0.values.banana", in: tolerances), 1e-6)
-        XCTAssertEqual(tolerance(for: "expected.score.holds.0.groups.stack", in: tolerances), 1e-4)
-        XCTAssertEqual(tolerance(for: "expected.score.holds.0.deviation", in: tolerances), 1e-4)
-        XCTAssertEqual(tolerance(for: "expected.score.holds.0.penalty", in: tolerances), 1e-4)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.holds.0.score", in: tolerances), 0.1)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.holds.1.z.hip_angle", in: tolerances), 1e-4)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.holds.0.values.banana", in: tolerances), 1e-6)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.holds.0.groups.stack", in: tolerances), 1e-4)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.holds.0.deviation", in: tolerances), 1e-4)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.holds.0.penalty", in: tolerances), 1e-4)
         // A top fault's value and mean are values, its z is a z.
         XCTAssertEqual(
-            tolerance(for: "expected.score.holds.2.top_faults.0.1", in: tolerances), 1e-6)
+            GoldenComparison.tolerance(for: "expected.score.holds.2.top_faults.0.1", in: tolerances), 1e-6)
         XCTAssertEqual(
-            tolerance(for: "expected.score.holds.2.top_faults.0.2", in: tolerances), 1e-6)
+            GoldenComparison.tolerance(for: "expected.score.holds.2.top_faults.0.2", in: tolerances), 1e-6)
         XCTAssertEqual(
-            tolerance(for: "expected.score.holds.2.top_faults.0.3", in: tolerances), 1e-4)
+            GoldenComparison.tolerance(for: "expected.score.holds.2.top_faults.0.3", in: tolerances), 1e-4)
         // Integers are exact.
-        XCTAssertEqual(tolerance(for: "expected.score.holds.0.hold_frames", in: tolerances), 0.0)
-        XCTAssertEqual(tolerance(for: "expected.score.clip_hold_id", in: tolerances), 0.0)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.holds.0.hold_frames", in: tolerances), 0.0)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.score.clip_hold_id", in: tolerances), 0.0)
         // A field no key claims falls back to default …
         let fallback = tolerances["default"] ?? 1e-6
         XCTAssertEqual(
-            tolerance(for: "expected.score.holds.0.hold_duration_s", in: tolerances), fallback)
-        XCTAssertEqual(tolerance(for: "meta.frame_count", in: tolerances), fallback)
+            GoldenComparison.tolerance(for: "expected.score.holds.0.hold_duration_s", in: tolerances), fallback)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "meta.frame_count", in: tolerances), fallback)
         // … and outside the score section the prefix rule still applies.
-        XCTAssertEqual(tolerance(for: "expected.features.12.com_u", in: tolerances), 1e-3)
+        XCTAssertEqual(GoldenComparison.tolerance(for: "expected.features.12.com_u", in: tolerances), 1e-3)
         XCTAssertEqual(
-            tolerance(for: "expected.postprocess.frames.3.filled", in: tolerances), 0.0)
-    }
-
-    /// One JSON value in `null`/number/string form, for a failure message.
-    private func describe(_ value: GoldenFixtures.JSONValue) -> String {
-        switch value {
-        case .null: return "null"
-        case .bool(let flag): return "\(flag)"
-        case .number(let number): return "\(number)"
-        case .text(let text): return "'\(text)'"
-        case .array: return "[…]"
-        case .object: return "{…}"
-        }
+            GoldenComparison.tolerance(for: "expected.postprocess.frames.3.filled", in: tolerances), 0.0)
     }
 
     // MARK: - The constants

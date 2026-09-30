@@ -34,11 +34,11 @@ host="${HANDSTAND_MAC_HOST:-macmini}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [[ -d "$repo_root/swift/$package" ]] || die "missing $repo_root/swift/$package"
-[[ "$remote_dir" != /* && "$remote_dir" != *..* ]] || die "remote dir must be relative to your home on $host: '$remote_dir'"
 
-echo "== rsync swift/ to $host:$remote_dir/swift/ (excluding .build)"
-rsync -a --delete --exclude '.build' --exclude '.swiftpm' \
-    "$repo_root/swift/" "$host:$remote_dir/swift/"
+# The rsync itself lives in swift_sync.sh, shared with real_parity.sh: one
+# definition of "copy this worktree's swift/ to the Mac".
+source "$repo_root/tools/mac/swift_sync.sh"
+swift_sync "$host" "$remote_dir" "$repo_root"
 
 tmp_dir="${TMPDIR:-/tmp/opencode}"
 mkdir -p "$tmp_dir"
