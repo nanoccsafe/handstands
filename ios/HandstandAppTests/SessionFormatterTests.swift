@@ -42,4 +42,15 @@ final class SessionFormatterTests: XCTestCase {
         XCTAssertEqual(SessionFormatter.score(.nan), "—")
         XCTAssertEqual(SessionFormatter.score(.infinity), "—")
     }
+
+    func testPositionIsMinutesSecondsAndATenth() {
+        // The worst-moment card's "Worst moment · 0:04.2" (chainlink #49).
+        XCTAssertEqual(SessionFormatter.position(4_200), "0:04.2")
+        XCTAssertEqual(SessionFormatter.position(0), "0:00.0")
+        XCTAssertEqual(SessionFormatter.position(65_000), "1:05.0")
+        XCTAssertEqual(SessionFormatter.position(999), "0:00.9")
+        XCTAssertEqual(SessionFormatter.position(1_250), "0:01.2")
+        // Times nobody can mean read as the start, never as "-1:−59.9".
+        XCTAssertEqual(SessionFormatter.position(-100), "0:00.0")
+    }
 }

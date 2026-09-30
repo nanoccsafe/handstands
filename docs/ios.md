@@ -284,6 +284,38 @@ the frames it read to **`<basename>.pose.json` next to the movie**
 
 It is local to the phone, exactly like the video: no network, no copies.
 
+## Summary
+
+Under the player of an **analysed** session — the same condition as the
+diagram: an analysis exists — the screen shows three things
+(chainlink #49, the logic in docs/swift.md's **SessionSummary** section):
+
+1. **The heat strip** (`HeatStripView`): a full-width, 16 pt bar of the
+   whole clip, one coloured bin per slice of it in the **same colours as
+   the diagram** (grey = not held, green = on form, amber = off, red =
+   far off — the bands come from `SessionSummary.heatStrip`, the same
+   severity the overlay draws), a thin white **playhead** at the clock's
+   current time, and the caption **"Form over time (holds coloured)"**.
+   Tapping or dragging on the strip **seeks** the player to that moment —
+   the x↔time mapping is the pure `HeatStripGeometry` (unit-tested), so
+   the line you tap and the bins you see are the same scale.
+2. **The worst moment** (`WorstMomentCard`): a thumbnail of the worst
+   frame of the hold with the stress diagram drawn over it
+   (`StressDiagramOverlay` aspect-fits any size), a label like
+   **"Worst moment · 0:04.2"** plus what was off in plain words
+   (`FaultLabel`: "Hip angle, Line deviation"), and a tap that seeks the
+   player **there and pauses**. The card is hidden when there is no worst
+   moment — no hold, or a hold with nothing wrong.
+3. **"What to work on"**: up to three numbered coaching cues
+   (`CoachingCues.cues` — the longest hold's faults, plus the balance
+   cues), one line each, in plain language.
+
+Everything is computed **once per analysis** — on opening an analysed
+take and again after **Analyse again** — and nothing is recomputed while
+the movie plays except the playhead. Side view only for now, like the
+rest of the analysis (front/back is chainlink #83); the names are
+view-neutral.
+
 ## Testing recording on the phone
 
 The camera does not exist in the simulator, so recording and its framing
@@ -349,8 +381,15 @@ this checklist is for the iPhone (sideload as above):
    while the stack line stays down your hands. Toggle **Diagram** off and
    on, then leave and re-open the session: the overlay comes straight back
    from the `.pose.json` cache, without the analysis running again.
+7. **Read the summary under the player** (chainlink #49): analyse a
+   session, then check the **heat strip's colours match the diagram**
+   while playing (grey outside the hold, green/amber/red in it, white
+   playhead moving over it) and tap the strip to **seek**; **tap the
+   worst moment** card and check the player jumps to that frame and
+   **pauses**; and read the numbered cues under **"What to work on"**.
+   Tap **Analyse again** and check the strip, card and cues all refresh.
 
 Everything stays on the phone: no networking, no analytics, recordings are
 not uploaded anywhere. The app ships the home, record, history, analysis,
-stress-diagram overlay, video-pick and about screens; the summary view and
-heat strip (chainlink #49) come next.
+stress-diagram overlay, summary (heat strip, worst moment, cues),
+video-pick and about screens.
