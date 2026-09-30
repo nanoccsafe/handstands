@@ -71,7 +71,7 @@ final class AnalysisSummaryTests: XCTestCase {
         let frames = Self.holdingClip()
         let analysis = Analyzer.analyze(frames, reference: nil)
 
-        let summary = AnalysisSummary.make(from: analysis, hasReference: false)
+        let summary = AnalysisSummary.make(from: analysis, frames: frames, hasReference: false)
 
         // The clip really holds: one run, first frame to last.
         XCTAssertEqual(analysis.phases.holdCount, 1, "the synthetic clip is exactly one hold")
@@ -87,6 +87,10 @@ final class AnalysisSummaryTests: XCTestCase {
         XCTAssertNil(summary.clipScore)
         XCTAssertTrue(summary.topFaults.isEmpty)
         XCTAssertFalse(summary.hasReference)
+
+        // Measurable: nothing to explain away, and every frame had a person.
+        XCTAssertNil(summary.unusableReason)
+        XCTAssertEqual(summary.detectedFrames, frames.count)
     }
 
     // MARK: - With the reference
@@ -98,13 +102,15 @@ final class AnalysisSummaryTests: XCTestCase {
         let frames = Self.holdingClip()
         let analysis = Analyzer.analyze(frames, reference: reference)
 
-        let summary = AnalysisSummary.make(from: analysis, hasReference: true)
+        let summary = AnalysisSummary.make(from: analysis, frames: frames, hasReference: true)
 
         XCTAssertEqual(summary.holdCount, analysis.phases.holdCount)
         XCTAssertNotNil(
             analysis.clipScore, "the hold has more than the 5 valid frames scoring needs")
         XCTAssertEqual(summary.clipScore, analysis.clipScore?.score)
         XCTAssertTrue(summary.hasReference)
+        XCTAssertNil(summary.unusableReason, "this clip was measured")
+        XCTAssertEqual(summary.detectedFrames, frames.count)
         XCTAssertFalse(summary.topFaults.isEmpty, "a scored hold has ranked faults")
         XCTAssertLessThanOrEqual(summary.topFaults.count, Scorer.topFaults, "at most three")
         // The faults are the scorer's feature keys — what FaultLabel turns
@@ -114,22 +120,78 @@ final class AnalysisSummaryTests: XCTestCase {
         }
     }
 
-    // MARK: - An empty analysis
+    // MARK: - Clips that could not be measured
 
-    /// A video nobody could be seen in: no holds, no score, and `0` for the
-    /// longest hold rather than an absence — the analysis finished.
-    func testAClipWithNoHoldSummarisesAsZero() throws {
+    /// A video nobody could be seen in: the analysis finishes with no
+    /// holds, no score and `0` for the longest hold — and, because there
+    /// was no body to measure, says *why*: the screens must not show
+    /// "Holds: 0" as if the athlete had failed to hold.
+    func testAClipWithNoPersonSummarisesAsZeroAndSaysWhyItCannotBeMeasured() throws {
         let frames = (0..<10).map { index in
             PostProcessInputFrame(
                 tMs: index * 33, detected: false, trainerContact: false, joints: [:])
         }
         let analysis = Analyzer.analyze(frames, reference: nil)
 
-        let summary = AnalysisSummary.make(from: analysis, hasReference: false)
+        let summary = AnalysisSummary.make(from: analysis, frames: frames, hasReference: false)
 
         XCTAssertEqual(summary.holdCount, 0)
         XCTAssertEqual(summary.longestHoldS, 0)
         XCTAssertNil(summary.clipScore)
         XCTAssertEqual(summary.frames, frames.count)
+
+        // Nobody was found, and the clip says why it could not be measured.
+        XCTAssertEqual(summary.detectedFrames, 0)
+        XCTAssertNotNil(summary.unusableReason)
+        XCTAssertEqual(summary.unusableReason, analysis.processed.bodyLength.reason)
+    }
+
+    /// A person the model finds but cannot measure — legs below
+    /// `MIN_VISIBILITY`, exactly the real clip that triggered this: Vision
+    /// saw a body in every frame, the ankles were never confident enough to
+    /// measure a body length with. The summary must carry the reason (and
+    /// zero holds, never a hold count read as "did not hold") while still
+    /// counting the frames that had a person in them.
+    func testAClipTheAppCannotMeasureSaysWhyAndCountsTheDetectedFrames() throws {
+        let frames = (0..<Self.frameCount).map { index -> PostProcessInputFrame in
+            var frame = Self.holdingFrame(tMs: index * Self.stepMs)
+            // Ankles and knees under the 0.5 gate: no shin, no thigh → no L.
+            for joint in [Joint.leftAnkle, .rightAnkle, .leftKnee, .rightKnee] {
+                frame.joints[joint]?.visibility = 0.3
+            }
+            return frame
+        }
+        let analysis = Analyzer.analyze(frames, reference: nil)
+
+        let summary = AnalysisSummary.make(from: analysis, frames: frames, hasReference: false)
+
+        XCTAssertFalse(analysis.processed.usable, "no body length can be measured")
+        XCTAssertNotNil(summary.unusableReason)
+        XCTAssertEqual(summary.unusableReason, analysis.processed.bodyLength.reason)
+        XCTAssertEqual(summary.holdCount, 0, "an unmeasurable clip has no holds")
+        XCTAssertNil(summary.clipScore)
+        XCTAssertEqual(summary.detectedFrames, frames.count, "the person was found every frame")
+    }
+
+    /// `detectedFrames` counts the frames the model found *a person* in —
+    /// which is not the same as the frames the pipeline could measure, so
+    /// it is read off the input frames, not off the analysis.
+    func testDetectedFramesCountsTheFramesWithAPerson() throws {
+        // Every second frame has nobody in it: 30 of 60. The 30 detected
+        // ones still measure a body length (MIN_BODY_FRAMES is 10), so the
+        // clip itself stays measurable.
+        let frames = Self.holdingClip().enumerated().map { index, frame -> PostProcessInputFrame in
+            var frame = frame
+            frame.detected = index % 2 == 0
+            return frame
+        }
+        let analysis = Analyzer.analyze(frames, reference: nil)
+
+        let summary = AnalysisSummary.make(from: analysis, frames: frames, hasReference: false)
+
+        XCTAssertEqual(summary.detectedFrames, 30)
+        XCTAssertEqual(summary.frames, frames.count)
+        XCTAssertNil(summary.unusableReason, "the clip was measured")
+        XCTAssertEqual(summary.holdCount, analysis.phases.holdCount)
     }
 }

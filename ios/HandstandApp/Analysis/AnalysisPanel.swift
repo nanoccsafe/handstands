@@ -67,34 +67,60 @@ struct AnalysisPanel: View {
     }
 
     /// Done: the facts of the run — holds, the longest one, the score (or
-    /// why there is none) and the worst faults, in words.
+    /// why there is none) and the worst faults, in words. A clip that could
+    /// not be measured says so instead: "Holds: 0" would read as "you did
+    /// not hold", which is not what an unmeasurable clip means.
     private func results(_ summary: AnalysisSummary) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            LabeledContent("Holds", value: "\(summary.holdCount)")
-            LabeledContent(
-                "Longest hold",
-                value: String(format: "%.1f s", summary.longestHoldS)
-            )
-            if let score = summary.clipScore {
-                LabeledContent("Score", value: SessionFormatter.score(score))
+            if summary.unusableReason != nil {
+                unmeasurable(summary)
             } else {
-                // Without a reference there is nothing to score against —
-                // say so, rather than showing a dash with no explanation.
-                Text(
-                    summary.hasReference
-                        ? "No score: this take could not be scored"
-                        : "No score yet (no reference)"
+                LabeledContent("Holds", value: "\(summary.holdCount)")
+                LabeledContent(
+                    "Longest hold",
+                    value: String(format: "%.1f s", summary.longestHoldS)
                 )
+                if let score = summary.clipScore {
+                    LabeledContent("Score", value: SessionFormatter.score(score))
+                } else {
+                    // Without a reference there is nothing to score against —
+                    // say so, rather than showing a dash with no explanation.
+                    Text(
+                        summary.hasReference
+                            ? "No score: this take could not be scored"
+                            : "No score yet (no reference)"
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                }
+                if !summary.topFaults.isEmpty {
+                    Text(
+                        "Top faults: "
+                            + summary.topFaults.map(FaultLabel.text(for:)).joined(separator: ", ")
+                    )
+                    .font(.subheadline)
+                }
+            }
+        }
+    }
+
+    /// What the screen says when the app could not measure the clip: why,
+    /// how to fix the framing, and how many frames had a person in them —
+    /// never a hold count, which would read as "you did not hold".
+    private func unmeasurable(_ summary: AnalysisSummary) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Couldn't measure your body in this video.")
                 .font(.subheadline)
+            Text("Make sure your whole body is in frame and well lit, side-on to the camera.")
+                .font(.footnote)
                 .foregroundStyle(.secondary)
-            }
-            if !summary.topFaults.isEmpty {
-                Text(
-                    "Top faults: "
-                        + summary.topFaults.map(FaultLabel.text(for:)).joined(separator: ", ")
-                )
-                .font(.subheadline)
-            }
+            Text(
+                summary.detectedFrames == 0
+                    ? "No person found in this video."
+                    : "Person found in \(summary.detectedFrames) of \(summary.frames) frames"
+            )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
         }
     }
 }

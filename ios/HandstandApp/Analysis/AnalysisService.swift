@@ -80,18 +80,26 @@ final class AnalysisService {
                 Analyzer.analyze(frames, reference: reference)
             }.value
             // 5. What the screen shows.
-            let summary = AnalysisSummary.make(from: analysis, hasReference: reference != nil)
+            let summary = AnalysisSummary.make(
+                from: analysis, frames: frames, hasReference: reference != nil
+            )
             // Cancelled (or a newer run started) while the pipeline ran: not
             // ours to report, and nothing may be saved.
             guard generation == mine else { return }
-            // 6. The row's analysis columns.
+            // 6. The row's analysis columns. A clip the app could not measure
+            //    (`unusableReason`) is recorded as "analysed, no result": no
+            //    score, no holds, and the reason in `note` — "Holds: 0" would
+            //    read as "you did not hold" when the truth is "I could not
+            //    measure you".
             if let session, let store {
+                let unusable = summary.unusableReason
                 try store.recordAnalysis(
                     for: session,
-                    score: summary.clipScore,
-                    holdCount: summary.holdCount,
-                    longestHoldS: summary.longestHoldS,
-                    version: Self.analysisVersion
+                    score: unusable == nil ? summary.clipScore : nil,
+                    holdCount: unusable == nil ? summary.holdCount : 0,
+                    longestHoldS: unusable == nil ? summary.longestHoldS : 0,
+                    version: Self.analysisVersion,
+                    note: unusable
                 )
             }
             state = .finished(summary)
@@ -193,6 +201,14 @@ struct AnalysisSummary: Equatable {
     var topFaults: [String]
     /// Was a scoring reference available for this run?
     var hasReference: Bool
+    /// Why the analysis could not measure the clip at all; `nil` when it
+    /// could. Set from `Analysis` when the post-process has no body length
+    /// (or the segmenter says the clip is unusable) — "Holds: 0" would read
+    /// as "you did not hold", which is not what an unmeasurable clip means.
+    var unusableReason: String?
+    /// How many of the analysed frames had a person in them (`detected`) —
+    /// "Person found in X of Y frames" on the unmeasurable-clip screen.
+    var detectedFrames: Int
 
     /// `summary` from the pipeline's own answer.
     ///
@@ -201,7 +217,14 @@ struct AnalysisSummary: Equatable {
     /// counted and its longest hold timed. The score is `clipScore`'s
     /// number — the longest *scored* hold, as `Scorer.clipScore` picks it —
     /// and the faults are that hold's `topFaults`.
-    static func make(from analysis: Analysis, hasReference: Bool) -> AnalysisSummary {
+    ///
+    /// `frames` are the frames that went *into* the pipeline: `detected` is
+    /// their flag, not something the `Analysis` carries.
+    static func make(
+        from analysis: Analysis,
+        frames: [PostProcessInputFrame],
+        hasReference: Bool
+    ) -> AnalysisSummary {
         let durations = analysis.phases.holdDurationsS()
         return AnalysisSummary(
             frames: analysis.phases.tMs.count,
@@ -211,7 +234,22 @@ struct AnalysisSummary: Equatable {
             topFaults: (analysis.clipScore?.topFaults ?? [])
                 .prefix(Scorer.topFaults)
                 .map(\.feature),
-            hasReference: hasReference
+            hasReference: hasReference,
+            unusableReason: unusableReason(of: analysis),
+            detectedFrames: frames.filter(\.detected).count
         )
+    }
+
+    /// Why the clip could not be measured, or `nil` when it could — the
+    /// post-process's reason first (no body length, e.g. Vision's leg
+    /// confidences under `MIN_VISIBILITY`), the segmenter's otherwise.
+    private static func unusableReason(of analysis: Analysis) -> String? {
+        if !analysis.processed.usable {
+            return analysis.processed.bodyLength.reason
+        }
+        if !analysis.phases.usable {
+            return analysis.phases.unusableReason.isEmpty ? nil : analysis.phases.unusableReason
+        }
+        return nil
     }
 }

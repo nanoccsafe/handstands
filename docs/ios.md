@@ -101,9 +101,10 @@ Every recording becomes a **Session** row in a local SwiftData database
   container moves between installs while the folder name is the stable
   part), when it was taken, which hold it was for, and its duration and
   frame size as read from the file. The analysis columns (`analyzed_at`,
-  `clip_score`, `hold_count`, `longest_hold_s`, `analysis_version`) are
-  filled by **Analyse** (see **Analysis** below); until a take is analysed
-  those rows read "Not analysed yet".
+  `clip_score`, `hold_count`, `longest_hold_s`, `analysis_version`,
+  `analysis_note`) are filled by **Analyse** (see **Analysis** below);
+  until a take is analysed those rows read "Not analysed yet", and a take
+  the app could not measure reads "Couldn't measure".
 - **Where**: `SessionStore` in `ios/HandstandApp/Sessions/`, over the
   `ModelContainer` that `HandstandApp.swift` opens with
   `ModelConfiguration(cloudKitDatabase: .none)`.
@@ -115,8 +116,10 @@ Every recording becomes a **Session** row in a local SwiftData database
 The header reads **"N sessions · M this week · total time mm:ss"** plus
 "Best score X" once any take has been analysed (until then, "Scores appear
 once analysis is available"). Rows show the date and time, the hold, the
-duration and the score, newest first; a row opens a detail screen that
-plays the video with the same facts beside it.
+duration and the score — or "Couldn't measure" when the last analysis could
+not measure that take, "Not analysed yet" when there was none — newest
+first; a row opens a detail screen that plays the video with the same
+facts beside it.
 
 `reconcile()` runs every time the screen appears: a `.mov` with no row
 gets one (hold type and date from its sidecar when there is one, otherwise
@@ -155,11 +158,18 @@ What happens, in order:
    features, and the scorer *if* a reference loaded (step 0).
 4. The result is shown: **Holds: N**, **Longest hold: x.x s**, the score —
    or **"No score yet (no reference)"** — and up to three top faults with
-   their names said in words (`hip_angle` → "Hip angle").
+   their names said in words (`hip_angle` → "Hip angle"). A clip the app
+   *cannot* measure (no body length — for instance Vision found a person
+   but never a confident enough leg) shows none of those rows: it says
+   **"Couldn't measure your body in this video."** with the framing hint
+   and **"Person found in X of Y frames"** (**"No person found in this
+   video."** when nobody was found) instead.
 5. For a recording, the result is saved to the session row's analysis
    columns (`analyzed_at`, `clip_score`, `hold_count`, `longest_hold_s`,
-   `analysis_version = "vision-1"`), which is what the detail screen and
-   the History row then show.
+   `analysis_version = "vision-1"`, `analysis_note`), which is what the
+   detail screen and the History row then show. An unmeasurable clip is
+   saved with hold count 0, no score and the reason in `analysis_note` —
+   the screens then read "Couldn't measure" rather than a hold count of 0.
 
 Worth knowing:
 
@@ -167,8 +177,10 @@ Worth knowing:
   button; cancelling returns to the button and saves nothing. The screen
   stays awake while it runs (`isIdleTimerDisabled`, restored afterwards),
   and the heavy work runs off the main actor, so the UI never blocks. A
-  video with nobody in it finishes with *Holds: 0* — it is not a failure;
-  only a video that cannot be read fails, with the reason in words.
+  video the model cannot measure — nobody in it, or nobody it can measure —
+  finishes with the explanation above rather than a hold count of 0, so
+  "Holds: 0" is never shown as if you had failed to hold; only a video that
+  cannot be read fails, with the reason in words.
 - **No score without a reference**: scores appear only when a scoring
   reference is available. The real one comes from your own #28 data — see
   below. Without one the analysis still finds phases, holds and features.
@@ -244,7 +256,9 @@ this checklist is for the iPhone (sideload as above):
    100 % — the screen must **stay awake** while it runs, and the result
    must show **Holds: 1** for a clip with one clean hold, and a
    **Longest hold** of a few seconds that matches how long you actually
-   held.
+   held. A clip the camera could not measure shows **"Couldn't measure your
+   body in this video."** (with how many frames had a person in it)
+   instead of any hold count.
 3. Tap **Analyse again** and, while it is running, tap **Cancel**: the
    screen goes straight back to the button, and nothing was saved (the
    row's numbers, if any, are unchanged).

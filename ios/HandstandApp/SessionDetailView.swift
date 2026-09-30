@@ -54,7 +54,13 @@ struct SessionDetailView: View {
                     "Frame",
                     value: VideoInfoFormatter.pixelSize(width: session.width, height: session.height)
                 )
-                if let score = session.clipScore {
+                if session.analysisNote != nil {
+                    // Analysed but unmeasurable (no body length): say so
+                    // rather than showing a score that is not there or a
+                    // hold count of 0, which would read as "did not hold".
+                    Text("Couldn't measure")
+                        .foregroundStyle(.secondary)
+                } else if let score = session.clipScore {
                     LabeledContent("Score", value: SessionFormatter.score(score))
                 } else if session.analyzedAt == nil {
                     Text("Not analysed yet")
@@ -74,14 +80,21 @@ struct SessionDetailView: View {
                 // from `.idle` on every visit, so these rows are how a
                 // re-opened session shows the numbers the run reported.
                 if service.state == .idle, session.analyzedAt != nil {
-                    if let holds = session.holdCount {
-                        LabeledContent("Holds", value: "\(holds)")
-                    }
-                    if let longest = session.longestHoldS {
-                        LabeledContent(
-                            "Longest hold",
-                            value: String(format: "%.1f s", longest)
-                        )
+                    if session.analysisNote != nil {
+                        // The run could not measure this take: no holds to
+                        // list, and a "0" would read as "did not hold".
+                        Text("Couldn't measure")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        if let holds = session.holdCount {
+                            LabeledContent("Holds", value: "\(holds)")
+                        }
+                        if let longest = session.longestHoldS {
+                            LabeledContent(
+                                "Longest hold",
+                                value: String(format: "%.1f s", longest)
+                            )
+                        }
                     }
                 }
                 // The first end-to-end run in the app (chainlink #47):

@@ -154,9 +154,16 @@ struct HistoryView: View {
             VStack(alignment: .trailing, spacing: 2) {
                 Text(VideoInfoFormatter.duration(session.durationS))
                     .font(.subheadline.monospacedDigit())
-                Text(session.clipScore.map { SessionFormatter.score($0) } ?? "Not analysed yet")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(
+                    // An unmeasurable take is neither a score nor "not
+                    // analysed yet": it was analysed, and the app could
+                    // not measure it.
+                    session.analysisNote != nil
+                        ? "Couldn't measure"
+                        : session.clipScore.map { SessionFormatter.score($0) } ?? "Not analysed yet"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
         }
         .accessibilityElement(children: .combine)
