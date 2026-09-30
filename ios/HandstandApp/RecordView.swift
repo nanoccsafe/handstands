@@ -5,7 +5,9 @@ import UIKit
 
 /// The Record screen (chainlink #46): the camera fills it, a coloured border
 /// says whether the whole body is in frame and what to do about it, and a
-/// big button records an attempt to a file that stays on the phone.
+/// big button records an attempt to a file that stays on the phone. At the
+/// top sits the hold picker (chainlink #66) — the one thing the user tells
+/// the app; wall, steps, camera angle and phases are detected (#72).
 ///
 /// Two things the screen owns beyond the picture: the framing message under
 /// the border (from `HandstandCore`'s `FramingCheck`), and the screen staying
@@ -13,6 +15,12 @@ import UIKit
 struct RecordView: View {
     @State private var model = CaptureService()
     @Environment(\.dismiss) private var dismiss
+    /// The last hold the user picked, remembered per device. Read through
+    /// `HoldType.resolved`, so a fresh install — and any stale stored value —
+    /// shows Line.
+    @AppStorage("holdType") private var holdTypeRaw: String = HoldType.default.rawValue
+
+    private var holdType: HoldType { HoldType.resolved(holdTypeRaw) }
 
     var body: some View {
         ZStack {
@@ -36,7 +44,13 @@ struct RecordView: View {
         .navigationTitle("Record")
         .navigationBarTitleDisplayMode(.inline)
         .task {
+            model.holdType = holdType
             await model.start()
+        }
+        .onChange(of: holdType) { _, selected in
+            // Keep the model in step with `@AppStorage`, so the take that
+            // starts next records what the picker shows.
+            model.holdType = selected
         }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
@@ -49,6 +63,7 @@ struct RecordView: View {
             if let info = model.finished {
                 RecordingDoneView(
                     info: info,
+                    holdType: model.finishedHoldType,
                     onRecordAgain: { model.recordAgain() },
                     onDone: { dismiss() }
                 )
@@ -76,6 +91,11 @@ struct RecordView: View {
                 .animation(.easeInOut(duration: 0.15), value: model.borderTone)
 
             VStack(spacing: 14) {
+                // The one thing the user chooses before recording (the
+                // rest — wall, steps, angle, phases — is detected, #72).
+                holdPicker
+                    .padding(.top, 28)
+
                 // What the border colour means, in words.
                 Text(model.framingMessage)
                     .font(.headline)
@@ -83,7 +103,6 @@ struct RecordView: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                     .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.top, 28)
 
                 Spacer()
 
@@ -118,6 +137,43 @@ struct RecordView: View {
             }
             .padding(.vertical, 24)
         }
+    }
+
+    // MARK: - The hold picker
+
+    /// "Hold: Line ▾" at the top of the camera screen (chainlink #66): the
+    /// hold the user is training, and the *only* thing they are asked —
+    /// everything else is detected (#72). Every `HoldType` is listed; the
+    /// ones the MVP cannot record yet are disabled and read "coming soon",
+    /// so the user can see what is planned. Frozen while the red light is on.
+    private var holdPicker: some View {
+        Menu {
+            ForEach(HoldType.allCases) { hold in
+                if hold.isAvailable {
+                    Button {
+                        holdTypeRaw = hold.rawValue
+                    } label: {
+                        if hold == holdType {
+                            Label(hold.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(hold.displayName)
+                        }
+                    }
+                } else {
+                    // Shown but not choosable: "Tuck — coming soon", …
+                    Button(HoldTypeLabel.text(for: hold)) {}
+                        .disabled(true)
+                }
+            }
+        } label: {
+            Text("Hold: \(HoldTypeLabel.text(for: holdType)) ▾")
+                .font(.headline)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial, in: Capsule())
+        }
+        .disabled(model.isRecording)
+        .accessibilityLabel("Hold type: \(holdType.displayName)")
     }
 
     private var recordButton: some View {
