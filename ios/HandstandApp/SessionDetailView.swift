@@ -1,14 +1,17 @@
-import AVKit
+import AVFoundation
 import Foundation
 import HandstandCore
 import SwiftUI
 import UIKit
 
-/// One recording, played (chainlink #51): the movie the row points at,
-/// exactly the facts the list shows beside it, the analysis of chainlink #47
-/// (read the frames, run Apple Vision + the pipeline, save the result back
-/// to this row), and the one destructive action in the app — deleting takes
-/// the video off the phone too, after the same confirmation the list uses.
+/// One recording, played (chainlink #51) with its stress diagram over it
+/// (chainlink #48): the movie the row points at, exactly the facts the list
+/// shows beside it, the analysis of chainlink #47 (read the frames, run
+/// Apple Vision + the pipeline, save the result back to this row), the
+/// overlay drawn from the pose cache — a skeleton coloured by how far the
+/// form is off, the stack line and the centre of mass — and the one
+/// destructive action in the app: deleting takes the video off the phone
+/// too, after the same confirmation the list uses.
 @MainActor
 struct SessionDetailView: View {
     let session: Session
@@ -22,9 +25,32 @@ struct SessionDetailView: View {
     /// The player for this row's movie, made once — body would otherwise
     /// build a fresh `AVPlayer` (and restart the video) on every redraw.
     @State private var player: AVPlayer?
+    /// The player's periodic time observer (every 1/30 s), removed when the
+    /// screen goes away — the player outlives no callback that outlives it.
+    @State private var timeObserver: Any?
     /// The analysis of this row: button, progress, results. Owned here, so
     /// leaving the screen stops a run in flight (see `onDisappear`).
     @State private var service = AnalysisService()
+    /// Where playback is, in the clip's own milliseconds — the clock the
+    /// diagram's frames are stamped with (see `PlaybackClock`).
+    @State private var clock = PlaybackClock()
+    /// Is the movie playing (what the play/pause button shows)?
+    @State private var isPlaying = false
+    /// Is the scrubber being dragged, and where it was dragged to? While it
+    /// is, the slider shows its own value and the time observer stays out
+    /// of the way (the movie is paused for the drag).
+    @State private var scrubbing = false
+    @State private var scrubSeconds = 0.0
+    /// The analysis the overlay is drawn from — from the pose cache when the
+    /// screen opens on an analysed take, from the run that just finished
+    /// otherwise. `nil` means no overlay: an un-analysed take shows the
+    /// plain picture until "Analyse" runs.
+    @State private var diagramAnalysis: Analysis?
+    /// The reference that analysis was scored/severed against, for the
+    /// legend's note line.
+    @State private var diagramReference: ScoreReference?
+    /// Is the overlay showing? On by default whenever there is one.
+    @State private var showDiagram = true
 
     /// Is a run in flight — the state the screen has to stay awake for.
     private var isAnalysing: Bool {
@@ -32,13 +58,53 @@ struct SessionDetailView: View {
         return false
     }
 
+    /// The video's display size in pixels — the space the analysis's
+    /// points are written in, and what the overlay's aspect-fit maths
+    /// starts from.
+    private var videoSize: CGSize {
+        CGSize(width: session.width, height: session.height)
+    }
+
+    /// The diagram frame to draw right now: `nil` while the overlay is off,
+    /// until an analysis is loaded, or while the playhead is before the
+    /// clip's first frame (nothing has been seen yet).
+    private var currentDiagram: DiagramFrame? {
+        guard showDiagram, let analysis = diagramAnalysis else { return nil }
+        guard
+            let index = StressDiagram.frameIndex(
+                atMs: clock.playheadMs, in: analysis.features.tMs)
+        else {
+            return nil
+        }
+        return StressDiagram.frame(
+            index,
+            analysis: analysis,
+            reference: diagramReference,
+            height: Double(session.height)
+        )
+    }
+
     var body: some View {
         List {
             Section {
                 if let player {
-                    VideoPlayer(player: player)
+                    VStack(spacing: 8) {
+                        ZStack {
+                            PlayerLayerView(player: player)
+                            if let diagram = currentDiagram {
+                                StressDiagramOverlay(diagram: diagram, videoSize: videoSize)
+                            }
+                        }
                         .frame(height: 260)
-                        .listRowInsets(EdgeInsets())
+                        .background(Color.black)
+
+                        if currentDiagram != nil {
+                            StressDiagramLegend(hasReference: diagramReference != nil)
+                        }
+
+                        playbackControls(player)
+                    }
+                    .listRowInsets(EdgeInsets())
                 } else {
                     ProgressView()
                         .frame(height: 260)
@@ -115,17 +181,40 @@ struct SessionDetailView: View {
         .navigationTitle(SessionFormatter.dateTime(session.recordedAt))
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            // One player per screen, for this screen's file.
+            // One player per screen, for this screen's file — and one time
+            // observer over it, feeding the diagram's clock at the clip's
+            // own 30 fps rather than at the screen's refresh rate.
             if player == nil {
                 player = AVPlayer(url: store.movieURL(for: session))
             }
+            if let player, timeObserver == nil {
+                let clock = self.clock
+                timeObserver = player.addPeriodicTimeObserver(
+                    forInterval: CMTime(value: 1, timescale: 30), queue: .main
+                ) { time in
+                    // Installed on the main queue, so this *is* the main
+                    // actor — `PlaybackClock` is `@Observable`, which is
+                    // what repaints the overlay from here.
+                    MainActor.assumeIsolated {
+                        clock.tick(time.seconds)
+                    }
+                }
+            }
+            // An already-analysed take: the pose cache has the frames, the
+            // pipeline over them is milliseconds, and the overlay is on.
+            loadDiagram()
         }
         .onDisappear {
             // Leaving the screen takes the sound with it, the analysis with
             // it (a run nobody is watching must not keep the CPU hot — and
-            // Delete may be what sent this screen away), and the "stay
-            // awake" with it.
+            // Delete may be what sent this screen away), the time observer
+            // with it, and the "stay awake" with it.
             player?.pause()
+            isPlaying = false
+            if let timeObserver, let player {
+                player.removeTimeObserver(timeObserver)
+            }
+            timeObserver = nil
             service.cancel()
             UIApplication.shared.isIdleTimerDisabled = false
         }
@@ -134,6 +223,15 @@ struct SessionDetailView: View {
             // awake while it runs, and only while it runs — restored the
             // moment it finishes, fails or is cancelled.
             UIApplication.shared.isIdleTimerDisabled = analysing
+        }
+        .onChange(of: service.state) { _, state in
+            // A finished run has just written its pose cache (chainlink
+            // #48): re-read it so the overlay appears without leaving the
+            // screen. Forced, because a diagram loaded earlier is exactly
+            // what a re-run must replace.
+            if case .finished = state {
+                loadDiagram(force: true)
+            }
         }
         .confirmationDialog(
             "Delete this recording? The video is removed from the phone.",
@@ -154,6 +252,113 @@ struct SessionDetailView: View {
         } message: {
             Text(deletionError ?? "")
         }
+    }
+
+    // MARK: - Playback controls
+
+    /// Play/pause, the scrubber, and the overlay's switch — kept simple on
+    /// purpose: the picture and the diagram are the show, these only move
+    /// the moment in time the diagram is drawn for.
+    private func playbackControls(_ player: AVPlayer) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                togglePlayback(player)
+            } label: {
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                    .frame(width: 24)
+            }
+            .accessibilityLabel(isPlaying ? "Pause" : "Play")
+
+            Slider(value: scrubBinding, in: scrubRange, onEditingChanged: { editing in
+                scrubbing = editing
+                if editing {
+                    // Dragging seeks where you drop it, so the picture
+                    // must hold still for the drag.
+                    player.pause()
+                    isPlaying = false
+                    scrubSeconds = clock.seconds
+                } else {
+                    seek(player, to: scrubSeconds)
+                }
+            })
+
+            if diagramAnalysis != nil {
+                Button {
+                    showDiagram.toggle()
+                } label: {
+                    Label("Diagram", systemImage: showDiagram ? "eye" : "eye.slash")
+                }
+                .accessibilityLabel(showDiagram ? "Hide diagram" : "Show diagram")
+            }
+        }
+        .buttonStyle(.borderless)
+        .frame(maxWidth: .infinity)
+    }
+
+    /// What the scrubber shows and writes: its own value while dragged,
+    /// the clock's while the movie plays.
+    private var scrubBinding: Binding<Double> {
+        Binding(
+            get: { scrubbing ? scrubSeconds : clock.seconds },
+            set: { scrubSeconds = $0 }
+        )
+    }
+
+    /// The scrubber's range: the movie's length, never `NaN` (a movie with
+    /// unreadable metadata still gets a slider that answers).
+    private var scrubRange: ClosedRange<Double> {
+        let duration = session.durationS
+        return 0...(duration.isFinite && duration > 0 ? duration : 0.1)
+    }
+
+    /// Play or pause — and start over when the movie has run out, so the
+    /// play button is never a button that does nothing.
+    private func togglePlayback(_ player: AVPlayer) {
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+            return
+        }
+        let duration = session.durationS
+        if duration.isFinite, duration > 0, clock.seconds >= duration - 0.05 {
+            seek(player, to: 0)
+        }
+        player.play()
+        isPlaying = true
+    }
+
+    /// Jump the movie (and the diagram with it) to `seconds`.
+    private func seek(_ player: AVPlayer, to seconds: Double) {
+        let duration = session.durationS
+        let upper = duration.isFinite && duration > 0 ? duration : .greatestFiniteMagnitude
+        let target = Swift.min(Swift.max(0, seconds.isFinite ? seconds : 0), upper)
+        player.seek(
+            to: CMTime(seconds: target, preferredTimescale: 600),
+            toleranceBefore: .zero, toleranceAfter: .zero
+        )
+        clock.tick(target)
+    }
+
+    // MARK: - The diagram
+
+    /// Loads the overlay's analysis from the take's pose cache — on appear,
+    /// and (forced) after a run has just written one. Nothing to do when
+    /// the take was never analysed, or when there is no cache yet (a take
+    /// analysed before this feature): the overlay then appears after
+    /// "Analyse", which is what writes it.
+    private func loadDiagram(force: Bool = false) {
+        guard force || diagramAnalysis == nil else { return }
+        guard session.analyzedAt != nil else { return }
+        guard let frames = PoseCache.read(for: store.movieURL(for: session)) else { return }
+        // The same reference the run itself used: with one, the colours
+        // compare against your own good holds; without one, against the
+        // built-in thresholds (`FeatureTolerances`). Re-analysing here (it
+        // is milliseconds) rather than caching the answer is what keeps the
+        // overlay from going stale when a new reference lands.
+        let reference = ReferenceLoader.load(for: session.holdType)
+        diagramReference = reference
+        diagramAnalysis = Analyzer.analyze(frames, reference: reference)
+        showDiagram = true
     }
 
     private func delete() {

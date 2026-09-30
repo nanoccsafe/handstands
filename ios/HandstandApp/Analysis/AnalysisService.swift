@@ -73,6 +73,15 @@ final class AnalysisService {
             let reference = ReferenceLoader.load(for: holdType)
             // 2./3. Every kept frame through the pose backend, with progress.
             let frames = try await extract(movie: movie, generation: mine)
+            // A *recording's* frames go to the pose cache beside the movie
+            // (chainlink #48) the moment Vision is done with them: the next
+            // time the session screen opens it reads them back and never
+            // runs Vision again. A picked video has no row in History, so it
+            // has no cache either — and a run that was cancelled or replaced
+            // while it extracted writes nothing.
+            if session != nil, generation == mine {
+                try? PoseCache.write(frames: frames, for: movie)
+            }
             // 4. The whole pipeline, also off the main actor: the segmenter
             //    and the scorer are CPU work, not something to do between
             //    two redraws.
