@@ -156,6 +156,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `parity_reference.json` (synthetic holds, not a real reference), and
   `HandstandCore.Scorer` mirrors `handstand.score` over
   `ClipFeatures.tableRounded()` (#41)
+- Epic: Dev infrastructure (repo, Python env, Mac mini build host) (#1)
 - Weighted z-score scorer (#29)
 - Port FeatureExtractor + CentreOfMass + hold summary to Swift (#81)
 - Port PhaseSegmenter to Swift (phases only; features are #81) (#40)
