@@ -1,4 +1,5 @@
 import AVKit
+import Foundation
 import HandstandCore
 import SwiftUI
 import UIKit
@@ -58,13 +59,31 @@ struct SessionDetailView: View {
                 } else if session.analyzedAt == nil {
                     Text("Not analysed yet")
                         .foregroundStyle(.secondary)
+                } else {
+                    // Analysed but scoreless (no reference in the build, or
+                    // no hold that could be scored): analysed, no number —
+                    // "Not analysed yet" would be wrong.
+                    Text("No score yet")
+                        .foregroundStyle(.secondary)
                 }
-                // Analysed but scoreless (no reference in the build, or no
-                // hold that could be scored): the Analysis section below
-                // says so in words — "Not analysed yet" would be wrong.
             }
 
             Section("Analysis") {
+                // What the last run *saved* (chainlink #51's columns), while
+                // the panel has nothing of its own to show: the panel starts
+                // from `.idle` on every visit, so these rows are how a
+                // re-opened session shows the numbers the run reported.
+                if service.state == .idle, session.analyzedAt != nil {
+                    if let holds = session.holdCount {
+                        LabeledContent("Holds", value: "\(holds)")
+                    }
+                    if let longest = session.longestHoldS {
+                        LabeledContent(
+                            "Longest hold",
+                            value: String(format: "%.1f s", longest)
+                        )
+                    }
+                }
                 // The first end-to-end run in the app (chainlink #47):
                 // frames -> Apple Vision -> Analyzer -> this row.
                 AnalysisPanel(

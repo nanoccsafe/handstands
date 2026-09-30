@@ -250,7 +250,9 @@ this checklist is for the iPhone (sideload as above):
    row's numbers, if any, are unchanged).
 4. Go back to **History**: the row now shows the score (or still "Not
    analysed yet" when the build has no reference — see **Analysis**), and
-   re-opening the session shows the same numbers the run reported.
+   re-opening the session shows the run's saved numbers again — **Holds**,
+   **Longest hold** and **Score** (the top faults are words, not stored on
+   the row, so they are shown by the run that produced them).
 5. Home → **Analyse a video** → pick a video from Photos → **Analyse**: the
    same progress, Cancel and result panel, with the duration and frame
    size still shown above it. Nothing appears in History — a pick is not a
