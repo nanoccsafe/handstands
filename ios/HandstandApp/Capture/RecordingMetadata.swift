@@ -4,9 +4,9 @@ import HandstandCore
 /// What a recording was: the hold type chosen when the take started, when it
 /// was taken and which build took it. A small JSON **sidecar next to the
 /// movie** — `20260928-143059.mov` → `20260928-143059.json` in the same
-/// Recordings folder (`RecordingFile.swift`) — because there is no session
-/// store yet (#51 comes later). Analysis (#47) reads `hold_type` to pick the
-/// matching scoring reference.
+/// Recordings folder (`RecordingFile.swift`) — read by `SessionStore` (#51)
+/// when it turns a recording into a History row, and by analysis (#47),
+/// which needs `hold_type` to pick the matching scoring reference.
 ///
 /// ```json
 /// {"schema": 1, "hold_type": "line", "recorded_at": "2026-09-28T14:30:59Z",

@@ -90,6 +90,46 @@ problem. Analysis (chainlink #47) reads `hold_type` to pick the matching
 scoring reference (`HoldType.referenceResourceName`, `"reference-line"` for
 Line); no reference is bundled yet (chainlink #28).
 
+## History
+
+Every recording becomes a **Session** row in a local SwiftData database
+(chainlink #51), listed on the **History** screen (home → **History**):
+
+- **What's stored**: the movie's *file name relative to the Recordings
+  folder* (`20260928-143059.mov` — never an absolute path, the app
+  container moves between installs while the folder name is the stable
+  part), when it was taken, which hold it was for, and its duration and
+  frame size as read from the file. The analysis columns (`analyzed_at`,
+  `clip_score`, `hold_count`, `longest_hold_s`, `analysis_version`) are
+  part of the model but stay empty until analysis (chainlink #47) exists —
+  those rows read "Not analysed yet".
+- **Where**: `SessionStore` in `ios/HandstandApp/Sessions/`, over the
+  `ModelContainer` that `HandstandApp.swift` opens with
+  `ModelConfiguration(cloudKitDatabase: .none)`.
+- **Local only**: no CloudKit, no network — the rows live on the phone and
+  nowhere else. The movies themselves are never moved or copied: they stay
+  in `Application Support/Recordings`, and the database only points at
+  them.
+
+The header reads **"N sessions · M this week · total time mm:ss"** plus
+"Best score X" once any take has been analysed (until then, "Scores appear
+once analysis is available"). Rows show the date and time, the hold, the
+duration and the score, newest first; a row opens a detail screen that
+plays the video with the same facts beside it.
+
+`reconcile()` runs every time the screen appears: a `.mov` with no row
+gets one (hold type and date from its sidecar when there is one, otherwise
+Line and the file's creation date; duration and size from the file), a row
+whose movie is gone is removed, and anything that is not a `.mov` is
+ignored. That is how recordings taken *before* this feature — or while a
+take failed to be recorded — appear as well.
+
+**Deleting** a recording (swipe the row, or the button in the detail view;
+both ask *"Delete this recording? The video is removed from the phone."*)
+removes the `.mov`, its `.json` sidecar **and** the row. The store only
+ever deletes files inside the Recordings folder — nothing else on the
+phone is touched.
+
 ## Testing recording on the phone
 
 The camera does not exist in the simulator, so recording and its framing
@@ -113,12 +153,16 @@ guide are checked on the iPhone itself (sideload as above). The checklist:
    `.json` sidecar with the same name appears next to the `.mov` in the
    Recordings folder (`20260928-143059.json` beside
    `20260928-143059.mov`).
+7. **Check History**: record two takes, open **History** and check both
+   appear (newest first, with date and time, hold, duration and "Not
+   analysed yet"), then delete one — confirm the dialog — and check it is
+   gone from the list and so is its `.mov` in the Recordings folder.
 
 Recordings land in `Application Support/Recordings/<yyyyMMdd-HHmmss>.mov`
 on the phone and stay there — nothing is uploaded, and the folder is
 deliberately *not* excluded from an iCloud backup.
 
 Everything stays on the phone: no networking, no analytics, recordings are
-not uploaded anywhere. The app ships the home, record, video-pick and about
-screens; analysis (chainlink #47), overlay (#48) and storage (#51) come
-later.
+not uploaded anywhere. The app ships the home, record, history,
+video-pick and about screens; analysis (chainlink #47) and overlay (#48)
+come later.
