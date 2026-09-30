@@ -130,7 +130,8 @@ take failed to be recorded — appear as well.
 
 **Deleting** a recording (swipe the row, or the button in the detail view;
 both ask *"Delete this recording? The video is removed from the phone."*)
-removes the `.mov`, its `.json` sidecar **and** the row. The store only
+removes the `.mov`, its `.json` sidecar, its `.pose.json` pose cache (see
+**Stress diagram** below) **and** the row. The store only
 ever deletes files inside the Recordings folder — nothing else on the
 phone is touched.
 
@@ -170,6 +171,10 @@ What happens, in order:
    detail screen and the History row then show. An unmeasurable clip is
    saved with hold count 0, no score and the reason in `analysis_note` —
    the screens then read "Couldn't measure" rather than a hold count of 0.
+6. For a recording, the frames Vision saw are also written to the
+   **pose cache** beside the movie — `<basename>.pose.json`, same folder,
+   same stem (see **Stress diagram** below). The next time the session
+   screen opens it reads those frames instead of running Vision again.
 
 Worth knowing:
 
@@ -211,6 +216,73 @@ when the folder is absent — scores then read "No score yet (no reference)".
 an invalid file is logged once, never a crash. The unit tests use the
 synthetic `parity_reference.json` inlined as a string instead — no test
 needs (or gets) the real one.
+
+## Stress diagram
+
+Open an **analysed** recording and the movie plays with the athlete's
+skeleton drawn over it (chainlink #48): bones and joints coloured by how far
+the form is off, joints *sized* by it, the vertical **stack line** through
+the hands, and the **centre of mass** — a dot with an arrow to where it
+projects onto the hand line, coloured by which side of the base of support
+it is on.
+
+### What the colours mean
+
+- **Green** — on target, and the CoM inside the base of support.
+- **Amber** — off, but not badly; the CoM in front of the fingertips is
+  amber's twin the other way: *under* (behind the heel) is amber, *over*
+  (past the fingers) is **red**.
+- **Red** — badly off.
+- **Grey** — not held or not measured: outside a hold the whole skeleton
+  turns grey, because a warm-up is not a fault.
+
+Joints are circles of `4 + 8 × severity` points (4 pt when grey), so how
+bad a fault is reads as size as well as colour. The legend under the player
+says all of this in a row of swatches, plus the note line: **"Colours
+compare with your reference"** when the build has a scoring reference (#28),
+or **"Colours use built-in form thresholds (no reference yet)"** until it
+does. The exact severity rules (z-scores with a reference, `TOLERANCES`
+without one) live in `HandstandCore.StressDiagram` and are documented in
+docs/swift.md.
+
+The **Diagram** button beside the scrubber hides and shows the overlay (on
+by default whenever there is one); play/pause and the scrubber move the
+playhead, and a `1/30 s` time observer picks the frame to draw — the same
+timestamps the analysis was made from, so the skeleton follows the body.
+
+**Side view only, for now**: every clip in the dataset is a side view, so
+the diagram measures sagittal-plane alignment only; front/back alignment is
+chainlink #83. The *ideal* "ghost" skeleton you would compare against is
+chainlink #28's — the model has the slot for it (`DiagramFrame.ideal`) and
+nothing fills it yet.
+
+### The pose cache
+
+Analysing a take runs Vision over every frame — seconds of work that must
+not be repeated just to *watch* the overlay again. So a finished run writes
+the frames it read to **`<basename>.pose.json` next to the movie**
+(`20260928-143059.mov` → `20260928-143059.pose.json`, same folder):
+
+```json
+{"schema": 1, "backend": "vision", "analysis_version": "vision-1",
+ "max_fps": 30,
+ "frames": [{"t_ms": 0, "detected": true,
+             "joints": {"nose": [x, y, visibility], …}}, …]}
+```
+
+- **Written** by `AnalysisService` when the extraction finishes — for a
+  *recording* only; a video picked from Photos has no row in History and so
+  gets no cache and no diagram (out of scope for now).
+- **Read** on the session screen's appear (and after a run): the frames go
+  through `Analyzer.analyze` again — milliseconds, no Vision — with this
+  build's reference, so the overlay can never go stale when a new reference
+  lands. `PoseCache.read` answers *nil* (and the screen simply waits for
+  "Analyse") on a missing file, bad JSON, or a `schema` / `analysis_version`
+  this build does not know.
+- **Deleted** with the recording, like the `.json` sidecar. `reconcile()`
+  ignores it — it is not a `.mov`, so it never becomes a History row.
+
+It is local to the phone, exactly like the video: no network, no copies.
 
 ## Testing recording on the phone
 
@@ -271,8 +343,14 @@ this checklist is for the iPhone (sideload as above):
    same progress, Cancel and result panel, with the duration and frame
    size still shown above it. Nothing appears in History — a pick is not a
    recording.
+6. **Play an analysed session** with the diagram on (chainlink #48): tap
+   ▶ and check the **skeleton follows your body** through the clip, and
+   that it **turns grey outside the hold** (the kick-up and the landing)
+   while the stack line stays down your hands. Toggle **Diagram** off and
+   on, then leave and re-open the session: the overlay comes straight back
+   from the `.pose.json` cache, without the analysis running again.
 
 Everything stays on the phone: no networking, no analytics, recordings are
 not uploaded anywhere. The app ships the home, record, history, analysis,
-video-pick and about screens; the stress-diagram overlay (chainlink #48)
-comes next.
+stress-diagram overlay, video-pick and about screens; the summary view and
+heat strip (chainlink #49) come next.

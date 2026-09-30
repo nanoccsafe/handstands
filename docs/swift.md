@@ -39,6 +39,7 @@ swift/HandstandCore/
 │   ├── Features.swift                  handstand.features — per-frame features + hold rows (#81)
 │   ├── Scorer.swift                    handstand.score — the weighted z-score scorer + reference (#41)
 │   ├── Analyzer.swift                  the whole chain, one entry point (#42)
+│   ├── StressDiagram.swift             the overlay's logic: severities, bands, one frame (#48)
 │   ├── BodyFrame.swift                 handstand.bodyframe
 │   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
@@ -50,6 +51,7 @@ swift/HandstandCore/
     ├── FeaturesTests.swift             golden parity + the feature tests (#81)
     ├── ScorerTests.swift               golden parity (expected.score) + the scorer tests (#41)
     ├── AnalyzerTests.swift             the end-to-end chain over every fixture (#42)
+    ├── StressDiagramTests.swift        severities, the joint table, tolerances, frameIndex (#48)
     ├── RealParityTests.swift           the same over real clips, skipped without HANDSTAND_REAL_GOLDEN (#42)
     ├── GoldenComparison.swift          the one comparison every parity test runs (#42)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
@@ -575,6 +577,98 @@ Where the private data lives, and what never happens to it:
 * Without `HANDSTAND_REAL_GOLDEN` (a plain `swift test`) `RealParityTests`
   skips with a message saying how to point it at the data, so the public tree
   alone is always enough to build and test.
+
+## StressDiagram (chainlink #48)
+
+`Sources/HandstandCore/StressDiagram.swift` is the stress diagram's **logic**:
+what one frame of the overlay draws — which joints and bones, how far each is
+off, where the stack line and the centre of mass are — and nothing about
+pixels on a screen. The app draws a `DiagramFrame` over the video through
+`OverlayGeometry` (docs/ios.md), so every rule below is unit-tested without a
+view, a player or a video (`StressDiagramTests`). The diagram is **side view
+only** for now (every clip in the dataset is one) and no type says "side":
+front/back alignment is chainlink #83's to add.
+
+| Piece | What it is |
+|---|---|
+| `FeatureSide` / `FeatureTolerance` / `FeatureTolerances.all` | Python's `EITHER`/`BELOW`/`ABOVE`, the `TOLERANCES` table (same nine rows, same order, same numbers) and `fails_tolerance` — including "an unmeasured value fails nothing" |
+| `BodyFrame.fromBodyFrame(u:v:wristMidX:wristMidY:bodyLength:)` | the exact inverse of `toBodyFrame` (`x = wristMidX + u·L`, `y = wristMidY − v·L`): how the CoM, *measured* in body frames, is placed back in display pixels |
+| `Severity.colourBand(_:)` → `SeverityBand` | `.ok < 0.25 ≤ .warn < 0.5 ≤ .bad`; `SeverityBand.neutral` is the fourth answer, "not measured", which no number produces |
+| `DiagramJoint`, `DiagramBone`, `DiagramStackLine`, `DiagramFrame` | the frame to draw: joints and bones with their severity and band, the vertical stack line (a small struct, not a tuple — tuples do not make `DiagramFrame` Equatable), `stackBand`, `com`/`comFloor`/`balanceZone`, and `ideal` |
+| `StressDiagram.bones` | the skeleton's pairs: arms (shoulder→elbow→wrist), torso (shoulder→hip, shoulder line), legs (hip→knee→ankle, hip line), feet (ankle→foot index) |
+| `StressDiagram.jointFeatures` | the one joint→features table (below) |
+| `StressDiagram.frameIndex(atMs:in:)` | the **last** frame whose `t_ms ≤ t`, `nil` before the first — the playback→frame lookup |
+| `StressDiagram.frame(_:analysis:reference:height:)` | one frame of one `Analysis`, as a `DiagramFrame` |
+
+### Severity, with and without a reference
+
+Both modes only speak **inside a hold** (`phases.phase[i] == .hold`) **and**
+on a frame the features measured (`features.valid[i]`): outside both, every
+band is `.neutral`, every severity `nil`, and the skeleton is drawn grey — a
+warm-up is not a fault. A feature whose value is `NaN` gives no severity
+either.
+
+* **With a reference** — the scorer's own z-score, rescaled to 0…1:
+  `severity = min(|z|, Z_CAP) / Z_CAP`, with `z = (value − mean) /
+  max(sd, Scorer.sdFloors[feature])`. The floors are the scorer's table, not
+  a copy of it. The five `SIGNED_BY_FACING` features are multiplied by the
+  frame's `facing_sign` **before** the z-score is taken, and are skipped
+  entirely when that sign is `NaN` (a frame nobody could tell the facing of
+  is not evidence of which way the fault points). A feature the reference
+  does not carry has no severity — a partial reference (#28's may well be
+  partial) judges only what it knows.
+* **Without a reference** — `FeatureTolerances` only: `0` when the value
+  passes its target, and `min(1, 0.3 + excess/band)` when it fails, where
+  `excess` is the distance past the threshold (either side for `either`,
+  `threshold − value` for `below`, `value − threshold` for `above`) and
+  `band` is **20 for degree features, 0.2 for body-length features** — so
+  `hip_angle 140` (25° past 165) is a full `1.0`.
+
+A joint's severity is the **max** over the features that touch it, a bone's
+is the max of its two joints' (never an average — a line must not hide a bad
+joint behind a good one), and `stackBand` the band of
+`max(severity(line_deviation), severity(body_angle))`.
+
+### The joint–feature table
+
+`StressDiagram.jointFeatures`, in full — the joints the diagram draws are
+exactly the ones `processed.frames[i].valid` has:
+
+| Joint | Features (severity = max) |
+|---|---|
+| nose | `head` |
+| shoulders | `shoulder_angle`, `off_shoulder` |
+| elbows | `elbow_angle` |
+| hips | `hip_angle`, `off_hip`, `banana` |
+| knees | `knee_angle`, `off_knee` |
+| ankles, foot indexes | `off_ankle`, `leg_separation` |
+| wrists | *(none)* — the origin every offset is measured from, so `.ok` in a hold, never a number out of nothing |
+
+The **head line** is the one bone not in `StressDiagram.bones`: the schema
+has no shoulder-*midpoint* joint to name, so `frame(_:…)` draws it from the
+nose to the **nearer** shoulder (in a side view the two shoulders sit on top
+of each other and either reads the same).
+
+### The colour bands
+
+| Band | Colour on screen | Means |
+|---|---|---|
+| `neutral` | grey | outside a hold, or a frame the features could not measure |
+| `ok` | green | on target (severity `< 0.25`), or a joint no feature judges |
+| `warn` | amber | `0.25 ≤ severity < 0.5` |
+| `bad` | red | `severity ≥ 0.5` (two SDs off with a reference, or well past the threshold without one) |
+
+Joints are drawn as circles of `4 + 8 × severity` points (4 pt for neutral),
+so "how bad" is readable as size as well as colour.
+
+### The ideal skeleton waits for #28
+
+`DiagramFrame.ideal` is `[Joint: Point2]?` and is **always `nil`** in this
+issue: the ghost "compare against your own perfect line" skeleton needs the
+user's reference skeleton, which is chainlink #28's output. The field is the
+extension point — #28 fills it, `StressDiagramOverlay` draws it, and nothing
+else in the model or the drawing changes. Nothing here ever guesses an ideal
+pose.
 
 ## VisionPoseKit / PoseService (chainlink #82)
 

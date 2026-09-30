@@ -429,4 +429,47 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(session.clipScore, 0.87)
         XCTAssertEqual(session.holdCount, 2)
     }
+
+    // MARK: - The pose cache (chainlink #48)
+
+    /// Deleting a recording takes its `.pose.json` with the movie: a cache
+    /// for a film nobody can play is a file nobody would ever read again.
+    func testDeleteRemovesThePoseCache() throws {
+        let sut = try makeSUT()
+        defer { try? FileManager.default.removeItem(at: sut.directory) }
+        let movie = try makeMovie(named: "20260928-143059.mov", in: sut.directory)
+        let session = try sut.store.add(
+            movie: movie,
+            metadata: nil,
+            info: VideoInfo(duration: 10, width: 1080, height: 1920)
+        )
+        try PoseCache.write(frames: [], for: movie)
+        let cache = PoseCache.cacheURL(for: movie)
+        XCTAssertTrue(exists(cache), "the cache sits beside the movie")
+
+        try sut.store.delete(session)
+
+        XCTAssertFalse(exists(cache), "the pose cache goes with the recording")
+        XCTAssertFalse(exists(movie))
+        XCTAssertEqual(try sut.store.sessions().count, 0)
+    }
+
+    /// A `.pose.json` beside nothing is not a recording: `reconcile()` must
+    /// not give it a History row (it filters on `.mov`, and this pins the
+    /// cache's own suffix down as one of the ignored files).
+    func testReconcileIgnoresThePoseCacheFile() async throws {
+        let sut = try makeSUT(
+            readInfo: fixedReader(VideoInfo(duration: 8.5, width: 720, height: 1280))
+        )
+        defer { try? FileManager.default.removeItem(at: sut.directory) }
+        try Data(#"{"schema": 1, "frames": []}"#.utf8).write(
+            to: sut.directory.appendingPathComponent("20260928-143059.pose.json")
+        )
+
+        let result = try await sut.store.reconcile()
+
+        XCTAssertEqual(result.added, 0)
+        XCTAssertEqual(result.removed, 0)
+        XCTAssertEqual(try sut.store.sessions().count, 0)
+    }
 }

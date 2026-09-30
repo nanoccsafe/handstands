@@ -110,6 +110,36 @@ final class BodyFrameTests: XCTestCase {
         XCTAssertEqual(midpoint.visibility, 0.4)
     }
 
+    func testFromBodyFrameInvertsToBodyFrame() throws {
+        // The round trip every stress-diagram point goes through (#48): a
+        // display pixel into the body frame and straight back, to the bit.
+        let wristX = 200.0
+        let wristY = 500.0
+        let length = 300.0
+        let cases: [(u: Double, v: Double)] = [
+            (0, 0), (1, 0), (0, 1), (-0.5, 0.75), (0.05, 0.7), (-1.23456, 3.45678),
+        ]
+        for point in cases {
+            let display = BodyFrame.fromBodyFrame(
+                u: point.u, v: point.v, wristMidX: wristX, wristMidY: wristY,
+                bodyLength: length)
+            let uv = try BodyFrame.toBodyFrame(
+                x: display.x, y: display.y, wristMidX: wristX, wristMidY: wristY,
+                bodyLength: length)
+            XCTAssertEqual(uv.u, point.u, accuracy: 1e-12, "u of \(point)")
+            XCTAssertEqual(uv.v, point.v, accuracy: 1e-12, "v of \(point)")
+        }
+        // The wrist midpoint itself, and one body length straight up.
+        let origin = BodyFrame.fromBodyFrame(
+            u: 0, v: 0, wristMidX: wristX, wristMidY: wristY, bodyLength: length)
+        XCTAssertEqual(origin.x, wristX, accuracy: 0)
+        XCTAssertEqual(origin.y, wristY, accuracy: 0)
+        let above = BodyFrame.fromBodyFrame(
+            u: 0, v: 1, wristMidX: wristX, wristMidY: wristY, bodyLength: length)
+        XCTAssertEqual(above.x, wristX, accuracy: 0)
+        XCTAssertEqual(above.y, wristY - length, accuracy: 0)
+    }
+
     func testBodyFrameErrorMatchesThePythonMessage() {
         XCTAssertEqual(
             "\(BodyFrame.BodyFrameError.invalidBodyLength(0))",

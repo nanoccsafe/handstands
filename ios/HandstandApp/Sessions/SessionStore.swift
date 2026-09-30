@@ -86,9 +86,10 @@ final class SessionStore {
         return session
     }
 
-    /// Deletes a session **and its video**: the `.mov`, its `.json` sidecar
-    /// and the row. A missing sidecar is not an error — the movie goes and
-    /// the row goes with it. Files outside the Recordings folder are never
+    /// Deletes a session **and its video**: the `.mov`, its `.json` sidecar,
+    /// its `.pose.json` pose cache (chainlink #48) and the row. A missing
+    /// sidecar or cache is not an error — the movie goes and the row goes
+    /// with it. Files outside the Recordings folder are never
     /// touched: only URLs that resolve inside it are removed, so a filename
     /// that somehow points elsewhere costs the file nothing (the row still
     /// goes, otherwise History would keep listing a take the app refuses to
@@ -99,6 +100,10 @@ final class SessionStore {
             let sidecar = RecordingMetadata.sidecarURL(for: movie)
             if isInsideRecordingsFolder(sidecar), fileManager.fileExists(atPath: sidecar.path) {
                 try fileManager.removeItem(at: sidecar)
+            }
+            let cache = PoseCache.cacheURL(for: movie)
+            if isInsideRecordingsFolder(cache), fileManager.fileExists(atPath: cache.path) {
+                try fileManager.removeItem(at: cache)
             }
             if fileManager.fileExists(atPath: movie.path) {
                 try fileManager.removeItem(at: movie)
@@ -115,7 +120,8 @@ final class SessionStore {
     ///   sidecar if it has one, otherwise Line and the file's creation date;
     ///   duration and frame size from `readInfo`;
     /// - a session whose `.mov` is gone is removed;
-    /// - anything that is not a `.mov` (sidecars, junk) is ignored.
+    /// - anything that is not a `.mov` (sidecars, `.pose.json` pose caches,
+    ///   junk) is ignored.
     ///
     /// Runs every time the History screen appears.
     func reconcile() async throws -> (added: Int, removed: Int) {
