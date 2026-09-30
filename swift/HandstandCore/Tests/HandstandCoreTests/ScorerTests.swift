@@ -387,12 +387,36 @@ final class ScorerTests: XCTestCase {
         }
     }
 
-    /// The tolerance that applies to `path`: the longest key of
-    /// `meta.tolerances` that prefixes it, with list indices dropped first —
-    /// `tolerance_for` in `tests/test_golden.py`.
+    /// The tolerance that applies to `path`.
+    ///
+    /// Under `expected.score` the **field** names the key of
+    /// `meta.tolerances`: `values.*` is `expected.score.values`, `z.*` is
+    /// `expected.score.z`, `groups.*` is `expected.score.groups`, a top
+    /// fault's value and mean are values and its z is a z, `deviation`,
+    /// `penalty` and `score` are their own keys, and the integer hold fields
+    /// are exact — like the strings, which never ask for a tolerance at all.
+    /// A plain prefix match cannot do that: the `holds.<n>` (and list-index)
+    /// segments in the middle mean `expected.score.score` is no prefix of
+    /// `expected.score.holds.0.score`, which is how every hold field used to
+    /// fall back to `default` and the declared per-field tolerances were
+    /// never applied.
+    ///
+    /// Anywhere else — `expected.features.12.com_u` and friends — the longest
+    /// key that prefixes the path wins, list indices dropped first, as
+    /// `tolerance_for` in `tests/test_golden.py` does.
     private func tolerance(for path: String, in tolerances: [String: Double]) -> Double {
-        let parts = path.split(separator: ".")
-            .filter { segment in !segment.allSatisfy { $0.isNumber } }
+        let segments = path.split(separator: ".")
+        if segments.count >= 3, segments[0] == "expected", segments[1] == "score" {
+            // `holds.<n>.<field>…` under the section, or a field of the
+            // section itself (`clip_hold_id`).
+            let rest = Array(segments.dropFirst(2))
+            let field =
+                rest.first == "holds" && rest.count >= 3 ? Array(rest.dropFirst(2)) : rest
+            if let declared = scoreTolerance(field, in: tolerances) {
+                return declared
+            }
+        }
+        let parts = segments.filter { segment in !segment.allSatisfy { $0.isNumber } }
         var best: [Substring] = []
         var value = tolerances["default"] ?? 1e-6
         for (key, tolerance) in tolerances {
@@ -404,6 +428,73 @@ final class ScorerTests: XCTestCase {
             }
         }
         return value
+    }
+
+    /// The tolerance `meta.tolerances` declares for one field of
+    /// `expected.score`, or `nil` for a field with no key of its own — the
+    /// caller then falls back to the longest prefixing key, i.e. `default`
+    /// for every path this section has.
+    private func scoreTolerance(_ field: [Substring], in tolerances: [String: Double]) -> Double? {
+        guard let name = field.first else { return nil }
+        switch name {
+        case "values", "z", "groups":
+            // `values.<feature>`, `z.<feature>`, `groups.<name>` — the
+            // container itself is never a number.
+            guard field.count >= 2 else { return nil }
+            return tolerances["expected.score.\(name)"]
+        case "deviation", "penalty", "score":
+            return tolerances["expected.score.\(name)"]
+        case "top_faults":
+            // `top_faults.<fault>.<element>`: 0 is the feature name, 1 the
+            // value, 2 the mean, 3 the z — the fixture's four-tuple. Value
+            // and mean are measured like values, the z like a z.
+            guard field.count >= 3 else { return nil }
+            switch field[2] {
+            case "1", "2": return tolerances["expected.score.values"]
+            case "3": return tolerances["expected.score.z"]
+            default: return nil
+            }
+        case "hold_id", "hold_frames", "valid_frames", "hold_start_ms", "hold_end_ms",
+            "clip_hold_id":
+            return 0.0  // integers: exact, no decimal place to be lenient about
+        default:
+            return nil
+        }
+    }
+
+    /// The lookup every scored number goes through, on its own: the field
+    /// under `expected.score` names the declared key however many `holds.<n>`
+    /// segments sit above it, integers are exact, an unclaimed field falls
+    /// back to `default`, and outside the score section the prefix rule still
+    /// applies.
+    func testTheScoreToleranceLookupMapsEachFieldToItsOwnKey() throws {
+        let tolerances = try GoldenFixtures.load("line_hold").meta.tolerances
+
+        XCTAssertEqual(tolerance(for: "expected.score.holds.0.score", in: tolerances), 0.1)
+        XCTAssertEqual(tolerance(for: "expected.score.holds.1.z.hip_angle", in: tolerances), 1e-4)
+        XCTAssertEqual(tolerance(for: "expected.score.holds.0.values.banana", in: tolerances), 1e-6)
+        XCTAssertEqual(tolerance(for: "expected.score.holds.0.groups.stack", in: tolerances), 1e-4)
+        XCTAssertEqual(tolerance(for: "expected.score.holds.0.deviation", in: tolerances), 1e-4)
+        XCTAssertEqual(tolerance(for: "expected.score.holds.0.penalty", in: tolerances), 1e-4)
+        // A top fault's value and mean are values, its z is a z.
+        XCTAssertEqual(
+            tolerance(for: "expected.score.holds.2.top_faults.0.1", in: tolerances), 1e-6)
+        XCTAssertEqual(
+            tolerance(for: "expected.score.holds.2.top_faults.0.2", in: tolerances), 1e-6)
+        XCTAssertEqual(
+            tolerance(for: "expected.score.holds.2.top_faults.0.3", in: tolerances), 1e-4)
+        // Integers are exact.
+        XCTAssertEqual(tolerance(for: "expected.score.holds.0.hold_frames", in: tolerances), 0.0)
+        XCTAssertEqual(tolerance(for: "expected.score.clip_hold_id", in: tolerances), 0.0)
+        // A field no key claims falls back to default …
+        let fallback = tolerances["default"] ?? 1e-6
+        XCTAssertEqual(
+            tolerance(for: "expected.score.holds.0.hold_duration_s", in: tolerances), fallback)
+        XCTAssertEqual(tolerance(for: "meta.frame_count", in: tolerances), fallback)
+        // … and outside the score section the prefix rule still applies.
+        XCTAssertEqual(tolerance(for: "expected.features.12.com_u", in: tolerances), 1e-3)
+        XCTAssertEqual(
+            tolerance(for: "expected.postprocess.frames.3.filled", in: tolerances), 0.0)
     }
 
     /// One JSON value in `null`/number/string form, for a failure message.
