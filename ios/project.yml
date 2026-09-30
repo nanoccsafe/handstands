@@ -61,6 +61,7 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSCameraUsageDescription: Record your handstand attempts to analyse your form.
+        NSPhotoLibraryAddUsageDescription: Save your annotated handstand video to Photos.
         NSPhotoLibraryUsageDescription: Choose a handstand video to analyse.
         UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
@@ -73,6 +74,8 @@ targets:
         product: HandstandCore
       - package: VisionPose
         product: VisionPoseKit
+      - package: VisionPose
+        product: AnnotatedVideo
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nanoccsafe.handstand
@@ -92,6 +95,8 @@ targets:
         product: HandstandCore
       - package: VisionPose
         product: VisionPoseKit
+      - package: VisionPose
+        product: AnnotatedVideo
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nanoccsafe.handstand.HandstandAppTests

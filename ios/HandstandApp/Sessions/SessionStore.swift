@@ -11,7 +11,9 @@ import SwiftData
 /// Local only: the container behind `context` is opened with
 /// `cloudKitDatabase: .none` (`HandstandApp.swift`) and nothing here talks
 /// to the network. `delete` never touches a file outside the Recordings
-/// folder, whatever a stored filename says.
+/// folder, whatever a stored filename says — except the session's annotated
+/// export in Caches (chainlink #50), which is built from the movie's *name*
+/// and so can only be the file the export button wrote.
 @MainActor
 final class SessionStore {
     /// How `reconcile()` reads a movie's duration and size. Injected so the
@@ -22,6 +24,10 @@ final class SessionStore {
     private let recordingsDirectory: URL
     private let fileManager: FileManager
     private let readInfo: InfoReader
+    /// Where `<basename>-annotated.mp4` exports (chainlink #50) are cached —
+    /// the app's Caches directory unless a test injects one, so `delete`
+    /// removes an export from the same place the export button wrote it.
+    private let annotatedDirectory: URL
 
     /// - Parameters:
     ///   - context: the History database (one container for the app).
@@ -30,16 +36,22 @@ final class SessionStore {
     ///   - fileManager: injectable for the tests.
     ///   - readInfo: reads duration and frame size; defaults to
     ///     `VideoInfoReader` (AVFoundation).
+    ///   - annotatedDirectory: where annotated exports are cached; defaults
+    ///     to the app's Caches directory.
     init(
         context: ModelContext,
         recordingsDirectory: URL,
         fileManager: FileManager = .default,
-        readInfo: @escaping InfoReader = { try await VideoInfoReader.read(url: $0) }
+        readInfo: @escaping InfoReader = { try await VideoInfoReader.read(url: $0) },
+        annotatedDirectory: URL? = nil
     ) {
         self.context = context
         self.recordingsDirectory = recordingsDirectory.standardizedFileURL
         self.fileManager = fileManager
         self.readInfo = readInfo
+        self.annotatedDirectory = annotatedDirectory
+            ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? recordingsDirectory.standardizedFileURL
     }
 
     // MARK: - Reading
@@ -56,6 +68,22 @@ final class SessionStore {
     /// the name never did.
     func movieURL(for session: Session) -> URL {
         recordingsDirectory.appendingPathComponent(session.movieFilename)
+    }
+
+    /// Where this session's annotated export (chainlink #50) is cached —
+    /// `<basename>-annotated.mp4` in the Caches directory (a test's own
+    /// directory). Not a recording: it is never in the Recordings folder
+    /// and never becomes a History row.
+    func annotatedExportURL(for session: Session) -> URL {
+        Self.annotatedExportURL(for: movieURL(for: session), in: annotatedDirectory)
+    }
+
+    /// The export's name, spelled once so the export button and `delete`
+    /// can never disagree: the movie's basename plus `-annotated.mp4`. The
+    /// basename is a *name*, so joining it to `directory` cannot leave it.
+    static func annotatedExportURL(for movie: URL, in directory: URL) -> URL {
+        let basename = movie.deletingPathExtension().lastPathComponent
+        return directory.appendingPathComponent("\(basename)-annotated.mp4")
     }
 
     // MARK: - Writing
@@ -87,13 +115,16 @@ final class SessionStore {
     }
 
     /// Deletes a session **and its video**: the `.mov`, its `.json` sidecar,
-    /// its `.pose.json` pose cache (chainlink #48) and the row. A missing
-    /// sidecar or cache is not an error — the movie goes and the row goes
-    /// with it. Files outside the Recordings folder are never
-    /// touched: only URLs that resolve inside it are removed, so a filename
-    /// that somehow points elsewhere costs the file nothing (the row still
-    /// goes, otherwise History would keep listing a take the app refuses to
-    /// open).
+    /// its `.pose.json` pose cache (chainlink #48), its leftover annotated
+    /// export in Caches (chainlink #50) and the row. A missing sidecar,
+    /// cache or export is not an error — the movie goes and the row goes
+    /// with it. Files outside the Recordings folder are never touched:
+    /// only URLs that resolve inside it are removed, so a filename that
+    /// somehow points elsewhere costs the file nothing (the row still goes,
+    /// otherwise History would keep listing a take the app refuses to open).
+    /// The one file built outside the folder is the annotated export, whose
+    /// URL is a *name* joined to the fixed exports directory — it cannot
+    /// point at anything the app did not write.
     func delete(_ session: Session) throws {
         let movie = movieURL(for: session)
         if isInsideRecordingsFolder(movie) {
@@ -108,6 +139,14 @@ final class SessionStore {
             if fileManager.fileExists(atPath: movie.path) {
                 try fileManager.removeItem(at: movie)
             }
+        }
+        // A leftover `<basename>-annotated.mp4` in Caches: nobody can watch
+        // an export of a recording that is gone. It is a cache rather than
+        // the recording, so a file that refuses to go must not keep the row
+        // alive — the deletion succeeds either way.
+        let annotated = Self.annotatedExportURL(for: movie, in: annotatedDirectory)
+        if fileManager.fileExists(atPath: annotated.path) {
+            try? fileManager.removeItem(at: annotated)
         }
         context.delete(session)
         try context.save()

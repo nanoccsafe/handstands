@@ -12,9 +12,11 @@ import UIKit
 /// form is off, the stack line and the centre of mass — the summary under
 /// the player (chainlink #49): a heat strip of the whole clip that seeks
 /// where you tap, the worst moment of the hold as a tappable card, and up
-/// to three coaching cues — and the one destructive action in the app:
-/// deleting takes the video off the phone too, after the same confirmation
-/// the list uses.
+/// to three coaching cues — the export of that same picture as a video
+/// (chainlink #50): diagram and strip burned into an `.mp4` in Caches, with
+/// progress, cancel and a share sheet, deleted when this screen goes away —
+/// and the one destructive action in the app: deleting takes the video off
+/// the phone too, after the same confirmation the list uses.
 @MainActor
 struct SessionDetailView: View {
     let session: Session
@@ -62,6 +64,10 @@ struct SessionDetailView: View {
     @State private var worstMoment: WorstMoment?
     @State private var worstMomentDiagram: DiagramFrame?
     @State private var cues: [CoachingCue] = []
+    /// The annotated video export (chainlink #50), owned here so leaving
+    /// the screen stops a run in flight and takes its cached file with it
+    /// (see `onDisappear`). Starts `.idle`, like the analysis service.
+    @State private var exporter = ExportService()
 
     /// Is a run in flight — the state the screen has to stay awake for.
     private var isAnalysing: Bool {
@@ -223,6 +229,34 @@ struct SessionDetailView: View {
                 )
             }
 
+            // The annotated video (chainlink #50): the picture with the
+            // diagram drawn on every frame and the heat strip along the
+            // bottom, written to the app's Caches — out of it only through
+            // the share sheet, and deleted when this screen goes away.
+            // Shown exactly when there is an analysis to draw (the same
+            // condition as the overlay).
+            if diagramAnalysis != nil {
+                Section("Export") {
+                    switch exporter.state {
+                    case .idle:
+                        Button("Export video") { exportVideo() }
+                    case .running(let progress):
+                        ProgressView(value: progress)
+                        Button("Cancel", role: .cancel) { exporter.cancel() }
+                    case .finished(let url):
+                        ShareLink(item: url) {
+                            Label("Share video", systemImage: "square.and.arrow.up")
+                        }
+                        Button("Export again") { exportVideo() }
+                    case .failed(let message):
+                        Text(message)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Button("Try again") { exportVideo() }
+                    }
+                }
+            }
+
             Section {
                 Button("Delete recording", role: .destructive) {
                     confirmingDelete = true
@@ -259,7 +293,11 @@ struct SessionDetailView: View {
             // Leaving the screen takes the sound with it, the analysis with
             // it (a run nobody is watching must not keep the CPU hot — and
             // Delete may be what sent this screen away), the time observer
-            // with it, and the "stay awake" with it.
+            // with it, and the "stay awake" with it. The annotated export
+            // (chainlink #50) goes too: it is a cache of *this* screen, so
+            // a run in flight is cancelled (the export deletes its own
+            // partial file) and the finished movie is deleted here — it is
+            // always one button away, remade on demand.
             player?.pause()
             isPlaying = false
             if let timeObserver, let player {
@@ -267,6 +305,11 @@ struct SessionDetailView: View {
             }
             timeObserver = nil
             service.cancel()
+            let exported = exporter.finishedURL
+            exporter.cancel()
+            if let exported {
+                try? FileManager.default.removeItem(at: exported)
+            }
             UIApplication.shared.isIdleTimerDisabled = false
         }
         .onChange(of: isAnalysing) { _, analysing in
@@ -438,8 +481,11 @@ struct SessionDetailView: View {
     private func delete() {
         // A run in flight must not write its result to a row that is about
         // to go: cancelling bumps the generation, so its save is refused
-        // no matter when it wakes up.
+        // no matter when it wakes up. The export goes for the same reason —
+        // `store.delete` takes the session's cached export with it, and a
+        // writer still going would only put a file back.
         service.cancel()
+        exporter.cancel()
         do {
             try store.delete(session)
             dismiss()
@@ -447,6 +493,23 @@ struct SessionDetailView: View {
             // The row and the video are still there (delete only removes
             // the record once the files are gone), so say what went wrong.
             deletionError = error.localizedDescription
+        }
+    }
+
+    /// The "Export video" button: this row's movie and the analysis on
+    /// screen, into the app's Caches as `<basename>-annotated.mp4`
+    /// (`SessionStore`'s own spelling, so `delete` removes exactly this
+    /// file). Anything a previous export left behind is deleted first, so
+    /// two exports never share a file.
+    private func exportVideo() {
+        guard let analysis = diagramAnalysis else { return }
+        let output = store.annotatedExportURL(for: session)
+        try? FileManager.default.removeItem(at: output)
+        let reference = diagramReference
+        let movie = store.movieURL(for: session)
+        Task {
+            await exporter.export(
+                movie: movie, analysis: analysis, reference: reference, to: output)
         }
     }
 

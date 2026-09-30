@@ -21,6 +21,7 @@
 // cannot be read, `nil`-finished when it ends.
 
 import AVFoundation
+import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -126,6 +127,51 @@ public struct VideoFrameSource: Sendable {
         guard seconds.isFinite else { return 0 }
         return Int((seconds * fps).rounded())
     }
+
+    /// The size of the clip's frames **once upright** — the display size a
+    /// viewer sees, in pixels.
+    ///
+    /// The same steps the reader takes before its first frame (file exists,
+    /// video track found, `preferredTransform` resolved to a quarter turn),
+    /// factored out of `VideoFrameReader.open` so a caller that must
+    /// configure an *output* before reading an input — the annotated export
+    /// (chainlink #50) writing its `.mp4` — measures the clip without
+    /// copying those steps. A transform that is not a plain quarter turn
+    /// throws here exactly as it does there.
+    public func displaySize() async throws -> CGSize {
+        let parts = try await Self.videoTrack(of: url)
+        let size = parts.displayTransform.displaySize
+        return CGSize(width: CGFloat(size.width), height: CGFloat(size.height))
+    }
+
+    /// The movie, its video track and the track's display transform: the
+    /// existence check, the track find and the `preferredTransform` →
+    /// quarter-turn conversion that ``displaySize()`` and
+    /// `VideoFrameReader.open` share.
+    static func videoTrack(of url: URL) async throws -> (
+        asset: AVAsset, track: AVAssetTrack, displayTransform: DisplayTransform
+    ) {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw VideoFrameSourceError.noVideoTrack(url.path)
+        }
+        let naturalSize = try await track.load(.naturalSize)
+        let preferred = try await track.load(.preferredTransform)
+        let storedSize = PixelSize(
+            width: Int(naturalSize.width.rounded()),
+            height: Int(naturalSize.height.rounded())
+        )
+        // Throws rather than guessing when the container's transform is not a
+        // plain quarter turn: sideways keypoints would be silent.
+        let displayTransform = try DisplayTransform.quarterTurns(
+            a: preferred.a, b: preferred.b, c: preferred.c, d: preferred.d,
+            storedSize: storedSize
+        )
+        return (asset, track, displayTransform)
+    }
 }
 
 /// One consumer's walk over one video: the runner's reading loop, one frame
@@ -212,27 +258,13 @@ final class VideoFrameReader: @unchecked Sendable {
 
     /// Everything the runner does before its `while` loop: find the track,
     /// resolve its `preferredTransform` to a quarter turn, and start an
-    /// `AVAssetReader` that decodes 32BGRA.
+    /// `AVAssetReader` that decodes 32BGRA. The track find and the transform
+    /// are `VideoFrameSource.videoTrack(of:)`'s — the same steps
+    /// `displaySize()` takes (chainlink #50), so the reader and a caller
+    /// configuring an output agree about the clip's display orientation.
     private func open() async throws {
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        let asset = AVURLAsset(url: url)
-        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
-            throw VideoFrameSourceError.noVideoTrack(url.path)
-        }
-        let naturalSize = try await track.load(.naturalSize)
-        let preferred = try await track.load(.preferredTransform)
-        let storedSize = PixelSize(
-            width: Int(naturalSize.width.rounded()),
-            height: Int(naturalSize.height.rounded())
-        )
-        // Throws rather than guessing when the container's transform is not a
-        // plain quarter turn: sideways keypoints would be silent.
-        let displayTransform = try DisplayTransform.quarterTurns(
-            a: preferred.a, b: preferred.b, c: preferred.c, d: preferred.d,
-            storedSize: storedSize
-        )
+        let parts = try await VideoFrameSource.videoTrack(of: url)
+        let (asset, track, displayTransform) = parts
 
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(

@@ -17,7 +17,7 @@ for one, with the expectations hard-coded in both.
 | path | what |
 |---|---|
 | `swift/HandstandCore/` | SwiftPM package: the port of the pipeline (this issue) |
-| `swift/VisionPose/` | the Apple Vision keypoint runner (chainlink #15) and **VisionPoseKit**, the shared `PoseService` backend (chainlink #82) |
+| `swift/VisionPose/` | the Apple Vision keypoint runner (chainlink #15), **VisionPoseKit**, the shared `PoseService` backend (chainlink #82), and **AnnotatedVideo**, the annotated video export (chainlink #50) |
 | `ios/` | the app (chainlink #44): `HandstandCore` for the maths, `VisionPoseKit` for the pose backend |
 | `tools/mac/swift_test.sh` | build and test a package on the Mac mini, from Linux |
 | `tools/mac/real_parity.sh` | the real-clip parity run: fixtures → the Mac → `RealParityTests` (chainlink #42) |
@@ -868,7 +868,10 @@ everything (what a parity run against the runner's CSV wants) — and
 `VideoPoseExtractor.extract(_:service:progress:)` runs a `PoseService` over
 the kept frames: `reset()` once, one `process` per frame, 0…1 progress and
 `Task` cancellation checked between frames. The app's `AnalysisService`
-(#47) drives it off the main actor.
+(#47) drives it off the main actor. `displaySize()` is the same track find
+and `preferredTransform` → quarter-turn resolution the reader takes,
+factored out of the reader's `open()` so chainlink #50's export can measure
+the clip before it reads a frame of it.
 
 Tests: `swift/VisionPose/Tests/VisionPoseKitTests/` — the y flip, the map-back
 checked against `CoordinateMath`, the `.auto` sequence including `reset()`, the
@@ -879,6 +882,77 @@ rotate modes, the lowest-wrist choice, missing joints and the absent
 `AVAssetWriter`: frame counts, the 30 fps rule, a quarter-turn track's
 display size, extract/reset/progress, cancellation), and one smoke test that
 runs the real detector over a blank 64×64 buffer made in the test.
+
+## AnnotatedVideo (chainlink #50)
+
+`swift/VisionPose/Sources/AnnotatedVideo/` is the export: the original
+video with the stress diagram (#48) drawn on **every** frame and the heat
+strip (#49) along the bottom, written as an H.264 `.mp4` the app's share
+sheet hands to Photos or a coach — and it stays on the phone until the user
+shares it. It is a library target of the VisionPose package (depends on
+`HandstandCore` and `VisionPoseKit`, builds for iOS 17 and macOS 15) that
+imports only CoreGraphics, CoreVideo, CoreText and AVFoundation — no UIKit,
+no AppKit — which is what lets its tests run on the Mac like the rest.
+
+| Piece | What it is |
+|---|---|
+| `DiagramStyle` | the palette and sizes: the overlay's colours per `SeverityBand` and `BalanceZone` (sRGB twins of the system colours SwiftUI resolves to), 4 pt bones, the 7/5 stack-line dash, the `4 + 8 × severity` radius rule, the strip's 3 % |
+| `DiagramRenderer.draw(_:in:scale:style:)` | one `DiagramFrame` into a `CGContext` in **display pixels with the origin top-left** (the caller flips), `scale = videoHeight / 1000` — a 1920-high video draws 1.92× the on-screen point sizes |
+| `DiagramRenderer.drawHeatStrip(_:playheadMs:in:ctx:style:)` | the bins, a white playhead, and a **neutral (grey) strip** when there are no bins at all |
+| `AnnotatedExport` | `AVAssetReader → CoreGraphics → AVAssetWriter`: every source frame, drawn over, appended, finished |
+| `ExportError` | what can go wrong around the run, in sentences |
+
+**Why not `AVVideoCompositionCoreAnimationTool`**: the skeleton changes
+every frame, and drawing each frame directly is deterministic and testable
+on macOS — the tests write their own synthetic clips with `AVAssetWriter`
+and read the output back pixel by pixel.
+
+How a run goes, in order:
+
+1. `VideoFrameSource(url:maxFps:0).displaySize()` — the source's
+   `preferredTransform` resolved to a quarter turn (the same steps the
+   *reader* takes, factored out of `VideoFrameReader.open`), so the writer
+   is configured with the **display** size before the first frame is read.
+   The writer's input carries **no transform**: the output track is
+   upright with an identity `preferredTransform`, whatever the source said.
+2. `VideoFrameSource(url:maxFps:0).frames()` — every source frame (nothing
+   capped at 30 fps), already in display orientation, with the clip's own
+   `tMs`.
+3. Per frame: the diagram is `StressDiagram.frame(frameIndex(atMs: tMs, in:
+   features.tMs), …)` — the latest analysed frame at or before it, the
+   overlay's own rule — drawn over a copy of the picture in a `CGContext`
+   flipped to top-left, then the strip (`SessionSummary.heatStrip`,
+   capped at the analysed frame count so a short clip's strip has no bins
+   nothing fell into) along the bottom 3 %, then the CoreText footer
+   bottom-left: "Handstand · \<yyyy-mm-dd\>", plus "Score 78" when the clip
+   has one.
+4. Audio, when present: the source's AAC passed through sample for sample,
+   interleaved with the video by timestamp. Anything an `.mp4` cannot carry
+   unchanged (LPCM, say) is dropped rather than transcoded — the video
+   still exports.
+5. `finishWriting`, with progress 0…1 along the way (0, the frames against
+   the estimated count, 1 only when the file is finished).
+
+An **unusable** analysis (`features`/`phases` not usable) does not fail the
+export: the movie is written with no skeleton and a neutral strip. On `Task`
+cancellation the run stops, **deletes the partial file** and throws
+`CancellationError`; any other failure cleans up the same way, so `output`
+either does not exist or is a finished, playable movie. An existing file at
+`output` is overwritten.
+
+Tests: `swift/VisionPose/Tests/AnnotatedVideoTests/` — every test writes
+its own 45-frame, 30 fps, 180 × 320 **mid-grey** clip (one variant stored
+sideways with a quarter-turn transform) and builds its analysis from
+hand-made `PostProcessInputFrame`s (a static inverted body — the hold the
+segmenter looks for), then checks: the output exists, keeps the display
+size and has an identity transform; the frame count and duration follow the
+source within a frame; **a pixel on a bone's midpoint is not grey** while a
+pixel far from the skeleton still is (the same check over the sideways
+source — orientation included); the strip's coloured bins are coloured; an
+unusable analysis still exports, with no bone pixels and a neutral strip;
+a cancellation deletes the partial file; and `DiagramRendererTests` puts
+red on a bad joint's own pixel in a small bitmap context, plus the radius
+rule and the strip's bins, playhead and neutral fill.
 
 ## Running the tests
 
