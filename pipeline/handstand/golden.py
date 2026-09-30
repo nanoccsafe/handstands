@@ -44,9 +44,18 @@ What is in a fixture
     What the real stages answered: ``postprocess`` (per frame ``valid`` and
     ``filled`` as arrays in ``meta.joint_names`` order plus the processed
     ``joints``, and the body length parts), ``phases`` (per frame ``phase`` and
-    ``hold_id``), ``features`` (per frame, ``meta.feature_columns``) and
+    ``hold_id``), ``features`` (per frame, ``meta.feature_columns``),
     ``hold_summary`` (one row per hold, straight out of
-    :func:`handstand.features.hold_rows`).
+    :func:`handstand.features.hold_rows`) and ``score`` (one object per hold
+    from :func:`handstand.score.score_clip` plus the clip's own
+    ``clip_hold_id``, scored against the folder's ``parity_reference.json``).
+
+``parity_reference.json``
+    Next to the fixtures, one file for all of them: a schema-v1 reference
+    (:mod:`handstand.score`'s format) built from the qualifying holds of the
+    five synthetic cases, so ``expected.score`` means the same thing on both
+    sides. It is **not a real reference** — nothing here is (chainlink #80,
+    #28) — and both its ``built_from`` and the fixtures' README say so.
 
 Every float is rounded to 1e-6 and every NaN is written as ``null``, so the file
 is stable text: the same seed produces the same bytes
@@ -59,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import importlib.metadata
 import json
 import math
@@ -66,12 +76,12 @@ import pathlib
 import subprocess
 import sys
 import zlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
-from handstand import athlete, features, phases, postprocess
+from handstand import athlete, features, phases, postprocess, score
 from handstand.paths import data_dir
 
 __all__ = [
@@ -86,6 +96,8 @@ __all__ = [
     "JOINTS",
     "MAX_FIXTURE_BYTES",
     "NEVER_REAL_TREES",
+    "PARITY_BUILT_FROM",
+    "PARITY_REFERENCE_NAME",
     "REAL_SUBDIR",
     "TOLERANCES",
     "CaseSpec",
@@ -97,13 +109,18 @@ __all__ = [
     "default_out_dir",
     "fixture_text",
     "main",
+    "parity_reference",
+    "parity_reference_payload",
     "read_fixture",
     "real_fixture",
     "recompute",
+    "reference_from_runs",
     "repo_root",
     "require_outside_repo",
     "run_pipeline",
+    "score_section",
     "write_fixture",
+    "write_parity_reference",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -111,8 +128,9 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 #: Bumped whenever the generator's output changes shape or meaning, so a Swift
-#: port can say which version of the fixtures it was written against.
-GENERATOR_VERSION = "1"
+#: port can say which version of the fixtures it was written against. Version 2
+#: added ``expected.score`` and the folder's ``parity_reference.json``.
+GENERATOR_VERSION = "2"
 
 #: The default seed. Deterministic: the committed fixtures are regenerated from
 #: it, and the test that proves it writes the same case twice and compares bytes.
@@ -163,7 +181,11 @@ ROUND_DIGITS = 6
 #:   are measured from — is exact to 1e-6, the writing precision;
 #: * anything the One-Euro filter or the gap fill touched, and every feature
 #:   measured off it, gets 1e-3: a port is allowed to disagree with Python in
-#:   the last digits of a filtered number, not in its value.
+#:   the last digits of a filtered number, not in its value;
+#: * the scorer's own answers (#41) are stated per field: the hold values are
+#:   medians of already-rounded columns (1e-6), everything derived from them —
+#:   z-scores, group deviations, the penalty — is 1e-4, and the score itself
+#:   only carries one decimal, so 0.1 is the most a port may differ by.
 TOLERANCES: dict[str, float] = {
     "default": 1e-6,
     "input.joints": 1e-6,
@@ -175,6 +197,12 @@ TOLERANCES: dict[str, float] = {
     "expected.phases.hold_id": 0.0,
     "expected.features": 1e-3,
     "expected.hold_summary": 1e-3,
+    "expected.score.values": 1e-6,
+    "expected.score.z": 1e-4,
+    "expected.score.deviation": 1e-4,
+    "expected.score.penalty": 1e-4,
+    "expected.score.groups": 1e-4,
+    "expected.score.score": 0.1,
 }
 
 #: Display size every synthetic case is rendered in: the real clips are 1024x576
@@ -205,6 +233,20 @@ FIXTURE_SOURCE = "golden"
 #: Where the committed synthetic fixtures go, relative to the repository root —
 #: the default of ``--out``. ``default_out_dir`` is the absolute version of it.
 DEFAULT_OUT = pathlib.Path("swift/HandstandCore/Tests/HandstandCoreTests/Fixtures/golden")
+
+#: The name of the reference file the fixtures' ``expected.score`` was scored
+#: against, written next to them. One file for all five cases: a scorer parity
+#: fixture, not a yardstick for anything real.
+PARITY_REFERENCE_NAME = "parity_reference.json"
+
+#: What ``parity_reference.json``'s ``built_from`` says — the same disclaimer
+#: ``docs/scoring.md`` insists on, so nobody can read numbers out of it as a
+#: reference of good holds: this one is the holds of the five synthetic cases,
+#: and chainlink #28/#80 own the real thing.
+PARITY_BUILT_FROM = (
+    "synthetic golden holds: Python->Swift parity only, NOT a real reference "
+    "(chainlink #80, #28)"
+)
 
 #: Source trees a ``--real`` output may never land under, whatever ``.gitignore``
 #: says about them: real keypoints belong in the data tree, not in code, and no
@@ -976,6 +1018,10 @@ class FixtureRun:
     processed: postprocess.ProcessedClip
     phases: phases.ClipPhases
     features: features.ClipFeatures
+    #: The per-frame table the scorer reads: ``features.feature_table``'s own
+    #: columns at its own rounding, which in production is what the parquet
+    #: carries — so ``expected.score`` is scored from exactly what #29 reads.
+    table: pd.DataFrame
 
     @property
     def hold_count(self) -> int:
@@ -1024,7 +1070,114 @@ def run_pipeline(clip: postprocess.ClipKeypoints, case_id: str) -> FixtureRun:
         hold_id=labels.hold_id,
         trainer_contact=clip.trainer_contact,
     )
-    return FixtureRun(clip=clip, processed=processed, phases=labels, features=measured)
+    # The scorer reads the rounded per-frame table (the parquet features.py
+    # writes), not the raw arrays, so the fixture builds the same one here.
+    table = features.feature_table(measured)
+    return FixtureRun(
+        clip=clip, processed=processed, phases=labels, features=measured, table=table
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The parity reference
+# --------------------------------------------------------------------------- #
+
+
+def _valid_frame_mask(table: pd.DataFrame, hold_id: int) -> np.ndarray:
+    """The frames of one hold the features were measured on — ``hold_id`` and ``valid``."""
+    return (table["hold_id"].to_numpy() == hold_id) & table["valid"].to_numpy(dtype=bool)
+
+
+def reference_from_runs(runs: Iterable[FixtureRun]) -> score.Reference:
+    """A schema-v1 reference built from the qualifying holds of ``runs``.
+
+    Every hold with at least :data:`handstand.score.MIN_SCORE_FRAMES` valid
+    frames contributes one value per :data:`handstand.score.SCORE_FEATURES`
+    name (through :func:`handstand.score.hold_values`), and each feature's
+    entry is the mean, the **population** SD and the count of those finite
+    values — #29's own numbers, over a handful of synthetic holds. The means
+    and SDs are rounded to the writing precision before they become the
+    reference, so the file on disk and the reference the tests score against
+    are the same doubles rather than two readings of the same numbers.
+
+    A feature no qualifying hold could measure is left out, which is exactly
+    what a reference file may do (#29 allows a partial one).
+    """
+    collected: dict[str, list[float]] = {name: [] for name in score.SCORE_FEATURES}
+    n_holds = 0
+    for run in runs:
+        for hold_id in run.features.hold_ids():
+            if int(_valid_frame_mask(run.table, hold_id).sum()) < score.MIN_SCORE_FRAMES:
+                continue
+            n_holds += 1
+            for name, value in score.hold_values(run.table, hold_id).items():
+                if math.isfinite(value):
+                    collected[name].append(float(value))
+    entries = {
+        name: (
+            round(float(np.mean(values)), ROUND_DIGITS),
+            round(float(np.std(values)), ROUND_DIGITS),
+            len(values),
+        )
+        for name, values in collected.items()
+        if values
+    }
+    return score.Reference(features=entries, n_holds=n_holds, built_from=PARITY_BUILT_FROM)
+
+
+@functools.lru_cache(maxsize=1)
+def parity_reference() -> score.Reference:
+    """The one reference every fixture's ``expected.score`` is scored against.
+
+    Built once per process from the five cases at :data:`DEFAULT_SEED` — never
+    from the seed a caller happens to pass, because the committed
+    ``parity_reference.json`` and the committed ``expected.score`` have to
+    agree with each other whatever ``--seed`` does to the input. It is a
+    parity fixture and says so in its ``built_from``: the real reference is
+    chainlink #28's, and no number here may be read as one.
+    """
+    return reference_from_runs(
+        [run_pipeline(generate_case(case, seed=DEFAULT_SEED), case) for case in CASES]
+    )
+
+
+def parity_reference_payload(reference: score.Reference | None = None) -> dict[str, object]:
+    """The reference as its JSON document, in :mod:`docs/scoring.md`'s schema v1."""
+    chosen = parity_reference() if reference is None else reference
+    return {
+        "schema": score.REFERENCE_SCHEMA,
+        "version": score.REFERENCE_VERSION,
+        "signs": score.REFERENCE_SIGNS,
+        "built_from": chosen.built_from,
+        "n_holds": int(chosen.n_holds),
+        "features": {
+            name: {
+                "mean": round(float(mean), ROUND_DIGITS),
+                "sd": round(float(sd), ROUND_DIGITS),
+                "n": int(n),
+            }
+            for name, (mean, sd, n) in chosen.features.items()
+        },
+    }
+
+
+def write_parity_reference(
+    directory: str | pathlib.Path, reference: score.Reference | None = None
+) -> pathlib.Path:
+    """Write ``parity_reference.json`` into ``directory``, atomically, and return its path.
+
+    Same writer as the fixtures themselves, so the file's bytes are as stable
+    as theirs: the same reference always produces the same text.
+    """
+    path = pathlib.Path(directory) / PARITY_REFERENCE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(fixture_text(parity_reference_payload(reference)))
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -1079,13 +1232,15 @@ def input_frames(clip: postprocess.ClipKeypoints) -> list[dict[str, object]]:
 
 
 def expected_output(run: FixtureRun) -> dict[str, object]:
-    """The ``expected`` section: everything the three stages answered, per frame.
+    """The ``expected`` section: everything the four stages answered, per frame.
 
     The ``valid`` and ``filled`` arrays of a post-process frame are in
     ``meta.joint_names`` order, because they are per joint and a name-keyed
     object of them would be twice the size for no gain; ``joints`` stays keyed
     by name because that is the shape a person reads. Everything else is one
-    row per frame in frame order, next to the input's own rows.
+    row per frame in frame order, next to the input's own rows — except
+    ``score``, which is one object per hold, scored against
+    :func:`parity_reference`.
     """
     processed = run.processed
     body = processed.body_length
@@ -1129,6 +1284,54 @@ def expected_output(run: FixtureRun) -> dict[str, object]:
         "phases": phase_rows,
         "features": feature_rows,
         "hold_summary": hold_rows,
+        "score": score_section(run),
+    }
+
+
+def score_section(run: FixtureRun, reference: score.Reference | None = None) -> dict[str, object]:
+    """The ``expected.score`` section: every hold scored the way #29 scores it.
+
+    One object per hold from :func:`handstand.score.score_clip` (in ``hold_id``
+    order), then ``clip_hold_id`` — the ``hold_id`` of
+    :func:`handstand.score.clip_score`, or ``None`` when no hold of the clip
+    could be scored. NaN becomes ``null`` the way every other fixture float
+    does, so a hold with an unmeasured feature says so rather than writing a
+    number JSON cannot hold.
+
+    ``reference`` defaults to :func:`parity_reference`, which is what the
+    committed file holds; the tests pass the file read back to prove the two
+    are one reference.
+    """
+    chosen = parity_reference() if reference is None else reference
+    holds = score.score_clip(run.table, chosen)
+    best = score.clip_score(holds)
+    return {
+        "holds": [_hold_json(hold) for hold in holds],
+        "clip_hold_id": None if best is None else int(best.hold_id),
+    }
+
+
+def _hold_json(hold: score.HoldScore) -> dict[str, object]:
+    """One hold's score as the fixture writes it: every field #29's row has."""
+    return {
+        "hold_id": int(hold.hold_id),
+        "hold_frames": int(hold.hold_frames),
+        "valid_frames": int(hold.valid_frames),
+        "hold_start_ms": int(hold.hold_start_ms),
+        "hold_end_ms": int(hold.hold_end_ms),
+        "hold_duration_s": _num(hold.hold_duration_s),
+        "score": _num(hold.score),
+        "reason": str(hold.reason),
+        "deviation": _num(hold.deviation),
+        "penalty": _num(hold.penalty),
+        "groups": {name: _num(value) for name, value in hold.groups.items()},
+        "values": {name: _num(value) for name, value in hold.values.items()},
+        "z": {name: _num(value) for name, value in hold.z.items()},
+        "top_faults": [
+            [name, _num(value), _num(mean), _num(z)]
+            for name, value, mean, z in hold.top_faults
+        ],
+        "missing_groups": [str(name) for name in hold.missing_groups],
     }
 
 
@@ -1372,6 +1575,14 @@ def _dump(value: object, level: int) -> str:
         if all(isinstance(item, Mapping) for item in value):
             rows = ",\n".join(f"{pad} {_compact(item)}" for item in value)
             return "[\n" + rows + "\n" + pad + "]"
+        # A row of scalars inside a row — the scorer's `top_faults` — is still
+        # a row: one line per fault, like one line per frame and per hold.
+        if all(
+            isinstance(item, (list, tuple)) and all(_is_scalar(part) for part in item)
+            for item in value
+        ):
+            rows = ",\n".join(f"{pad} {_compact(list(item))}" for item in value)
+            return "[\n" + rows + "\n" + pad + "]"
         items = [f"{pad} {_dump(item, level + 1)}" for item in value]
         return "[\n" + ",\n".join(items) + "\n" + pad + "]"
     return _compact(value)
@@ -1541,6 +1752,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         fixture = build_fixture(case, seed=args.seed)
         path = write_fixture(target, fixture)
         print(_line(fixture, path), flush=True)
+    # Written next to the fixtures whichever subset was generated: every
+    # fixture's expected.score is scored against *this* reference.
+    reference_path = write_parity_reference(target)
+    print(f"parity reference {reference_path} ({parity_reference().n_holds} holds)")
     print(f"wrote {len(cases)} fixture(s) to {target}")
     return 0
 

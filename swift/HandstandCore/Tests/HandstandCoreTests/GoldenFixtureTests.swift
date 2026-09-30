@@ -141,6 +141,19 @@ final class GoldenFixtureTests: XCTestCase {
             XCTAssertEqual(
                 fixture.expected.holdSummary.count, fixture.meta.holdCount,
                 "\(name): hold summary rows")
+
+            // The scorer's answers (#41) decode as the document README says:
+            // one score per hold, and the clip's own hold beside them.
+            guard case .object(let score) = fixture.expected.score else {
+                XCTFail("\(name): expected.score is not an object")
+                continue
+            }
+            guard case .array(let scored)? = score["holds"] else {
+                XCTFail("\(name): expected.score has no holds array")
+                continue
+            }
+            XCTAssertEqual(scored.count, fixture.meta.holdCount, "\(name): score rows")
+            XCTAssertNotNil(score["clip_hold_id"], "\(name): clip_hold_id is missing")
         }
         XCTAssertEqual(Set(seen), Set(Self.expectedCases), "the five committed cases")
     }

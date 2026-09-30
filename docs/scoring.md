@@ -16,7 +16,10 @@ Two other issues own the parts this one deliberately does not decide:
   top of `pipeline/handstand/score.py`, each with a comment saying what it is
   for, and they are the only thing that is expected to change.
 
-The Swift port is #41.
+The Swift port is #41: `swift/HandstandCore/Sources/HandstandCore/Scorer.swift`
+mirrors this document and `pipeline/handstand/score.py` — same constants, same
+groups, same NaN rules, same rounding — so the score on the device is the score
+the pipeline writes.
 
 ## Input
 

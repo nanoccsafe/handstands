@@ -260,6 +260,45 @@ public struct ClipFeatures: Sendable, Equatable {
         guard let first = frames.first, let last = frames.last else { return 0.0 }
         return Double(tMs[last] - tMs[first]) / 1000.0
     }
+
+    /// The per-frame table Python's scorer reads — `feature_table`'s rounding
+    /// on every column it carries — `ClipFeatures.tableRounded`.
+    ///
+    /// The scorer in production never sees the raw measurements: it reads the
+    /// parquet `features.feature_table` writes, which rounds each feature to
+    /// `Feature.digits` (five decimals on lengths and ratios, two on angles),
+    /// `com_u`/`com_v`/`com_forward` to five and `facing_sign` to zero —
+    /// half to even on the binary value, NaN staying NaN. Scoring the rounded
+    /// table is therefore what makes the on-device score equal the pipeline's,
+    /// and `Scorer` applies this first, exactly as Python applies it by
+    /// reading the file. Columns this copy does not carry are left alone;
+    /// they are read as `NaN` either way, as Python reads a column the
+    /// table does not have.
+    public func tableRounded() -> ClipFeatures {
+        var rounded = values
+        for spec in Features.all {
+            if let column = rounded[spec.name] {
+                rounded[spec.name] = column.map {
+                    Features.roundedScalar($0, digits: spec.digits)
+                }
+            }
+        }
+        // The centre-of-mass columns round like lengths, except the sign,
+        // which is a whole number: -1, 0 or 1.
+        for name in ["com_u", "com_v", "com_forward"] {
+            if let column = rounded[name] {
+                rounded[name] = column.map {
+                    Features.roundedScalar($0, digits: Features.lengthDigits)
+                }
+            }
+        }
+        if let column = rounded["facing_sign"] {
+            rounded["facing_sign"] = column.map { Features.roundedScalar($0, digits: 0) }
+        }
+        var table = self
+        table.values = rounded
+        return table
+    }
 }
 
 /// One row of the per-hold table — the numeric half of a `hold_rows` dict in

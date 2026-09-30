@@ -36,6 +36,7 @@ swift/HandstandCore/
 │   ├── Phases.swift                    handstand.phases — the segmenter, phases only (#40)
 │   ├── CentreOfMass.swift              handstand.com — the segment model and balance (#81)
 │   ├── Features.swift                  handstand.features — per-frame features + hold rows (#81)
+│   ├── Scorer.swift                    handstand.score — the weighted z-score scorer + reference (#41)
 │   ├── BodyFrame.swift                 handstand.bodyframe
 │   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
@@ -45,6 +46,7 @@ swift/HandstandCore/
     ├── PhasesTests.swift               golden parity + the phase segmenter tests (#40)
     ├── CentreOfMassTests.swift         mirrors pipeline/tests/test_com.py (#81)
     ├── FeaturesTests.swift             golden parity + the feature tests (#81)
+    ├── ScorerTests.swift               golden parity (expected.score) + the scorer tests (#41)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
     ├── FramingCheckTests.swift         whole body in frame / cut off / too small / alone (#46)
     ├── PoseFrameTests.swift            midpoint / isValid
@@ -52,7 +54,7 @@ swift/HandstandCore/
     ├── GoldenFixtures.swift            the golden fixture schema, shared by the parity tests
     ├── GoldenFixtureTests.swift        the fixtures decode and their rows line up (#25)
     ├── Fixtures/tiny_frames.json       three hand-written PoseFrames
-    └── Fixtures/golden/                the five synthetic parity cases + README.md
+    └── Fixtures/golden/                the five synthetic parity cases + the parity reference + README.md
 ```
 
 Conventions the sources keep, so the package builds for **both iOS and macOS**:
@@ -95,6 +97,9 @@ Conventions the sources keep, so the package builds for **both iOS and macOS**:
   it is on, in the section below (chainlink #81).
 * `Features` — `handstand.features`: the 14 per-frame features, the balance
   columns and the per-hold summary, in the section below (chainlink #81).
+* `Scorer` — `handstand.score`: the weighted z-score of each hold against a
+  reference of good holds, and the reference file's own reader, in the section
+  below (chainlink #41).
 * `BodyFrame` — `handstand.bodyframe.to_body_frame` /
   `body_frame_points` / `midpoint`: origin at the wrist midpoint, `u` to the
   right, `v` up, divided by `L`. A `body_length` that is not a positive finite
@@ -371,7 +376,10 @@ both where both are and the one that is where only one is, except
 rounds like Python's `round(x, d)` — half to even on the binary value — with
 `NaN` left as `NaN`. The tables (`feature_table`), the parquet / CSV writing,
 the `ClipStats` summary, the TOLERANCES fault list, the plots and the CLI are
-**not** ported.
+**not** ported — except the one table the scorer reads: `ClipFeatures.tableRounded()`
+rounds every column the way `feature_table` writes it (five decimals on
+lengths, two on angles, none on the facing sign), which chainlink #41 added so
+the on-device score equals the pipeline's.
 
 `FeaturesTests.testEveryGoldenFixtureMatchesThePythonFeatures` runs all five
 golden fixtures of chainlink #25 through `PostProcess.process`,
@@ -381,6 +389,79 @@ golden fixtures of chainlink #25 through `PostProcess.process`,
 integer fields exact; a mismatch names the case, the frame or hold, the column
 and both values. The other tests mirror the core of
 `pipeline/tests/test_features.py` on poses written by hand in the body frame.
+
+## Scorer (chainlink #41)
+
+`Sources/HandstandCore/Scorer.swift` mirrors `pipeline/handstand/score.py`:
+the weighted z-score of every hold of a clip against a reference of good
+holds — the end of the on-device chain PostProcess (#39) → PhaseSegmenter
+(#40) → Features (#81) → this. The entry points are
+`Scorer.scoreClip(_:reference:)` → `[HoldScore]`, `Scorer.clipScore(_:)` →
+the hold a clip is represented by, and `Scorer.scoreHold(_:holdId:reference:)`
+/ `Scorer.holdValues(_:holdId:)` for one hold; `ScoreReference.decode(_:)`
+reads and validates the reference file (`docs/scoring.md`'s schema v1),
+throwing `ScoreReferenceError` with Python's `ValueError` messages. The CSV
+table, the summary and the CLI are **not** ported.
+
+What it does, in the order the pipeline does it:
+
+1. **The rounded table first** — `ClipFeatures.tableRounded()` (in
+   Features.swift): Python's stage reads the parquet `feature_table` writes,
+   so the scorer rounds every column to `Feature.digits` (five decimals on
+   lengths and ratios, two on angles), `com_u`/`com_v`/`com_forward` to five
+   and `facing_sign` to zero — half to even on the binary value, `NaN` left
+   as `NaN` — before measuring anything. That is what makes the on-device
+   score equal the pipeline's.
+2. **The values** — `holdValues` mirrors `hold_values`: over the hold's
+   measurable frames (`hold_id == h && valid`), the median over the finite
+   values of each of the fourteen per-frame features — the five of
+   `SIGNED_BY_FACING` multiplied by each frame's `facing_sign` first (a NaN
+   sign making that frame NaN, which drops it out of the median) — plus the
+   **population** SDs of `com_forward` and `hip_angle`. A hold below
+   `MIN_SCORE_FRAMES` (5) valid frames is not scored:
+   `"too few valid frames"`.
+3. **The score** — `z = (value - mean) / max(sd, SD_FLOOR)` capped at
+   `Z_CAP`, each group takes the mean capped |z| of the features it could
+   compare, `D` is the weight average over the groups that are there (a
+   missing group renormalises the weights), `P` the one-sided hip penalty,
+   and the score is `round(100 * max(0, 1 - (D + P) / Z_CAP), 1)` — half to
+   even, as Python rounds it. Every group missing is no score at all:
+   `"nothing to compare"`. `topFaults` ranks `weight * |z| / size` with ties
+   kept in `SCORE_FEATURES` order (Python's stable sort over `z`'s insertion
+   order, so Swift's sort is made stable by hand), and `hip_angle_sd` is in
+   no group — it is the penalty's own input.
+
+The constants, each the Python module constant of the same name:
+
+| Python | value | Swift |
+|---|---|---|
+| `SCORE_FEATURES` | 16 names | `Scorer.scoreFeatures` |
+| `SIGNED_BY_FACING` | the five image-signed features | `Scorer.signedByFacing` |
+| `GROUPS` | 7 groups, weights summing to 1.0 | `Scorer.groups: [Scorer.Group]` |
+| `MIN_SCORE_FRAMES` | 5 | `Scorer.minScoreFrames` |
+| `Z_CAP` | 4.0 | `Scorer.zCap` |
+| `SD_FLOOR_L`, `SD_FLOOR_DEG` | 0.01 L, 1.0° | `Scorer.sdFloorL`, `.sdFloorDeg` |
+| `_SD_FLOORS` | per feature, from its unit | `Scorer.sdFloors` |
+| `HIP_PENALTY_WEIGHT` | 0.10 | `Scorer.hipPenaltyWeight` |
+| `TOP_FAULTS` | 3 | `Scorer.topFaults` |
+| `REFERENCE_SCHEMA`, `REFERENCE_VERSION`, `REFERENCE_SIGNS` | handstand-reference, 1, athlete | `Scorer.referenceSchema`, `.referenceVersion`, `.referenceSigns` |
+
+`ScorerTests.testEveryGoldenFixtureMatchesThePythonScores` runs all five
+golden fixtures of chainlink #25 through the whole chain and compares
+`expected.score` with `ScoreReference.decode` of the folder's
+**`parity_reference.json`** at `meta.tolerances` — values 1e-6; z, deviation,
+penalty and groups 1e-4; the score 0.1 — with integers, the `reason`,
+`missing_groups` and the top-fault *names* exact and `null` ⇔ `nil`/`NaN`; a
+mismatch names the case, the hold, the key and both values. That reference is
+**not a real one**: it is built from the five synthetic cases' holds
+(`built_from` says so) and chainlink #28/#80 own the real thing. The other
+tests mirror `pipeline/tests/test_score.py` on tables written column by
+column with an inline `GOOD` reference — a hold at the means scores 100, one
+feature 2 SDs off moves only its group, the cap and the floors, the
+facing-sign flip and its NaN, the one-sided hip penalty, renormalisation, the
+two "not scored" reasons, invalid frames and hold −1 ignored, the population
+SD, `clip_score`, reference validation — plus `tableRounded`'s half-way
+rounding checked against numpy's answers.
 
 ## Running the tests
 
