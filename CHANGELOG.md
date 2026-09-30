@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- SessionStore with SwiftData (history, progress) (#51)
 - Hold-type picker in recording flow (MVP: line only, others shown as coming soon) (#66)
 - Epic: HandstandCore Swift package (port of pipeline) (#37)
 - End-to-end Python->Swift parity: Analyzer entry point, synthetic + real-clip parity (#42)
