@@ -165,6 +165,26 @@ up to 0.3 s of unknown frames inside a hold does not. The thresholds are module
 constants, documented at the top of `handstand.phases`. See
 `docs/keypoint_schema.md` for every column and the whole state machine.
 
+## Scoring
+
+One number per hold — how far its values sit from a reference of good holds,
+as a weighted z-score in the groups a judge would name.
+
+```sh
+cd pipeline
+uv run python -m handstand.score --reference reference.json --all
+uv run python -m handstand.score --reference reference.json --clip 057c9e6c96af
+```
+
+Reads `features/<source>/` and writes `$HANDSTAND_DATA/scores/<source>/scores.csv`
+— one row per hold with the score (or the reason it has none), the group
+deviations, every value and z, and the top faults — then prints a summary with
+the best and worst holds. The reference is a `handstand-reference` JSON file
+built by chainlink #28 from the labelled good clips (#27): none is bundled and
+`--reference` is required, so the weights (#30 tunes) never compare against
+guessed numbers. See `docs/scoring.md` for the formula, the groups and the
+schema.
+
 ## Golden fixtures
 
 The test data the Swift ports are checked against: synthetic clips, run through
