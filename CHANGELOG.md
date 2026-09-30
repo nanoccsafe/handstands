@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Summary view: worst frame, timeline heat strip, text cues (#49)
 - Stress diagram overlay renderer (#48)
 - Post-recording analysis: Vision over the recording -> Analyzer -> session (no classifier yet) (#47)
 - PoseService protocol + Apple Vision backend (VisionPoseKit), shared by app and runner (#82)
