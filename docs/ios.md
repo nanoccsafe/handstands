@@ -88,7 +88,8 @@ hold that was selected when the take **started**. If the sidecar cannot be
 written the video is kept — never deleted — and `errorMessage` explains the
 problem. Analysis (chainlink #47) reads `hold_type` to pick the matching
 scoring reference (`HoldType.referenceResourceName`, `"reference-line"` for
-Line); no reference is bundled yet (chainlink #28).
+Line); see **Analysis** below for where that file comes from (it is never
+committed — chainlink #28's real one is user data).
 
 ## History
 
@@ -101,7 +102,7 @@ Every recording becomes a **Session** row in a local SwiftData database
   part), when it was taken, which hold it was for, and its duration and
   frame size as read from the file. The analysis columns (`analyzed_at`,
   `clip_score`, `hold_count`, `longest_hold_s`, `analysis_version`) are
-  part of the model but stay empty until analysis (chainlink #47) exists —
+  filled by **Analyse** (see **Analysis** below); until a take is analysed
   those rows read "Not analysed yet".
 - **Where**: `SessionStore` in `ios/HandstandApp/Sessions/`, over the
   `ModelContainer` that `HandstandApp.swift` opens with
@@ -129,6 +130,75 @@ both ask *"Delete this recording? The video is removed from the phone."*)
 removes the `.mov`, its `.json` sidecar **and** the row. The store only
 ever deletes files inside the Recordings folder — nothing else on the
 phone is touched.
+
+## Analysis
+
+**Analyse** is the app's first end-to-end run (chainlink #47): a recording
+(or a video picked from Photos) to phases, holds, a duration — and a score
+when a scoring reference is available. All of it is on the phone.
+
+What happens, in order:
+
+1. The movie is read frame by frame by `VideoFrameSource`
+   (`swift/VisionPose/…/VideoFrameSource.swift`), decoded exactly the way
+   the macOS `vision-pose` runner decodes it — same `kCVPixelFormatType_32BGRA`
+   pixel format, same `preferredTransform` → display orientation
+   (`DisplayFrames`), same millisecond `tMs` rounding — and **capped at
+   30 fps**: a frame is kept when it is at least `1000/30 − 0.5` ms after
+   the last kept one (the first frame is always kept; `maxFps 0` keeps
+   everything, which is what a parity check against the runner's CSV uses).
+   Frames are *pulled* one at a time, so a long clip never piles up in
+   memory while Vision is still on frame three.
+2. Apple Vision — the `PoseService` of chainlink #82, the same class the
+   runner uses — runs on every kept frame.
+3. `Analyzer.analyze` (#42) runs the whole pipeline: post-process, phases,
+   features, and the scorer *if* a reference loaded (step 0).
+4. The result is shown: **Holds: N**, **Longest hold: x.x s**, the score —
+   or **"No score yet (no reference)"** — and up to three top faults with
+   their names said in words (`hip_angle` → "Hip angle").
+5. For a recording, the result is saved to the session row's analysis
+   columns (`analyzed_at`, `clip_score`, `hold_count`, `longest_hold_s`,
+   `analysis_version = "vision-1"`), which is what the detail screen and
+   the History row then show.
+
+Worth knowing:
+
+- **Progress and Cancel**: the run shows a percentage and a **Cancel**
+  button; cancelling returns to the button and saves nothing. The screen
+  stays awake while it runs (`isIdleTimerDisabled`, restored afterwards),
+  and the heavy work runs off the main actor, so the UI never blocks. A
+  video with nobody in it finishes with *Holds: 0* — it is not a failure;
+  only a video that cannot be read fails, with the reason in words.
+- **No score without a reference**: scores appear only when a scoring
+  reference is available. The real one comes from your own #28 data — see
+  below. Without one the analysis still finds phases, holds and features.
+- **No fault classifier yet**: chainlink #34's classifier does not exist,
+  so nothing classifies faults; the "top faults" are just the scorer's
+  ranked features of the scored hold.
+- A video picked from **Analyse a video** runs the same analysis with the
+  Line hold and is *not* saved anywhere — a pick is not a recording, so it
+  never appears in History.
+
+### The scoring reference (never committed)
+
+The repo is public and the reference is built from your own labelled clips
+(#28), so it is **never committed**. To score, put your reference in the
+app's resource folder on *your* clone before building:
+
+```
+ios/LocalResources/reference-line.json     # one file per hold:
+                                           # reference-<hold>.json
+```
+
+`ios/LocalResources/` is in `.gitignore` and declared in `project.yml` as
+an **optional** resource folder, so `xcodegen generate` and the build work
+when the folder is absent — scores then read "No score yet (no reference)".
+`ReferenceLoader` looks the file up in the built bundle
+(`<hold.referenceResourceName>.json`), decodes it with
+`ScoreReference.decode`, and returns `nil` when it is missing *or* invalid:
+an invalid file is logged once, never a crash. The unit tests use the
+synthetic `parity_reference.json` inlined as a string instead — no test
+needs (or gets) the real one.
 
 ## Testing recording on the phone
 
@@ -162,7 +232,31 @@ Recordings land in `Application Support/Recordings/<yyyyMMdd-HHmmss>.mov`
 on the phone and stay there — nothing is uploaded, and the folder is
 deliberately *not* excluded from an iCloud backup.
 
+## Testing analysis on the phone
+
+Analysis needs a real recording and the Vision model on real frames, so
+this checklist is for the iPhone (sideload as above):
+
+1. **Record ~10 s** (the recording checklist above), then open the take
+   from **History** → its row.
+2. Tap **Analyse** (it reads "Analyse again" after the first run). The
+   progress percentage must **move** — it starts at 0 %, climbs and reaches
+   100 % — the screen must **stay awake** while it runs, and the result
+   must show **Holds: 1** for a clip with one clean hold, and a
+   **Longest hold** of a few seconds that matches how long you actually
+   held.
+3. Tap **Analyse again** and, while it is running, tap **Cancel**: the
+   screen goes straight back to the button, and nothing was saved (the
+   row's numbers, if any, are unchanged).
+4. Go back to **History**: the row now shows the score (or still "Not
+   analysed yet" when the build has no reference — see **Analysis**), and
+   re-opening the session shows the same numbers the run reported.
+5. Home → **Analyse a video** → pick a video from Photos → **Analyse**: the
+   same progress, Cancel and result panel, with the duration and frame
+   size still shown above it. Nothing appears in History — a pick is not a
+   recording.
+
 Everything stays on the phone: no networking, no analytics, recordings are
-not uploaded anywhere. The app ships the home, record, history,
-video-pick and about screens; analysis (chainlink #47) and overlay (#48)
-come later.
+not uploaded anywhere. The app ships the home, record, history, analysis,
+video-pick and about screens; the stress-diagram overlay (chainlink #48)
+comes next.
