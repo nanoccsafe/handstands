@@ -25,4 +25,16 @@ enum SessionFormatter {
         guard let value, value.isFinite else { return "—" }
         return String(format: "%.2f", value)
     }
+
+    /// A playback position in the clip's own milliseconds as `0:04.2` —
+    /// minutes, padded seconds and a tenth, the way the worst-moment card
+    /// (chainlink #49) says when the worst frame was. A time that is not
+    /// a whole number of milliseconds (negative, absurdly large) reads
+    /// `0:00.0` rather than something odd.
+    static func position(_ tMs: Int) -> String {
+        guard tMs >= 0, tMs < 100_000_000 else { return "0:00.0" }
+        let total = tMs / 1000
+        let tenths = (tMs % 1000) / 100
+        return String(format: "%d:%02d.%d", total / 60, total % 60, tenths)
+    }
 }

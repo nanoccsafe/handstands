@@ -40,6 +40,7 @@ swift/HandstandCore/
 │   ├── Scorer.swift                    handstand.score — the weighted z-score scorer + reference (#41)
 │   ├── Analyzer.swift                  the whole chain, one entry point (#42)
 │   ├── StressDiagram.swift             the overlay's logic: severities, bands, one frame (#48)
+│   ├── SessionSummary.swift            the summary: heat strip, worst moment, cues (#49)
 │   ├── BodyFrame.swift                 handstand.bodyframe
 │   └── FramingCheck.swift              the Record screen's live framing guide (#46)
 └── Tests/HandstandCoreTests/
@@ -52,6 +53,7 @@ swift/HandstandCore/
     ├── ScorerTests.swift               golden parity (expected.score) + the scorer tests (#41)
     ├── AnalyzerTests.swift             the end-to-end chain over every fixture (#42)
     ├── StressDiagramTests.swift        severities, the joint table, tolerances, frameIndex (#48)
+    ├── SessionSummaryTests.swift       heat strip bins, worst moment, coaching cues (#49)
     ├── RealParityTests.swift           the same over real clips, skipped without HANDSTAND_REAL_GOLDEN (#42)
     ├── GoldenComparison.swift          the one comparison every parity test runs (#42)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
@@ -669,6 +671,118 @@ user's reference skeleton, which is chainlink #28's output. The field is the
 extension point — #28 fills it, `StressDiagramOverlay` draws it, and nothing
 else in the model or the drawing changes. Nothing here ever guesses an ideal
 pose.
+
+## SessionSummary (chainlink #49)
+
+`Sources/HandstandCore/SessionSummary.swift` is the summary view's logic:
+the three things the screen shows under the player (docs/ios.md) as pure
+functions over an `Analysis` — no view, no player, no video
+(`SessionSummaryTests` builds everything from synthetic frames).
+
+**One severity implementation.** Nothing here re-derives a rule: everything
+reads `StressDiagram.valueSeverity(_:feature:reference:)`, the **only**
+copy of #48's two severity rules, through
+`StressDiagram.featureSeverities(_:analysis:reference:)` (every feature of
+one frame, empty outside a hold or on an unmeasured frame) and
+`StressDiagram.frameSeverity(_:analysis:reference:)` (their **max**, `nil`
+when there is none). `StressDiagram.frame(_:…)`'s joints are drawn from
+the same dictionary — a test pins every joint of `frame` to the max over
+`featureSeverities` of the joint's own features — so what the strip says
+and what the overlay colours are the same numbers by construction.
+
+| Piece | What it is |
+|---|---|
+| `HeatBin`, `SessionSummary.heatStrip(analysis:reference:bins:)` | the timeline strip (below) |
+| `WorstMoment`, `SessionSummary.worstMoment(analysis:reference:edgeS:)` | the worst moment (below) |
+| `CoachingCue`, `CoachingCues.cues(analysis:reference:max:)`, `CoachingCues.texts` | up to three cues and the one table of texts |
+
+### The heat strip
+
+`heatStrip` splits `[first tMs, last tMs]` into `bins` (default 120) that
+**tile the clip exactly** — bin `b` runs from `first + span·b/bins` to
+`first + span·(b+1)/bins`, the last bin ending on the clip's own last
+timestamp — and each bin carries:
+
+* `severity` — the **max** frame severity of the frames inside it that are
+  in a hold (`nil` when it holds no such frame, so a warm-up is grey, not
+  green or red);
+* `band` — `Severity.colourBand(severity)`, `.neutral` when there is no
+  severity: the *same four colours* as the diagram, because it is the same
+  severity;
+* `inHold` — whether any of its frames was inside a hold.
+
+Fewer frames than bins is fine: the bins that caught no frame are
+`.neutral` and say nothing. `startMs`/`endMs` are what the app maps to
+screen x with `HeatStripGeometry`, so the playhead and the bins share one
+x↔time mapping.
+
+### The worst moment
+
+`worstMoment` looks only at frames **inside a hold**, skipping the first
+and last `edgeS` seconds (default 0.3 s) of each hold — an entry and an
+exit are not the held form, so the kick-up and the landing can never be
+the worst moment. The worst frame is the one with the highest
+`frameSeverity`, **ties going to the earlier frame**, and it returns:
+
+* `frameIndex` / `tMs` — what the card seeks to;
+* `severity` — that frame's max severity;
+* `holdId` — which hold it was in;
+* `features` — the frame's features at severity ≥ 0.5, worst first (ties
+  keep `Features.all` order), which the card says in plain words.
+
+It is `nil` when the clip has no hold, and when no frame has a finite
+severity **above 0** — a clean hold has no worst moment to show.
+
+### Coaching cues
+
+`CoachingCues.cues(analysis:reference:max:)` is about the clip's
+**longest hold** — the same hold `Scorer.clipScore` /
+`ClipFeatures.longestHoldId` represents a clip by — and its
+`HoldSummaryRow`:
+
+* **with a reference**: the candidates are that hold's
+  `HoldScore.topFaults` entries with `|z| ≥ CoachingCues.zThreshold`
+  (1.5) — a magnitude, because the severity is one too (a hip two SDs
+  *below* the reference's mean is as much a fault as one above);
+* **without one**: the features whose hold **median** fails
+  `FeatureTolerances`;
+* **balance, in both modes**: `pct_over > 30` → `balance_over`,
+  `pct_under > 30` → `balance_under`, at a flat severity 0.4.
+
+Severity is `min(|z|, Z_CAP)/Z_CAP` with a reference and #48's tolerance
+severity without one; the candidates are sorted worst-first (ties keep the
+order above: the scorer's rank, then the tolerance table's rows, then
+balance) and cut to `max` (default **3**). Candidates with no sentence to
+show (`com_forward`, `com_sway_sd`) are dropped rather than shown as a
+bare key. An unusable clip and a clip with no hold answer `[]`; a hold
+where nothing is over the limits gets the single `none` cue.
+
+**The wording is to be reviewed by the user**: the texts are copy, not
+maths. They are short and actionable on purpose — say the fault, say the
+fix — and live in the one table `CoachingCues.texts`:
+
+| Key | Text |
+|---|---|
+| `shoulder_angle` | Open your shoulders: push the floor away, arms by your ears. |
+| `hip_angle` | Hips are piked: squeeze your glutes and bring your legs in line. |
+| `knee_angle` | Straighten your knees and point your toes. |
+| `elbow_angle` | Lock your elbows. |
+| `banana_pos` | You're arching (banana): pull your ribs in and tuck the pelvis. |
+| `banana_neg` | You're hollowing at the hips: open the hips to a straight line. |
+| `head` | Keep your head neutral: eyes on the floor between your hands. |
+| `leg_separation` | Keep your legs together. |
+| `line_deviation` / `body_angle` | Your line leans: stack hips over shoulders over hands. |
+| `off_shoulder` | Stack your shoulders over your hands. |
+| `off_hip` | Stack your hips over your hands. |
+| `off_knee` | Stack your knees over your hands. |
+| `off_ankle` | Stack your ankles over your hands. |
+| `balance_over` | You're tipping towards your fingers: press into your fingertips. |
+| `balance_under` | You're sitting back on your palms: shift a little over your fingers. |
+| `none` | Solid line: nothing over the limits in this hold. |
+
+`banana` picks `banana_pos` or `banana_neg` by the sign of the hold's
+median (banana is athlete-signed already: positive is the arch, negative
+the hollow); `off_*` say the joint's own name.
 
 ## VisionPoseKit / PoseService (chainlink #82)
 

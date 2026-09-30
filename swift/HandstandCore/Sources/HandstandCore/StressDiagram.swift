@@ -36,6 +36,12 @@ import Foundation
 // Outside a hold — or on a frame the features could not measure — there is
 // no severity at all: every band is `.neutral` and the skeleton is drawn
 // grey, because a warm-up is not a fault.
+//
+// Both rules live in exactly one function — `valueSeverity(_:feature:
+// reference:)` — and everything that needs a severity calls it: the frame's
+// joints through `featureSeverities(_:analysis:reference:)`, and the
+// summary's cues and worst moment (chainlink #49) directly. There is no
+// second copy of any of it.
 // --------------------------------------------------------------------------- #
 
 /// Which side of a target is the wrong side — Python's `EITHER`, `BELOW` and
@@ -340,6 +346,113 @@ public enum StressDiagram {
         .rightFootIndex: ["off_ankle", "leg_separation"],
     ]
 
+    /// The two features the **stack line's** band is the worse of —
+    /// `frame(_:…)` reads its `stackBand` from them, and nothing else in the
+    /// diagram judges a feature outside `jointFeatures`.
+    public static let stackFeatures: [String] = ["line_deviation", "body_angle"]
+
+    /// Every feature a frame can carry a severity for: the union of
+    /// `jointFeatures` and `stackFeatures`, in `Features.all` order so a
+    /// list built from it is deterministic.
+    ///
+    /// This is the diagram's candidate set — the summary (chainlink #49's
+    /// heat strip and worst moment) reads the *same* features through
+    /// `featureSeverities(_:analysis:reference:)`, so what the strip says
+    /// is exactly what the overlay colours, and the severity rules have one
+    /// home rather than two.
+    public static let severityFeatures: [String] = {
+        let judged = Set(jointFeatures.values.flatMap { $0 } + stackFeatures)
+        return Features.featureNames.filter(judged.contains)
+    }()
+
+    /// One value's severity, on the diagram's 0…1 scale — **the** severity
+    /// rule of #48, called by everything that needs one (`frame(_:…)`'s
+    /// joints, the summary's cues) so there is exactly one implementation
+    /// of it (chainlink #49).
+    ///
+    /// - Parameters:
+    ///   - value: the feature's value. For a signed feature this must
+    ///     already be athlete-signed (`frame`'s caller multiplies by
+    ///     `facing_sign`; hold medians and the scorer's values arrive
+    ///     signed).
+    ///   - feature: the feature's name.
+    ///   - reference: the scoring reference to be severe against, or `nil`
+    ///     to fall back to `FeatureTolerances`' built-in targets.
+    /// - Returns: `nil` when neither source has an opinion about this
+    ///   feature (a feature the reference does not carry, one no tolerance
+    ///   was written for) or the value is not a finite number.
+    public static func valueSeverity(
+        _ value: Double, feature: String, reference: ScoreReference?
+    ) -> Double? {
+        guard value.isFinite else { return nil }
+
+        if let reference {
+            guard let stat = reference.features[feature] else { return nil }
+            let floor = Scorer.sdFloors[feature] ?? Scorer.sdFloorL
+            let z = (value - stat.mean) / Swift.max(stat.sd, floor)
+            guard z.isFinite else { return nil }
+            return Swift.min(Swift.abs(z), Scorer.zCap) / Scorer.zCap
+        }
+
+        guard let tolerance = FeatureTolerances.tolerance(for: feature) else { return nil }
+        guard FeatureTolerances.fails(value, tolerance) else { return 0 }
+        let bandSize = severityBandSize(of: feature)
+        return Swift.min(1.0, 0.3 + FeatureTolerances.excess(value, tolerance) / bandSize)
+    }
+
+    /// Every feature's severity at frame `i` — what `frame(_:…)` draws from
+    /// and what the summary (chainlink #49) reads, so the two can never
+    /// disagree about how bad a frame was.
+    ///
+    /// The keys are `severityFeatures`; a feature neither source has an
+    /// opinion about, one whose value is `NaN`, or a signed feature on a
+    /// frame whose `facing_sign` is not a number, simply has no key. The
+    /// result is **empty** outside a hold or on a frame the features could
+    /// not measure — a warm-up is not a fault — and then the frame has no
+    /// severity at all (`frameSeverity(_:analysis:reference:)` is `nil`).
+    public static func featureSeverities(
+        _ i: Int, analysis: Analysis, reference: ScoreReference?
+    ) -> [String: Double] {
+        let features = analysis.features
+        guard i >= 0, i < features.tMs.count else { return [:] }
+        // Measured means "inside a hold *and* a frame the features stand
+        // behind" — the same guard `frame(_:…)` draws greys with.
+        guard i < analysis.phases.phase.count, analysis.phases.phase[i] == .hold else {
+            return [:]
+        }
+        guard i < features.valid.count, features.valid[i] else { return [:] }
+
+        var severities: [String: Double] = [:]
+        for name in severityFeatures {
+            let column = features.value(name)
+            guard i < column.count else { continue }
+            var value = column[i]
+            guard value.isFinite else { continue }
+            if reference != nil, Scorer.signedByFacing.contains(name) {
+                let signs = features.value("facing_sign")
+                guard i < signs.count, signs[i].isFinite else { continue }
+                value *= signs[i]
+            }
+            if let severity = valueSeverity(value, feature: name, reference: reference) {
+                severities[name] = severity
+            }
+        }
+        return severities
+    }
+
+    /// One frame's severity — the **max** over `featureSeverities`, so the
+    /// worst feature of the frame is what the frame is judged by (one bad
+    /// joint makes it a bad frame, never averaged away).
+    ///
+    /// `nil` when the frame has no severities at all: outside a hold, on a
+    /// frame the features could not measure, or on one where no feature
+    /// had a finite number to say.
+    public static func frameSeverity(
+        _ i: Int, analysis: Analysis, reference: ScoreReference?
+    ) -> Double? {
+        featureSeverities(i, analysis: analysis, reference: reference).values.max()
+    }
+
     /// The frame to draw at playback time `t` milliseconds: the **last**
     /// frame whose timestamp is at or before `t` (so the overlay never
     /// shows a frame the playback has not reached), `nil` before the first
@@ -385,34 +498,15 @@ public enum StressDiagram {
         let inHold = i < analysis.phases.phase.count && analysis.phases.phase[i] == .hold
         let measured = inHold && i < features.valid.count && features.valid[i]
 
-        // One feature's severity at this frame — the two modes documented at
-        // the top of this file, and `nil` for a value nobody measured or a
-        // feature neither source has an opinion about.
+        // Every feature's severity at this frame, from the one function the
+        // summary reads too (#49) — so what is drawn here and what the heat
+        // strip and worst moment say are the same numbers by construction.
+        let severities = featureSeverities(i, analysis: analysis, reference: reference)
+
+        /// One feature's severity at this frame — `nil` for a value nobody
+        /// measured or a feature neither source has an opinion about.
         func severity(of name: String) -> Double? {
-            guard measured else { return nil }
-            let column = features.value(name)
-            guard i < column.count else { return nil }
-            let raw = column[i]
-            guard raw.isFinite else { return nil }
-
-            if let reference {
-                guard let stat = reference.features[name] else { return nil }
-                var value = raw
-                if Scorer.signedByFacing.contains(name) {
-                    let signs = features.value("facing_sign")
-                    guard i < signs.count, signs[i].isFinite else { return nil }
-                    value *= signs[i]
-                }
-                let floor = Scorer.sdFloors[name] ?? Scorer.sdFloorL
-                let z = (value - stat.mean) / Swift.max(stat.sd, floor)
-                guard z.isFinite else { return nil }
-                return Swift.min(Swift.abs(z), Scorer.zCap) / Scorer.zCap
-            }
-
-            guard let tolerance = FeatureTolerances.tolerance(for: name) else { return nil }
-            guard FeatureTolerances.fails(raw, tolerance) else { return 0 }
-            let bandSize = severityBandSize(of: name)
-            return Swift.min(1.0, 0.3 + FeatureTolerances.excess(raw, tolerance) / bandSize)
+            severities[name]
         }
 
         /// The colour of a severity: `.neutral` when this frame is not
@@ -484,8 +578,8 @@ public enum StressDiagram {
                 bottom: Point2(x: $0.x, y: height)
             )
         }
-        let stackSeverity = [severity(of: "line_deviation"), severity(of: "body_angle")]
-            .compactMap { $0 }
+        let stackSeverity = StressDiagram.stackFeatures
+            .compactMap(severity(of:))
             .max()
 
         // The centre of mass: the body-frame column placed back into display

@@ -9,9 +9,12 @@ import UIKit
 /// shows beside it, the analysis of chainlink #47 (read the frames, run
 /// Apple Vision + the pipeline, save the result back to this row), the
 /// overlay drawn from the pose cache — a skeleton coloured by how far the
-/// form is off, the stack line and the centre of mass — and the one
-/// destructive action in the app: deleting takes the video off the phone
-/// too, after the same confirmation the list uses.
+/// form is off, the stack line and the centre of mass — the summary under
+/// the player (chainlink #49): a heat strip of the whole clip that seeks
+/// where you tap, the worst moment of the hold as a tappable card, and up
+/// to three coaching cues — and the one destructive action in the app:
+/// deleting takes the video off the phone too, after the same confirmation
+/// the list uses.
 @MainActor
 struct SessionDetailView: View {
     let session: Session
@@ -51,6 +54,14 @@ struct SessionDetailView: View {
     @State private var diagramReference: ScoreReference?
     /// Is the overlay showing? On by default whenever there is one.
     @State private var showDiagram = true
+    /// The summary (chainlink #49), computed once per analysis in
+    /// `loadDiagram` — never per playback frame. The strip's bins, the
+    /// worst moment (and its diagram, so the card's overlay is not
+    /// rebuilt either) and the coaching cues.
+    @State private var heatBins: [HeatBin] = []
+    @State private var worstMoment: WorstMoment?
+    @State private var worstMomentDiagram: DiagramFrame?
+    @State private var cues: [CoachingCue] = []
 
     /// Is a run in flight — the state the screen has to stay awake for.
     private var isAnalysing: Bool {
@@ -103,12 +114,52 @@ struct SessionDetailView: View {
                         }
 
                         playbackControls(player)
+
+                        // The summary (chainlink #49): everything below is
+                        // computed once per analysis in `loadDiagram`, so
+                        // only the playhead moves while the movie plays.
+                        if let analysis = diagramAnalysis,
+                            let firstMs = analysis.features.tMs.first,
+                            let lastMs = analysis.features.tMs.last
+                        {
+                            HeatStripView(
+                                bins: heatBins,
+                                firstMs: firstMs,
+                                lastMs: lastMs,
+                                playheadMs: clock.playheadMs,
+                                onSeek: { tMs in
+                                    seek(player, to: Double(tMs) / 1000.0)
+                                }
+                            )
+                            if let moment = worstMoment, let diagram = worstMomentDiagram {
+                                WorstMomentCard(
+                                    movieURL: store.movieURL(for: session),
+                                    moment: moment,
+                                    diagram: diagram,
+                                    videoSize: videoSize,
+                                    onTap: { seekToWorst(player, moment) }
+                                )
+                            }
+                        }
                     }
                     .listRowInsets(EdgeInsets())
                 } else {
                     ProgressView()
                         .frame(height: 260)
                         .listRowInsets(EdgeInsets())
+                }
+            }
+
+            // What to work on: up to three plain-language cues about the
+            // longest hold (chainlink #49), one line each. Shown with the
+            // analysis, like everything else of its; an empty list (no
+            // hold, unmeasurable clip) shows no section at all.
+            if diagramAnalysis != nil, !cues.isEmpty {
+                Section("What to work on") {
+                    ForEach(Array(cues.enumerated()), id: \.offset) { index, cue in
+                        Text("\(index + 1). \(cue.text)")
+                            .font(.subheadline)
+                    }
                 }
             }
 
@@ -356,9 +407,32 @@ struct SessionDetailView: View {
         // is milliseconds) rather than caching the answer is what keeps the
         // overlay from going stale when a new reference lands.
         let reference = ReferenceLoader.load(for: session.holdType)
+        let analysis = Analyzer.analyze(frames, reference: reference)
         diagramReference = reference
-        diagramAnalysis = Analyzer.analyze(frames, reference: reference)
+        diagramAnalysis = analysis
         showDiagram = true
+
+        // The summary under the player (chainlink #49): the strip's bins,
+        // the worst moment with the diagram drawn over its thumbnail, and
+        // the coaching cues — all computed *here*, once per analysis (and
+        // so again after "Analyse again"), never per playback frame.
+        heatBins = SessionSummary.heatStrip(analysis: analysis, reference: reference)
+        let moment = SessionSummary.worstMoment(analysis: analysis, reference: reference)
+        worstMoment = moment
+        worstMomentDiagram = moment.map {
+            StressDiagram.frame(
+                $0.frameIndex, analysis: analysis, reference: reference,
+                height: Double(session.height))
+        }
+        cues = CoachingCues.cues(analysis: analysis, reference: reference)
+    }
+
+    /// The worst-moment card's tap: seek there and **pause** — a jump to
+    /// the moment you asked about should hold still while you look at it.
+    private func seekToWorst(_ player: AVPlayer, _ moment: WorstMoment) {
+        player.pause()
+        isPlaying = false
+        seek(player, to: Double(moment.tMs) / 1000.0)
     }
 
     private func delete() {
