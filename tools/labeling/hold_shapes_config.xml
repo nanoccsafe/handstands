@@ -9,7 +9,7 @@
     decision: check the image and change it when it is wrong. A task with no
     preselection is a hold the features could not measure.
   -->
-  <Text name="hold_info" value="$clip_id / hold $hold_id / $duration_s s / $reason" density="1"/>
+  <Text name="hold_info" value="$info" density="1"/>
   <Image name="image" value="$image" zoom="true" zoomControl="true"/>
   <Choices name="shape" toName="image" choice="single" required="true" showInline="true">
     <Choice value="line" hotkey="1"/>
