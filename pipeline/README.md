@@ -204,6 +204,25 @@ uv run python -m handstand.hold_shapes summary --write-catalogue
 reference, #29/#30 scoring, #32–#34 faults) can never take an unreviewed hold.
 See `docs/labeling.md` for the whole loop.
 
+## Pose model bake-off
+
+Which pose model the app ships — MediaPipe vs Apple Vision, with RTMPose as
+the reference upper bound — scored against the human labels on the
+human-reviewed frames only, with the auto-accepted frames reported separately
+as agreement with RTMPose, one MediaPipe-chosen trainer mask applied to every
+model, pipeline and oracle person matching, clip-bootstrap intervals, and the
+per-backend visibility gate. Writes CSVs to `$HANDSTAND_DATA/reports/bakeoff/`
+and prints the summary; the decision, the gates and their unusable-clip counts
+are written up in `docs/bakeoff.md`.
+
+```sh
+cd pipeline
+uv run python -m handstand.bakeoff                    # runs RTMPose fresh (~2 min)
+uv run python -m handstand.bakeoff --skip-rtmpose     # skip that pass
+uv run python -m handstand.bakeoff --models mediapipe vision
+uv run python -m handstand.bakeoff --flag-catalogue   # flag multi-person clips in the catalogue notes
+```
+
 ## Golden fixtures
 
 The test data the Swift ports are checked against: synthetic clips, run through
