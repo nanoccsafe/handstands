@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- hold_shapes: Label Studio rejects the config (multi-variable Text) and file:// image URIs (#87)
 - Hold shapes: pre-label per hold (line/straddle/split/tuck/pike), user review in Label Studio, line-only helper (#85)
 - Annotated video export (#50)
 - Summary view: worst frame, timeline heat strip, text cues (#49)
