@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import json
 import pathlib
+import re
 import xml.etree.ElementTree as ET
 
 import cv2
@@ -285,11 +286,22 @@ def test_prelabel_writes_a_task_with_the_shape_preselected(
 
     tasks = json.loads(report.json_path.read_text(encoding="utf-8"))
     assert len(tasks) == 2
-    assert set(tasks[0]["data"]) == {"image", "clip_id", "hold_id", "duration_s", "reason"}
+    assert set(tasks[0]["data"]) == {
+        "image",
+        "clip_id",
+        "hold_id",
+        "duration_s",
+        "reason",
+        "info",
+    }
     assert tasks[0]["data"]["clip_id"] == CLIP
     assert tasks[0]["data"]["hold_id"] == 0
     assert tasks[0]["data"]["duration_s"] == 0.4
-    assert tasks[0]["data"]["image"].startswith("file://")
+    # The header the config shows is joined into ONE field: Label Studio 1.23
+    # reads a value with several $... as a single variable name.
+    assert tasks[0]["data"]["info"] == f"{CLIP} / hold 0 / 0.4 s / legs 5°, knees 176°, hips 172°"
+    assert tasks[1]["data"]["info"] == f"{CLIP} / hold 1 / 0.2 s / knees 100°"
+    assert tasks[0]["data"]["image"].startswith("/data/local-files/?d=label_frames_holds/")
     assert tasks[0]["data"]["image"].endswith(f"{CLIP}_h0.jpg")
     first = tasks[0]["predictions"][0]
     assert first["model_version"] == hold_shapes.MODEL_VERSION
@@ -328,10 +340,13 @@ def test_prelabel_writes_the_labeling_config(
     assert root.tag == "View"
     info = root.find("Text")
     assert info is not None
-    assert "$clip_id" in info.get("value", "")
-    assert "$hold_id" in info.get("value", "")
-    assert "$duration_s" in info.get("value", "")
-    assert "$reason" in info.get("value", "")
+    # One variable, one task field: Label Studio 1.23 parses the whole value as
+    # one variable name, so "$clip_id / hold $hold_id / ..." cannot be a template.
+    assert info.get("value") == "$info"
+    assert info.get("name") == "hold_info"
+    image = root.find("Image")
+    assert image is not None
+    assert image.get("value") == "$image"
     choices = root.find("Choices")
     assert choices is not None
     assert choices.get("name") == "shape"
@@ -341,6 +356,57 @@ def test_prelabel_writes_the_labeling_config(
     assert [choice.get("value") for choice in choices] == list(SHAPES)
     assert [choice.get("hotkey") for choice in choices] == ["1", "2", "3", "4", "5", "6"]
     assert hold_shapes.default_config_path().name == "hold_shapes_config.xml"
+
+
+def test_every_config_variable_is_one_identifier_present_in_every_task(
+    workspace: tuple[pathlib.Path, pathlib.Path], tmp_path: pathlib.Path
+) -> None:
+    """Label Studio 1.23 reads a ``value`` as ONE variable, name and all.
+
+    ``value="$clip_id / hold $hold_id / ..."`` asks for a task key literally
+    named ``clip_id / hold $hold_id / ...``, so every import fails with
+    ``key is expected in task data``. Each ``$`` in the generated config must
+    therefore be a lone ``$identifier``, and that identifier must be a key of
+    the ``data`` of every task the pre-label wrote.
+    """
+    data, videos = workspace
+    report = run_prelabel(data, videos, tmp_path)
+
+    root = ET.parse(report.config_path).getroot()
+    tasks = json.loads(report.json_path.read_text(encoding="utf-8"))
+    assert tasks
+    values = [value for element in root.iter() if (value := element.get("value")) and "$" in value]
+    assert values, "the config must reference task data"
+    for value in values:
+        assert re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", value), (
+            "not a single identifier: Label Studio reads the whole value as one "
+            f"variable name, so it must be $identifier, got {value!r}"
+        )
+        for task in tasks:
+            assert value[1:] in task["data"], f"{value} is not a key of {task['data']}"
+
+
+def test_default_image_uri_is_a_local_files_url(
+    workspace: tuple[pathlib.Path, pathlib.Path], tmp_path: pathlib.Path
+) -> None:
+    """The task image defaults to the local-files URL, ``--image-base`` overrides."""
+    data, videos = workspace
+    report = run_prelabel(data, videos, tmp_path)
+
+    tasks = json.loads(report.json_path.read_text(encoding="utf-8"))
+    for task in tasks:
+        assert task["data"]["image"].startswith("/data/local-files/?d=label_frames_holds/")
+    # The path is relative to the data dir (LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT).
+    assert tasks[0]["data"]["image"] == (
+        f"/data/local-files/?d={hold_shapes.FRAMES_DIRNAME}/{CLIP}_h0.jpg"
+    )
+
+    # --image-base is the override: the file name is prefixed, as before.
+    local = data / hold_shapes.FRAMES_DIRNAME / f"{CLIP}_h0.jpg"
+    assert hold_shapes.task_image_uri(local, "http://localhost:8080/frames/", data) == (
+        f"http://localhost:8080/frames/{CLIP}_h0.jpg"
+    )
+    assert hold_shapes.task_image_uri(local, None, data).startswith(hold_shapes.LOCAL_FILES_URL)
 
 
 def test_prelabel_skips_a_clip_whose_video_is_missing(

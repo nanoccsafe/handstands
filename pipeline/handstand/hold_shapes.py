@@ -64,6 +64,7 @@ __all__ = [
     "IMAGE_NAME",
     "LABEL_COLUMNS",
     "LABELS_CSV_NAME",
+    "LOCAL_FILES_URL",
     "MANIFEST_COLUMNS",
     "MANIFEST_NAME",
     "MODEL_VERSION",
@@ -97,6 +98,7 @@ __all__ = [
     "summarise_import",
     "summarise_prelabel",
     "summarise_shapes",
+    "task_image_uri",
     "tasks_path",
     "write_catalogue_skill",
 ]
@@ -156,6 +158,14 @@ TASKS_FILENAME = "label_studio_hold_shapes.json"
 LABELS_CSV_NAME = "hold_shapes.csv"
 #: Where the generated labeling config lives, relative to the repository root.
 CONFIG_RELATIVE = ("tools", "labeling", "hold_shapes_config.xml")
+
+#: Label Studio local-files URL prefix: ``/data/local-files/?d=<path relative to
+#: the data dir>`` — the default form of every task's ``image``. A browser
+#: cannot open a ``file://`` URI, but Label Studio serves these URLs from its
+#: local storage when it runs with
+#: ``LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT`` set to the data directory and the
+#: project carries ``data/label_frames_holds`` as a local storage.
+LOCAL_FILES_URL = "/data/local-files/?d="
 
 #: Full manifest header, in order. Part of the contract: the CLI prints it and
 #: :func:`import_export` reads the predictions back from it.
@@ -353,6 +363,14 @@ def config_xml() -> str:
     header line that shows which hold this is, how long it was and why the
     pre-label says what it says — everything needed to decide without leaving
     the task. The choices carry hotkeys 1–6 in :data:`SHAPES` order.
+
+    The header reads the single ``$info`` task field (:func:`build_task` joins
+    the four parts). Label Studio 1.23 parses a ``value`` as ONE variable whose
+    name runs from the ``$`` to the end of the attribute, so a value of
+    ``"$clip_id / hold $hold_id / ..."`` asks for a task key literally named
+    ``clip_id / hold $hold_id / ...`` and every import fails with
+    ``key is expected in task data``. Every ``$`` here must stay a lone
+    ``$identifier`` — ``tests/test_hold_shapes.py`` asserts it.
     """
     choices = "\n".join(
         f'    <Choice value="{shape}" hotkey="{HOTKEYS[shape]}"/>' for shape in SHAPES
@@ -369,13 +387,46 @@ def config_xml() -> str:
     decision: check the image and change it when it is wrong. A task with no
     preselection is a hold the features could not measure.
   -->
-  <Text name="hold_info" value="$clip_id / hold $hold_id / $duration_s s / $reason" density="1"/>
+  <Text name="hold_info" value="$info" density="1"/>
   <Image name="{IMAGE_NAME}" value="$image" zoom="true" zoomControl="true"/>
 {tag}required="true" showInline="true">
 {choices}
   </Choices>
 </View>
 """
+
+
+def task_image_uri(
+    image: str | pathlib.Path,
+    image_base: str | None = None,
+    data: str | pathlib.Path | None = None,
+) -> str:
+    """The ``data.image`` URL for one hold's frame.
+
+    The default is Label Studio's local-files form,
+    ``/data/local-files/?d=<path relative to the data dir>`` — for this module
+    ``/data/local-files/?d=label_frames_holds/<clip_id>_h<hold_id>.jpg``. A
+    browser refuses to open a ``file://`` URI, but Label Studio serves these
+    URLs from its local storage when it is started with
+    ``LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT`` set to the data directory and
+    the project carries ``data/label_frames_holds`` as a local storage (the
+    setup ``docs/labeling.md`` documents for project 3, ``handstand-hold-shapes``).
+
+    ``image_base`` overrides it, prefixing the file name exactly as
+    :func:`handstand.prelabel.image_uri` does: an ``http(s)://`` prefix or a
+    directory serving the JPEGs by name.
+    """
+    path = pathlib.Path(image)
+    if image_base:
+        return image_uri(path, image_base)
+    root = pathlib.Path(data) if data is not None else data_dir()
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        # Outside the data dir (a direct call with some other path): the local
+        # storage holds this module's frames, so name the file as it names them.
+        relative = pathlib.Path(FRAMES_DIRNAME) / path.name
+    return f"{LOCAL_FILES_URL}{relative.as_posix()}"
 
 
 def build_task(
@@ -387,22 +438,30 @@ def build_task(
     reason: str,
     shape: str,
     image_base: str | None = None,
+    data: str | pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """One Label Studio task for one hold, carrying the pre-selected shape.
 
-    ``image`` is a local path; it becomes the ``file://`` URI that Label
-    Studio's local file serving reads, exactly as :func:`handstand.prelabel.image_uri`
-    builds it (``image_base`` serves it from somewhere else instead). A
-    :data:`UNMEASURED` hold gets **no** ``predictions`` entry — there is
-    nothing to preselect, and inventing a default would label it by accident.
+    ``image`` is a local path; it becomes the ``/data/local-files/?d=`` URL
+    :func:`task_image_uri` builds from its place under the data dir, so the
+    project's local storage serves it (``image_base`` serves it from somewhere
+    else instead).
+
+    ``info`` is the header line joined into ONE task field — ``clip / hold /
+    duration / reason`` — because that is the single ``$info`` the config's
+    ``<Text>`` reads: Label Studio 1.23 takes a multi-``$`` value as one
+    variable name (see :func:`config_xml`). A :data:`UNMEASURED` hold gets
+    **no** ``predictions`` entry — there is nothing to preselect, and
+    inventing a default would label it by accident.
     """
     task: dict[str, Any] = {
         "data": {
-            "image": image_uri(image, image_base),
+            "image": task_image_uri(image, image_base, data),
             "clip_id": clip_id,
             "hold_id": hold_id,
             "duration_s": duration_s,
             "reason": reason,
+            "info": f"{clip_id} / hold {hold_id} / {duration_s:.1f} s / {reason}",
         }
     }
     if shape != UNMEASURED:
@@ -604,6 +663,7 @@ def prelabel(
                 reason=reason,
                 shape=shape,
                 image_base=image_base,
+                data=root,
             )
         )
 
@@ -1180,9 +1240,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="URL",
         help=(
-            "serve the frames from here instead of the local files, e.g. "
-            "/data/local-files/?d=.../label_frames_holds (default: file:// URIs, "
-            "which need Label Studio's local file serving)"
+            "serve the frames from here instead of the Label Studio local-files "
+            "URL, e.g. an http(s):// prefix or a directory (default: "
+            "/data/local-files/?d=label_frames_holds/<name>, which needs the "
+            "local storage on the project and LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT "
+            "set to the data dir)"
         ),
     )
     pre.add_argument(
