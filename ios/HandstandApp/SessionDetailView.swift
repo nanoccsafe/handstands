@@ -450,7 +450,8 @@ struct SessionDetailView: View {
         // is milliseconds) rather than caching the answer is what keeps the
         // overlay from going stale when a new reference lands.
         let reference = ReferenceLoader.load(for: session.holdType)
-        let analysis = Analyzer.analyze(frames, reference: reference)
+        let analysis = Analyzer.analyze(
+            frames, reference: reference, config: PoseBackend.preferred.postProcessConfig)
         diagramReference = reference
         diagramAnalysis = analysis
         showDiagram = true

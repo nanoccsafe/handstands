@@ -58,19 +58,23 @@ public enum Analyzer {
     /// gates those frames away while the segmenter still has to say *why* a
     /// frame is unknown). Then, in pipeline order:
     ///
-    /// 1. `PostProcess.process(frames)`;
+    /// 1. `PostProcess.process(frames)` — with `config`, the post-process
+    ///    tuning (its `minVisibility` gate comes from the backend that ran,
+    ///    `PoseBackend.postProcessConfig`, so a per-backend recalibration is
+    ///    one number there);
     /// 2. `PhaseSegmenter.classify(tMs:processed:trainerContact:)`;
     /// 3. `Features.extract(tMs:processed:phases:trainerContact:)`;
     /// 4. with a reference, `Scorer.scoreClip(features, reference:)` and
     ///    `Scorer.clipScore(_:)` — without one, no scores at all.
     public static func analyze(
         _ frames: [PostProcessInputFrame],
-        reference: ScoreReference?
+        reference: ScoreReference?,
+        config: PostProcessConfig = PostProcessConfig()
     ) -> Analysis {
         let tMs = frames.map(\.tMs)
         let trainerContact = frames.map(\.trainerContact)
 
-        let processed = PostProcess.process(frames)
+        let processed = PostProcess.process(frames, config: config)
         let phases = PhaseSegmenter.classify(
             tMs: tMs, processed: processed, trainerContact: trainerContact)
         let features = Features.extract(

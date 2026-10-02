@@ -32,6 +32,12 @@ ios/HandstandApp/Info.plist
 # Personal signing config (a team id is personal data; repo is public)
 ios/Config/Local.xcconfig
 
+# CocoaPods (chainlink #45): Pods/ and the generated workspace are build
+# artifacts re-created by `pod install`. Podfile.lock IS committed — it pins
+# the MediaPipe version the app was built with.
+ios/Pods/
+ios/*.xcworkspace
+
 # The user's scoring reference (chainlink #28): built from their own data,
 # so it lives outside git — the app finds it as an optional resource folder.
 ios/LocalResources/

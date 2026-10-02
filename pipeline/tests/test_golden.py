@@ -28,7 +28,7 @@ from collections.abc import Mapping
 import numpy as np
 import pytest
 
-from handstand import features, golden, phases, postprocess, score
+from handstand import features, golden, orientation_cases, phases, postprocess, score
 
 #: Where the committed fixtures live — the folder this test guards.
 FIXTURES = golden.default_out_dir()
@@ -381,13 +381,18 @@ def test_the_generated_clip_is_in_the_keypoint_schema(tmp_path) -> None:
 def test_the_committed_fixtures_fit_the_size_budget() -> None:
     cases = [FIXTURES / f"{case}.json" for case in golden.CASES]
     reference = FIXTURES / golden.PARITY_REFERENCE_NAME
+    orientation = FIXTURES / orientation_cases.FIXTURE_NAME
     assert all(path.is_file() for path in cases) and reference.is_file()
-    total = sum(path.stat().st_size for path in [*cases, reference])
+    assert orientation.is_file()
+    total = sum(path.stat().st_size for path in [*cases, reference, orientation])
     assert total <= golden.MAX_FIXTURE_BYTES, f"{total} bytes of committed fixtures"
-    # The folder holds the five cases and the parity reference — nothing else,
-    # because every Swift test reads whatever `*.json` it finds there.
+    # The folder holds the five cases, the parity reference and the
+    # orientation-parity file — nothing else, because every Swift test reads
+    # whatever `*.json` it finds there (`GoldenFixtures.urls()` keeps only
+    # the five cases; the other two are loaded by name).
     expected = {f"{case}.json" for case in golden.CASES}
     expected.add(golden.PARITY_REFERENCE_NAME)
+    expected.add(orientation_cases.FIXTURE_NAME)
     assert {path.name for path in FIXTURES.glob("*.json")} == expected
 
 

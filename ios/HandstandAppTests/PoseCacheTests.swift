@@ -80,7 +80,9 @@ final class PoseCacheTests: XCTestCase {
         let json = try JSONSerialization.jsonObject(with: data)
         let object = try XCTUnwrap(json as? [String: Any])
         XCTAssertEqual(object["schema"] as? Int, 1)
-        XCTAssertEqual(object["backend"] as? String, "vision")
+        XCTAssertEqual(
+            object["backend"] as? String, PoseBackend.preferred.rawValue,
+            "the cache says which backend wrote it")
         XCTAssertEqual(object["analysis_version"] as? String, AnalysisService.analysisVersion)
         XCTAssertEqual(object["max_fps"] as? Int, 30)
 

@@ -1,0 +1,41 @@
+# CocoaPods for the MediaPipe pose backend (chainlink #45).
+#
+# The app's second backend is Google's MediaPipe Tasks Vision
+# (`MediaPipeTasksVision`), which Google ships as a CocoaPod only — there is
+# no official Swift Package — so this is the one pod in the project. The rest
+# of the app (HandstandCore, VisionPoseKit, AnnotatedVideo) stays on local
+# Swift packages, declared in project.yml.
+#
+# The .xcodeproj is generated (xcodegen) and never committed, so `pod install`
+# has to run AFTER every `xcodegen generate` — tools/mac/ios_build.sh does
+# both, in that order, and the same two lines are in docs/ios.md for running
+# it by hand on the Mac.
+#
+# Podfile.lock IS committed (the exact pod version the build was tested
+# against); Pods/ and the generated Handstand.xcworkspace are git-ignored.
+# With Pods/ already installed a re-run needs no network
+# (`pod install --no-repo-update`), which is what keeps ios_build.sh working
+# offline.
+platform :ios, '17.0'
+project 'Handstand.xcodeproj'
+
+target 'HandstandApp' do
+  # Google's own setup guide recommends dynamic frameworks for this pod:
+  # https://developers.google.com/edge/mediapipe/solutions/setup_ios
+  use_frameworks!
+  # The latest 0.10.x; pinned by Podfile.lock once `pod install` has run.
+  pod 'MediaPipeTasksVision', '~> 0.10.35'
+end
+
+# The unit tests are deliberately NOT a CocoaPods target. They never import
+# MediaPipeTasksVision — they drive the clip extractor through its injectable
+# landmarker protocol with fakes, and the real-clip parity test builds the
+# real backend through the app's own factory — so the only thing they need is
+# to *resolve* the module when loading `HandstandApp.swiftmodule`. That is
+# the FRAMEWORK_SEARCH_PATHS handout in ios/project.yml (HandstandAppTests):
+# a nested `target 'HandstandAppTests' do inherit! :search_paths end` gets a
+# full OTHER_LDFLAGS from CocoaPods anyway (force-loading a second copy of
+# MediaPipe's C++ graph library into the test bundle, whose duplicate factory
+# registration aborts dyld at test-bundle injection). No nested target here:
+# no Pods-HandstandAppTests, no second copy, and the test target links only
+# the app binary (BUNDLE_LOADER) — exactly as it did before the pod existed.

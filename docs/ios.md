@@ -3,32 +3,97 @@
 `ios/` is the iPhone app: a SwiftUI shell around the `HandstandCore` package
 (`swift/HandstandCore/`). The `.xcodeproj` is **generated** from
 `ios/project.yml` with XcodeGen and is never committed — edit `project.yml`,
-not the project.
+not the project. The project's one CocoaPod — Google's MediaPipe Tasks Vision,
+the default pose backend (see **Pose backends** below) — hooks into that
+generated project, so `pod install` follows every `xcodegen generate` and the
+generated `.xcworkspace` is what you open (and, like the project, is never
+committed).
 
 ## Generate and open (on the Mac)
 
 ```bash
-export PATH="/opt/homebrew/bin:$PATH"   # XcodeGen lives in homebrew
+export PATH="/opt/homebrew/bin:$PATH"   # XcodeGen and CocoaPods live in homebrew
 cd ios
 xcodegen generate
-open Handstand.xcodeproj
+pod install                              # after every xcodegen generate
+open Handstand.xcworkspace               # the workspace, not the .xcodeproj
 ```
 
 Re-run `xcodegen generate` whenever `project.yml` changes (including after a
-pull); Xcode picks up the regenerated project.
+pull) and `pod install` right after it — CocoaPods re-hooks into the freshly
+generated project. `Podfile.lock` is committed (it pins the MediaPipe
+version); `Pods/` and `Handstand.xcworkspace` are git-ignored and re-created
+by `pod install`, which needs no network once `Pods/` is installed.
+
+Also fetch the pose model before the first build (see **Pose backends**):
+`tools/ios/fetch_mediapipe_model.sh` puts it into `LocalResources/`, which
+`project.yml` bundles when present and skips when absent.
 
 ## Build and test from Linux
 
 ```bash
-tools/mac/ios_build.sh          # rsync ios/ + swift/ to the Mac, xcodegen,
-                                # simulator build, HandstandAppTests
+tools/mac/ios_build.sh          # fetch the model if missing, rsync ios/ + swift/
+                                 # to the Mac, xcodegen + pod install, simulator
+                                 # build, HandstandAppTests
 tools/mac/ios_build.sh wt/i44   # the same, spelled out
 ```
 
-It picks an available iPhone simulator from `xcrun simctl list devices
-available` (nothing hard-coded) and exits non-zero if generation, the build
-or the tests fail, printing `** BUILD SUCCEEDED **`, `** TEST SUCCEEDED **`
-and the `Executed … tests` lines.
+It runs `tools/ios/fetch_mediapipe_model.sh` first when the model is missing
+(the model is never committed), then picks an available iPhone simulator from
+`xcrun simctl list devices available` (nothing hard-coded) and exits
+non-zero if generation, the pod install, the build or the tests fail, printing
+`** BUILD SUCCEEDED **`, `** TEST SUCCEEDED **` and the `Executed … tests`
+lines.
+
+## Pose backends
+
+The app runs one of two pose backends, decided by `PoseBackend.preferred`
+(`ios/HandstandApp/Pose/PoseBackend.swift`):
+
+- **MediaPipe — the default** (chainlink #45), whenever
+  `pose_landmarker_full.task` is in the app bundle. The bake-off
+  (**docs/bakeoff.md**, chainlink #16) picked it over Apple Vision: PCK@0.2
+  on clean line holds **0.76 vs 0.43** at the common gate, MediaPipe wins at
+  every gate, and at the 0.5 gate Vision leaves **84/179** clips
+  unmeasurable against MediaPipe's **3/179**. It runs the *same way the
+  pipeline does* — `pose_mediapipe.py --rotate best`: two VIDEO-mode
+  landmarkers (MediaPipe's own 0.5 confidences, `numPoses = 1`), one fed
+  upright frames and one fed 180°-turned frames, both on every frame, and
+  `HandstandCore.OrientationChooser` picking the winner over the whole clip
+  — because the thresholds, the reference and the scorer were all built on
+  those keypoints. The extraction is clip-level
+  (`MediaPipeClipExtractor.extract`), so `MediaPipePoseService.process`
+  refuses a single frame honestly (`PoseServiceError.clipLevelOnly`) rather
+  than guessing one.
+- **Apple Vision — the fallback** (chainlink #82), always: built into iOS,
+  needs no download, and what a build without the fetched model runs.
+
+The **model file is not committed** (`*.task` is git-ignored). Fetch it into
+`ios/LocalResources/models/pose_landmarker_full.task` with:
+
+```bash
+tools/ios/fetch_mediapipe_model.sh
+```
+
+It copies `pipeline/models/pose_landmarker_full.task` when the pipeline has
+it, otherwise downloads the exact `MODEL_URL` `pose_mediapipe.py` uses.
+`ios/LocalResources/` is git-ignored (like the scoring reference, #28) and an
+optional resource folder, so a build without it works — the app then analyses
+with Vision.
+
+Two per-backend numbers live in `PoseBackend` (one place, so a later
+recalibration changes one line): `minVisibility` — the post-process gate,
+**0.5 for both** backends for now (MediaPipe's is the bake-off's gate) —
+passed into `Analyzer.analyze(config:)`; and `analysisVersion` —
+`"mediapipe-1"` for MediaPipe runs, `"vision-1"` for Vision — which is what
+makes pose caches (#48) written by the old builds fail their version check
+and recompute instead of replaying.
+
+CocoaPods layout: `ios/Podfile` (committed; `MediaPipeTasksVision ~> 0.10.35`,
+pinned by the committed `Podfile.lock`), `Pods/` and the generated
+`Handstand.xcworkspace` git-ignored, and `pod install` after every
+`xcodegen generate` — `tools/mac/ios_build.sh` does both in that order and
+stays offline when `Pods/` is already installed.
 
 ## Signing with a free Apple ID
 
@@ -152,11 +217,16 @@ What happens, in order:
    the last kept one (the first frame is always kept; `maxFps 0` keeps
    everything, which is what a parity check against the runner's CSV uses).
    Frames are *pulled* one at a time, so a long clip never piles up in
-   memory while Vision is still on frame three.
-2. Apple Vision — the `PoseService` of chainlink #82, the same class the
-   runner uses — runs on every kept frame.
-3. `Analyzer.analyze` (#42) runs the whole pipeline: post-process, phases,
-   features, and the scorer *if* a reference loaded (step 0).
+   memory while the model is still on frame three.
+2. `PoseBackend.preferred`'s backend runs over every kept frame —
+   **MediaPipe** (the default when its model is bundled, see **Pose
+   backends** above) through the clip-level `MediaPipeClipExtractor`, both
+   passes of the whole clip and the orientation choice; **Apple Vision**
+   per frame through the kit's `PoseService` (chainlink #82), the same class
+   the runner uses.
+3. `Analyzer.analyze` (#42) runs the whole pipeline: post-process (with the
+   backend's `minVisibility` gate), phases, features, and the scorer *if* a
+   reference loaded (step 0).
 4. The result is shown: **Holds: N**, **Longest hold: x.x s**, the score —
    or **"No score yet (no reference)"** — and up to three top faults with
    their names said in words (`hip_angle` → "Hip angle"). A clip the app
@@ -167,11 +237,12 @@ What happens, in order:
    video."** when nobody was found) instead.
 5. For a recording, the result is saved to the session row's analysis
    columns (`analyzed_at`, `clip_score`, `hold_count`, `longest_hold_s`,
-   `analysis_version = "vision-1"`, `analysis_note`), which is what the
-   detail screen and the History row then show. An unmeasurable clip is
+   `analysis_version` — the backend's own (`"mediapipe-1"` /
+   `"vision-1"`, **Pose backends** above) — and `analysis_note`), which is
+   what the detail screen and the History row then show. An unmeasurable clip is
    saved with hold count 0, no score and the reason in `analysis_note` —
    the screens then read "Couldn't measure" rather than a hold count of 0.
-6. For a recording, the frames Vision saw are also written to the
+6. For a recording, the frames the model saw are also written to the
    **pose cache** beside the movie — `<basename>.pose.json`, same folder,
    same stem (see **Stress diagram** below). The next time the session
    screen opens it reads those frames instead of running Vision again.
@@ -258,17 +329,22 @@ nothing fills it yet.
 
 ### The pose cache
 
-Analysing a take runs Vision over every frame — seconds of work that must
-not be repeated just to *watch* the overlay again. So a finished run writes
-the frames it read to **`<basename>.pose.json` next to the movie**
+Analysing a take runs the pose model over every frame — seconds of work that
+must not be repeated just to *watch* the overlay again. So a finished run
+writes the frames it read to **`<basename>.pose.json` next to the movie**
 (`20260928-143059.mov` → `20260928-143059.pose.json`, same folder):
 
 ```json
-{"schema": 1, "backend": "vision", "analysis_version": "vision-1",
+{"schema": 1, "backend": "mediapipe", "analysis_version": "mediapipe-1",
  "max_fps": 30,
  "frames": [{"t_ms": 0, "detected": true,
              "joints": {"nose": [x, y, visibility], …}}, …]}
 ```
+
+(`backend`/`analysis_version` follow whichever backend ran — `"vision"` /
+`"vision-1"` while Vision is the fallback — and a cache whose
+`analysis_version` is not this build's is not read: **Pose backends** above
+is what makes old `"vision-1"` caches recompute once MediaPipe decides.)
 
 - **Written** by `AnalysisService` when the extraction finishes — for a
   *recording* only; a video picked from Photos has no row in History and so

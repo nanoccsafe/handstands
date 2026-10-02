@@ -7,14 +7,22 @@
 #             (default wt/i44)
 #
 # What it does:
-#   1. rsync the repo's ios/ and swift/ to $host:$remote-dir/, excluding
-#      .build, .swiftpm, DerivedData and *.xcodeproj — the .xcodeproj and the
-#      DerivedData cache live on the Mac, only the sources travel;
-#   2. on the Mac: `xcodegen generate` in $remote-dir/ios;
-#   3. `xcodebuild build` for "generic/platform=iOS Simulator";
-#   4. pick an iPhone from `xcrun simctl list devices available` (no
+#   1. fetch the MediaPipe model (tools/ios/fetch_mediapipe_model.sh) when
+#      ios/LocalResources/models/pose_landmarker_full.task is missing, so the
+#      remote copy carries it — the model is never committed (chainlink #45);
+#   2. rsync the repo's ios/ and swift/ to $host:$remote-dir/, excluding
+#      .build, .swiftpm, DerivedData, *.xcodeproj, Pods/ and the generated
+#      *.xcworkspace — the project, Pods and the DerivedData cache live on
+#      the Mac, only the sources (plus Podfile/Podfile.lock) travel;
+#   3. on the Mac: `xcodegen generate` then `pod install` in
+#      $remote-dir/ios — always in that order, CocoaPods hooks into the
+#      generated project; `pod install` runs with --no-repo-update when
+#      Pods/ is already installed, so a re-run needs no network;
+#   4. `xcodebuild build` of the generated .xcworkspace for
+#      "generic/platform=iOS Simulator";
+#   5. pick an iPhone from `xcrun simctl list devices available` (no
 #      hard-coded UUID) and run `xcodebuild test` on it;
-#   5. print the result lines (** BUILD SUCCEEDED **, ** TEST SUCCEEDED **,
+#   6. print the result lines (** BUILD SUCCEEDED **, ** TEST SUCCEEDED **,
 #      "Executed … tests") and exit non-zero if any step failed.
 #
 # Examples:
@@ -24,7 +32,7 @@
 # Env: HANDSTAND_MAC_HOST (default macmini).
 set -euo pipefail
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
 
 die() { echo "ios_build: $*" >&2; exit 1; }
 
@@ -41,11 +49,24 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [[ "$remote_dir" =~ ^[A-Za-z0-9._/-]+$ && "$remote_dir" != /* && "$remote_dir" != *..* ]] \
     || die "remote dir must be a safe relative path on $host: '$remote_dir'"
 
-# The .xcodeproj is generated on the Mac (xcodegen), DerivedData is a build
-# cache that must survive the sync, and .build/.swiftpm belong to swift test.
-exclude=(--exclude '.build' --exclude '.swiftpm' --exclude 'DerivedData' --exclude '*.xcodeproj')
+# The .xcodeproj is generated on the Mac (xcodegen), the workspace on the Mac
+# (pod install), Pods/ lives only there, DerivedData is a build cache that
+# must survive the sync, and .build/.swiftpm belong to swift test. The
+# excludes also protect those directories from --delete.
+exclude=(
+    --exclude '.build' --exclude '.swiftpm' --exclude 'DerivedData'
+    --exclude '*.xcodeproj' --exclude 'Pods' --exclude '*.xcworkspace'
+)
 
-echo "== rsync ios/ and swift/ to $host:$remote_dir/ (excluding .build, DerivedData, *.xcodeproj)"
+# The model the default backend loads (chainlink #45): not committed, so it
+# is fetched into ios/LocalResources/models/ before the rsync when missing —
+# a copy from pipeline/models or a download, see the script itself.
+if [[ ! -f "$repo_root/ios/LocalResources/models/pose_landmarker_full.task" ]]; then
+    echo "== MediaPipe model missing; running tools/ios/fetch_mediapipe_model.sh"
+    "$repo_root/tools/ios/fetch_mediapipe_model.sh"
+fi
+
+echo "== rsync ios/ and swift/ to $host:$remote_dir/ (excluding .build, DerivedData, *.xcodeproj, Pods, *.xcworkspace)"
 rsync -a --delete "${exclude[@]}" "$repo_root/ios/" "$host:$remote_dir/ios/"
 rsync -a --delete "${exclude[@]}" "$repo_root/swift/" "$host:$remote_dir/swift/"
 
@@ -70,8 +91,19 @@ cd "$REMOTE_DIR/ios"
 echo "== xcodegen generate"
 xcodegen generate
 
+echo "== pod install (CocoaPods: MediaPipeTasksVision, chainlink #45)"
+# `pod install` always runs AFTER `xcodegen generate` — it hooks into the
+# generated project, and a regenerated project has to be hooked in again.
+# With Pods/ already installed --no-repo-update keeps it offline; a first
+# install (no Pods/ yet) needs the network once to fetch the pod.
+if [[ -d Pods ]]; then
+    pod install --no-repo-update
+else
+    pod install
+fi
+
 echo "== xcodebuild build (generic/platform=iOS Simulator)"
-xcodebuild -project Handstand.xcodeproj -scheme HandstandApp \
+xcodebuild -workspace Handstand.xcworkspace -scheme HandstandApp \
     -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath DerivedData build
 
@@ -91,7 +123,7 @@ name="$(sed -E 's/^[[:space:]]*//; s/[[:space:]]*\([0-9A-Fa-f-]{36}\).*//' <<<"$
 echo "simulator: $name ($udid)"
 
 echo "== xcodebuild test ($name)"
-xcodebuild -project Handstand.xcodeproj -scheme HandstandApp \
+xcodebuild -workspace Handstand.xcworkspace -scheme HandstandApp \
     -destination "platform=iOS Simulator,id=$udid" \
     -derivedDataPath DerivedData test
 REMOTE

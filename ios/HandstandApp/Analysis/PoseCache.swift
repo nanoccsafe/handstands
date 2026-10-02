@@ -41,8 +41,13 @@ enum PoseCache {
     /// The document's schema version — bumped when the *shape* changes.
     static let schema = 1
 
-    /// Which pose backend wrote the file (`PoseBackend.vision.rawValue`).
-    static let backend = "vision"
+    /// Which pose backend wrote the file (`PoseBackend.preferred.rawValue`):
+    /// `"mediapipe"` for runs of the default backend (chainlink #45),
+    /// `"vision"` while Vision is the fallback. `read` keys on
+    /// `analysis_version`, which follows the backend the same way — a cache
+    /// written by the old `"vision-1"` builds is not read once MediaPipe
+    /// decides the frames.
+    static var backend: String { PoseBackend.preferred.rawValue }
 
     /// The cache for `movie`: same folder, same stem, `.pose.json`.
     static func cacheURL(for movie: URL) -> URL {
