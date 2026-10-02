@@ -185,6 +185,25 @@ built by chainlink #28 from the labelled good clips (#27): none is bundled and
 guessed numbers. See `docs/scoring.md` for the formula, the groups and the
 schema.
 
+## Hold shapes
+
+The shape of every hold — `line`, `straddle`, `split_stag`, `tuck`, `pike`,
+`other` — labelled per hold (one clip can mix shapes), pre-labelled from the
+hold summary's medians, reviewed in a small Label Studio project and imported
+to `$HANDSTAND_DATA/labels/hold_shapes.csv`.
+
+```sh
+cd pipeline
+uv run python -m handstand.hold_shapes prelabel                # frames + Label Studio import + config
+uv run python -m handstand.hold_shapes import ../data/label_studio_hold_shapes_export.json
+uv run python -m handstand.hold_shapes summary --write-catalogue
+```
+
+`load_hold_shapes` / `is_line_hold` / `line_holds` are the downstream helpers:
+`is_line_hold` is False for an unlabelled hold, so the line-only stages (#28
+reference, #29/#30 scoring, #32–#34 faults) can never take an unreviewed hold.
+See `docs/labeling.md` for the whole loop.
+
 ## Golden fixtures
 
 The test data the Swift ports are checked against: synthetic clips, run through
