@@ -73,11 +73,15 @@ done
 [[ -f $catalogue ]] || die "missing $catalogue ($catalogue)"
 
 # clip id -> file name, from the catalogue (the pipeline's clip id definition).
+# Rows with `missing=true` are skipped: their video file is gone (chainlink #49),
+# so --all must not try to copy or run them.
 declare -A filename_by_id=()
 declare -A id_by_name=()
 while IFS=, read -r clip_id filename _rest; do
     [[ $clip_id == "clip_id" || -z $clip_id ]] && continue
     filename="${filename%$'\r'}"
+    missing="${_rest##*,}"
+    [[ "${missing%$'\r'}" =~ ^(true|1|yes)$ ]] && continue
     filename_by_id["$clip_id"]="$filename"
     id_by_name["$filename"]="$clip_id"
 done < <(tail -n +2 "$catalogue")
@@ -124,6 +128,13 @@ rsync -a --ignore-existing --include='*/' --include='*.mp4' --exclude='*' \
 # --------------------------------------------------------------------------- #
 # 2. The package, and a release build of it.
 # --------------------------------------------------------------------------- #
+# VisionPose depends on swift/HandstandCore by relative path (see its
+# Package.swift), so both packages have to land on the Mac — a fresh remote
+# root without HandstandCore fails the build with "the package at
+# .../HandstandCore cannot be accessed" (chainlink #16).
+echo "== copying swift/HandstandCore to $host:$remote_root/swift/HandstandCore"
+rsync -a --delete --exclude .build "$repo_root/swift/HandstandCore/" \
+    "$host:$remote_root/swift/HandstandCore/"
 echo "== copying swift/VisionPose to $host:$remote_root/swift/VisionPose"
 rsync -a --delete --exclude .build "$package/" "$host:$remote_root/swift/VisionPose/"
 
