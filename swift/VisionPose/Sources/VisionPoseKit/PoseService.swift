@@ -44,6 +44,11 @@ public enum PoseServiceError: Error, Equatable, CustomStringConvertible {
     case visionFailed(String)
     /// The display-oriented buffer of a rotated frame could not be allocated.
     case pixelBufferAllocation(width: Int, height: Int)
+    /// The backend decides a frame's orientation over the **whole clip**
+    /// (MediaPipe's `--rotate best`, chainlink #45), so it cannot answer for
+    /// one frame in isolation: run its clip-level extractor
+    /// (`MediaPipeClipExtractor.extract`) instead of `process(_:tMs:)`.
+    case clipLevelOnly(String)
 
     public var description: String {
         switch self {
@@ -51,6 +56,8 @@ public enum PoseServiceError: Error, Equatable, CustomStringConvertible {
             return "could not read the body-pose points: \(message)"
         case .pixelBufferAllocation(let width, let height):
             return "could not allocate a \(width)x\(height) pixel buffer"
+        case .clipLevelOnly(let message):
+            return message
         }
     }
 }

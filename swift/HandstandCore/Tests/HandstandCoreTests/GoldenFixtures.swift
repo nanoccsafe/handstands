@@ -214,14 +214,24 @@ enum GoldenFixtures {
     /// by name through `parityReferenceData()`.
     static let parityReferenceName = "parity_reference"
 
+    /// The orientation-chooser parity fixture of chainlink #45 — a document
+    /// of score sequences, not a golden clip, so `urls()` excludes it here
+    /// for the same reason it excludes `parity_reference.json`;
+    /// `OrientationChooserTests` loads it by name.
+    static let orientationCasesName = "orientation_cases"
+
     /// Every committed **fixture**, in file-name order so a failure names a
-    /// stable list. `parity_reference.json` is not one — see above.
+    /// stable list. `parity_reference.json` and `orientation_cases.json` are
+    /// not golden fixtures — see above.
     static func urls() -> [URL] {
         let urls =
             Bundle.module.urls(forResourcesWithExtension: "json", subdirectory: "Fixtures/golden")
             ?? []
         return urls
-            .filter { $0.lastPathComponent != "\(parityReferenceName).json" }
+            .filter {
+                $0.lastPathComponent != "\(parityReferenceName).json"
+                    && $0.lastPathComponent != "\(orientationCasesName).json"
+            }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 

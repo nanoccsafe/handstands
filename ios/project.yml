@@ -103,6 +103,14 @@ targets:
         GENERATE_INFOPLIST_FILE: "YES"
         BUNDLE_LOADER: "$(TEST_HOST)"
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/HandstandApp.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/HandstandApp"
+        # Chainlink #45: the test target is not a CocoaPods target (see
+        # ios/Podfile — a nested pod target links a SECOND copy of MediaPipe
+        # into the bundle and dyld aborts on the duplicate C++ registrations).
+        # The tests never import the pod; these paths only let the compiler's
+        # dependency scan resolve `MediaPipeTasksVision` when it loads
+        # `HandstandApp.swiftmodule`. Same four -F flags CocoaPods' own
+        # HandstandAppTests xcconfig would have handed out.
+        FRAMEWORK_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Pods/MediaPipeTasksCommon/frameworks $(SRCROOT)/Pods/MediaPipeTasksVision/frameworks $(BUILD_DIR)/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/XCFrameworkIntermediates/MediaPipeTasksCommon $(BUILD_DIR)/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/XCFrameworkIntermediates/MediaPipeTasksVision"
 
 schemes:
   HandstandApp:

@@ -954,6 +954,58 @@ a cancellation deletes the partial file; and `DiagramRendererTests` puts
 red on a bad joint's own pixel in a small bitmap context, plus the radius
 rule and the strip's bins, playhead and neutral fill.
 
+## OrientationChooser (chainlink #45)
+
+`swift/HandstandCore/Sources/HandstandCore/OrientationChooser.swift` is
+`handstand.pose_mediapipe.choose_orientations` ported exactly — the decision
+behind `--rotate best`: which of MediaPipe's two VIDEO-mode passes (upright /
+180°-turned) each frame's keypoints come from. The app has to reproduce it
+because the thresholds, the reference and the scorer were all built on the
+keypoints that choice wrote out (the bake-off, docs/bakeoff.md), and because
+the same smoothed-margin rule keeps the phone from flickering between
+orientations the way a per-frame rule would (chainlink #79).
+
+Four functions, the Python ones renamed to Swift's camel case:
+
+| Python | Swift |
+|---|---|
+| `frame_margin` | `OrientationChooser.frameMargin(scoreUpright:scoreRotated:)` |
+| `smooth_margin` | `OrientationChooser.smoothMargin(tMs:margin:windowS:)` |
+| `_opening_orientation` | `OrientationChooser.openingOrientation(tMs:smoothed:)` |
+| `choose_orientations` | `OrientationChooser.chooseOrientations(tMs:scoreUpright:scoreRotated:)` |
+
+with the same three constants (`ORIENT_WINDOW_S = 0.5` s centred window in
+**clip time**, `ORIENT_MARGIN = 0.05`, `ORIENT_MIN_SWITCH_S = 0.3`), the same
+`searchsorted` window bounds (binary search spelled `lowerBound`/`upperBound`
+inside the file), NaN for "a pass found nobody" — skipped by the smoothing,
+never averaged as zero — and the same hysteresis loop: a switch only once the
+smoothed margin has held the other sign past the band for the minimum time,
+so a tie, an unscored frame and a one-frame confident misread all keep the
+orientation the clip is already in.
+
+The file also carries the **33 → 15 landmark map** (`mediaPipeLandmarkIndex`,
+public because the app's extractor maps its detections through it) and
+`OrientationChooser.mainJointIndices`, the 12 main-joint landmark indices the
+per-frame score averages — `MAIN_JOINT_INDEX` and `MAIN_JOINTS` on the Python
+side.
+
+**Parity**: `pipeline/handstand/orientation_cases.py` runs the *real* Python
+chooser over six synthetic score sequences — steady upright, steady inverted,
+a one-frame confident misread, a sustained switch, NaN gaps and variable
+frame-rate timestamps — and writes input + Python's answer to
+`Fixtures/golden/orientation_cases.json` (regenerate with
+`uv run python -m handstand.orientation_cases`; `tests/test_orientation_cases.py`
+re-runs the chooser against the committed file, so the two sides cannot
+drift). `OrientationChooserTests` reads the same JSON through `Bundle.module`
+and asserts Swift's answer is **exactly** Python's, frame by frame, plus the
+constants pinned twice (the literals and the `meta` the generator recorded)
+and the VFR window arithmetic. Parity only, no real clips (chainlink #80).
+
+On the phone the chooser runs inside `MediaPipeClipExtractor` (the app,
+`ios/HandstandApp/Pose/MediaPipePoseService.swift`): both passes of the clip
+first, then one `chooseOrientations` call over the whole clip, then the
+chosen pass's keypoints mapped back to display pixels.
+
 ## Running the tests
 
 Swift cannot build on Linux, so the tests run on the Mac mini. From the repo

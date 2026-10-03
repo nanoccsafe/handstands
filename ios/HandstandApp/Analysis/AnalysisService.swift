@@ -5,11 +5,14 @@ import VisionPoseKit
 
 // --------------------------------------------------------------------------- #
 // One video, analysed (chainlink #47): the app's first end-to-end run —
-// VideoFrameSource reads the frames, PoseBackend.vision runs Apple Vision on
-// each one, `Analyzer.analyze` does the pipeline, `AnalysisSummary` is what
-// the screen shows and `SessionStore.recordAnalysis` what History remembers.
+// VideoFrameSource reads the frames, `PoseBackend.preferred`'s extractor runs
+// the model over them (MediaPipe's clip-level `MediaPipeClipExtractor` when
+// its model is bundled — chainlink #45 —, `VideoPoseExtractor` with Apple
+// Vision otherwise), `Analyzer.analyze` does the pipeline, `AnalysisSummary`
+// is what the screen shows and `SessionStore.recordAnalysis` what History
+// remembers.
 //
-// Everything here is on the main actor; the heavy half (decode + Vision + the
+// Everything here is on the main actor; the heavy half (decode + model + the
 // pipeline) runs in a `Task.detached`, so the progress bar moves, the Cancel
 // button answers and the screen never blocks. `state` is the only thing this
 // class owns, and it is written only by the run that still owns it — see
@@ -32,8 +35,11 @@ final class AnalysisService {
 
     /// The version written to `Session.analysisVersion` by this build's
     /// scoring run — one definition, so every row says which algorithm wrote
-    /// it, and old scores can be told apart from new ones.
-    static let analysisVersion = "vision-1"
+    /// it, and old scores can be told apart from new ones. It follows the
+    /// backend that ran: `"mediapipe-1"` once the model is bundled,
+    /// `"vision-1"` while Vision is the fallback (`PoseBackend.analysisVersion`),
+    /// which is what makes old pose caches (#48) recompute instead of replay.
+    static var analysisVersion: String { PoseBackend.preferred.analysisVersion }
 
     /// The cap on frames fed to the model: the app analyses after recording,
     /// and 30 fps is every frame a normal recording has. Doubles as the
@@ -68,11 +74,16 @@ final class AnalysisService {
         state = .running(progress: 0)
 
         do {
+            // Which backend this run is: decided once, so the extraction,
+            // the cache version and the saved row all agree. MediaPipe when
+            // its model is bundled (chainlink #45's default, per the
+            // bake-off), Vision otherwise.
+            let backend = PoseBackend.preferred
             // 1. The reference for this hold, if the app was built with one
             //    (`ReferenceLoader`; the real file is never in the repo).
             let reference = ReferenceLoader.load(for: holdType)
             // 2./3. Every kept frame through the pose backend, with progress.
-            let frames = try await extract(movie: movie, generation: mine)
+            let frames = try await extract(movie: movie, backend: backend, generation: mine)
             // A *recording's* frames go to the pose cache beside the movie
             // (chainlink #48) the moment Vision is done with them: the next
             // time the session screen opens it reads them back and never
@@ -84,9 +95,11 @@ final class AnalysisService {
             }
             // 4. The whole pipeline, also off the main actor: the segmenter
             //    and the scorer are CPU work, not something to do between
-            //    two redraws.
+            //    two redraws. The config carries this backend's
+            //    `minVisibility` gate (`PoseBackend`, per backend).
+            let config = backend.postProcessConfig
             let analysis = await Task.detached {
-                Analyzer.analyze(frames, reference: reference)
+                Analyzer.analyze(frames, reference: reference, config: config)
             }.value
             // 5. What the screen shows.
             let summary = AnalysisSummary.make(
@@ -107,7 +120,7 @@ final class AnalysisService {
                     score: unusable == nil ? summary.clipScore : nil,
                     holdCount: unusable == nil ? summary.holdCount : 0,
                     longestHoldS: unusable == nil ? summary.longestHoldS : 0,
-                    version: Self.analysisVersion,
+                    version: backend.analysisVersion,
                     note: unusable
                 )
             }
@@ -139,24 +152,41 @@ final class AnalysisService {
 
     /// The extraction task of this run, awaited here: `analyse` stays on the
     /// main actor, the work inside the task does not.
-    private func extract(movie: URL, generation mine: Int) async throws -> [PostProcessInputFrame] {
+    private func extract(
+        movie: URL, backend: PoseBackend, generation mine: Int
+    ) async throws -> [PostProcessInputFrame] {
         // Copied out before the task: `Self.maxFps` is main-actor isolated
         // like everything on this class, the number itself is not.
         let maxFps = Self.maxFps
         let task = Task.detached { () async throws -> [PostProcessInputFrame] in
-            // The service is created *inside* the task: one clip's worth of
-            // state (the auto-rotation), never sent anywhere.
-            guard let service = PoseBackend.vision.makeService() else {
-                throw AnalysisError.noPoseBackend
-            }
             let source = VideoFrameSource(url: movie, maxFps: maxFps)
-            return try await VideoPoseExtractor.extract(source, service: service) { progress in
-                // Called on the extraction's executor; hop home to show it,
-                // and only if this run is still the one on screen.
+            // Called on the extraction's executor; hop home to show it,
+            // and only if this run is still the one on screen.
+            let show: @Sendable (Double) -> Void = { progress in
                 Task { @MainActor in
                     guard self.generation == mine, case .running = self.state else { return }
                     self.state = .running(progress: progress)
                 }
+            }
+            // MediaPipe cannot answer frame by frame — the orientation is
+            // chosen over the whole clip (#45) — so it runs its own
+            // clip-level extractor; Vision keeps the per-frame
+            // `VideoPoseExtractor` it has always had. Both are created
+            // inside the task: one clip's worth of state, never sent
+            // anywhere.
+            switch backend {
+            case .mediapipe:
+                guard let modelURL = PoseBackend.mediapipeModelURL else {
+                    throw AnalysisError.noPoseBackend
+                }
+                return try await MediaPipeClipExtractor.extract(
+                    source: source, modelURL: modelURL, progress: show)
+            case .vision:
+                guard let service = backend.makeService() else {
+                    throw AnalysisError.noPoseBackend
+                }
+                return try await VideoPoseExtractor.extract(
+                    source, service: service, progress: show)
             }
         }
         extraction = task
@@ -169,6 +199,7 @@ final class AnalysisService {
         switch error {
         case let error as VideoFrameSourceError: return error.description
         case let error as PoseServiceError: return error.description
+        case let error as MediaPipeExtractorError: return error.description
         case let error as AnalysisError: return error.description
         case let error as ScoreReferenceError: return error.description
         default: return error.localizedDescription
@@ -179,9 +210,11 @@ final class AnalysisService {
 /// What can go wrong around the pipeline — never the maths itself, whose
 /// stages refuse their bad input by precondition rather than by throwing.
 enum AnalysisError: Error, CustomStringConvertible {
-    /// The pose backend asked for is not available in this build
-    /// (`PoseBackend.vision` is always available; MediaPipe, #45, is not
-    /// yet).
+    /// The pose backend this run picked is not available in this build —
+    /// `PoseBackend.preferred` fell through to a backend whose `makeService`
+    /// or model file disappeared between the choice and the run (chainlink
+    /// #45 made MediaPipe the default whenever its model is bundled; Vision
+    /// is the always-available fallback).
     case noPoseBackend
 
     var description: String {
