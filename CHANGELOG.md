@@ -151,6 +151,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- MediaPipe pose backend in the app (default, per the bake-off), --rotate best parity (#45)
 - Bake-off evaluation and model decision (#16)
 - Review and correct the agent pre-labels in Label Studio (~300 frames) (#13)
 - hold_shapes: Label Studio rejects the config (multi-variable Text) and file:// image URIs (#87)
