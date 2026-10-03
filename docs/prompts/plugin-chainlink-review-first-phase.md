@@ -38,5 +38,7 @@ as "earlier work", so it reviewed an empty branch first.
 
 ## Workaround used (not a fix)
 
-The lead folded the comments into the description, which was already done, and reran with a fresh state file. The
-plugin itself was not modified.
+The lead moved the stale state file aside (kept as `i86-ingest.loop-state.failed-review-first.json` in
+`/tmp/handstand-workers/`) and reran with the plugin's documented `--review-first never`. The bug in the review-first
+path remains: any issue with comments and an empty branch hits it under the default `--review-first auto`. The plugin
+itself was not modified.
