@@ -18,6 +18,13 @@ The loop exited with code 1. No worker step ran, and the branch stayed empty. Th
 (`OPENCODE_LOOP_STATE_PATH`) holds the workflow `chainlink_32prs` for task 86. After the review-first reviewer step it
 was left in phase `worker`, and the loop then refused to proceed from that same phase.
 
+## Root cause (filed as plugin chainlink #6, 2026-10-02)
+
+runReviewer() moves the workflow to phase "reviewer" only `if (result.sessionID)` (src/chainlink-process.ts). The
+reviewer step here produced NO OpenCode session (there's no "Chainlink 86 reviewer 1" session in opencode.db), so
+the phase stayed "worker", and recordChainlinkReview() (src/state.ts) threw the phase-mismatch error. The real
+failure is that the reviewer step didn't start, and the loop doesn't log why.
+
 ## Why the review-first path was taken
 
 The issue's comments were the lead's scope notes (spec additions), not earlier work. The loop treats any comment
