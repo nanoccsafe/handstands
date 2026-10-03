@@ -21,7 +21,9 @@ The default flow is one issue at a time through the opencode-loop-plugin's singl
    in the issue's worktree (`CHAINLINK_DB` points at the main `.chainlink`). One-shot `opencode run` steps:
    build-agent worker, plan-agent reviewer that cannot edit, findings fed back to the worker session, until the
    reviewer approves; the issue stays open. Long batches: `LOOP_ARGS="--worker-timeout 10800"`. Don't comment on
-   an issue right before spawning (the loop treats comments as earlier work and reviews first).
+   an issue right before spawning (the loop treats comments as earlier work and reviews first). If an issue has
+   spec comments but no work yet, spawn with `LOOP_ARGS="--review-first never"`: the review-first path on an empty
+   branch fails with "workflow … is in phase worker" (docs/prompts/plugin-chainlink-review-first-phase.md).
 3. When the loop finishes, review it yourself (see below) against the spec. If it falls short, put the findings
    in `chainlink issue comment <id> ...` and rerun: `spawn.sh <id> <slug> --chainlink --rerun` (same worktree).
    The plugin is meant to work on its own: if the loop fails (no reviewer verdict, a timeout, the orchestrator
