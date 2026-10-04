@@ -354,7 +354,17 @@ def test_prelabel_writes_the_labeling_config(
     assert choices.get("choice") == "single"
     assert choices.get("required") == "true"
     assert [choice.get("value") for choice in choices] == list(SHAPES)
-    assert [choice.get("hotkey") for choice in choices] == ["1", "2", "3", "4", "5", "6"]
+    assert [choice.get("hotkey") for choice in choices] == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+    ]
     assert hold_shapes.default_config_path().name == "hold_shapes_config.xml"
 
 
@@ -612,7 +622,11 @@ def test_summary_counts_shapes_skills_and_prediction_accuracy(tmp_path: pathlib.
         "tuck": 1,
         "pike": 1,
         "other": 1,
+        "not_a_hold": 0,
+        "walk": 0,
+        "mexican": 0,
     }
+    assert summary.false_holds == {}
     assert summary.clip_skills == {CLIP: "line", OTHER_CLIP: "mixed", MISSING_CLIP: "mixed"}
     assert (summary.predicted, summary.agreed) == (4, 3)
     assert (summary.unmeasured, summary.unrecorded) == (1, 1)
@@ -707,3 +721,216 @@ def test_line_helpers_refuse_an_unlabelled_hold(tmp_path: pathlib.Path) -> None:
     assert [(row["clip_id"], row["hold_id"]) for row in selected] == [(CLIP, 0)]
     # The whole summary read back is the input, and only 1 of 3 rows survives.
     assert len(rows) == 3
+
+
+# --------------------------------------------------------------------------- #
+# The #86 label set: not_a_hold, walk, mexican
+# --------------------------------------------------------------------------- #
+
+
+def test_shapes_and_hotkeys_are_the_review_projects_choices_in_order() -> None:
+    """Exactly the nine choices Label Studio project 3 carries, by hand."""
+    assert SHAPES == (
+        "line",
+        "straddle",
+        "split_stag",
+        "tuck",
+        "pike",
+        "other",
+        "not_a_hold",
+        "walk",
+        "mexican",
+    )
+    assert hold_shapes.HOTKEYS == {
+        "line": "1",
+        "straddle": "2",
+        "split_stag": "3",
+        "tuck": "4",
+        "pike": "5",
+        "other": "6",
+        "not_a_hold": "7",
+        "walk": "8",
+        "mexican": "9",
+    }
+    choices = ET.fromstring(hold_shapes.config_xml()).find("Choices")
+    assert choices is not None
+    assert [choice.get("value") for choice in choices] == list(SHAPES)
+    assert [choice.get("hotkey") for choice in choices] == [str(n) for n in range(1, 10)]
+    # The committed config is generated from those constants: it must be in sync.
+    committed = hold_shapes.default_config_path().read_text(encoding="utf-8")
+    assert committed == hold_shapes.config_xml()
+
+
+def test_not_a_hold_is_counted_but_never_a_shape_of_a_clip() -> None:
+    """A clip with line holds plus a false hold is "line", not "mixed" (#86)."""
+    rows: list[dict[str, object]] = [
+        {"clip_id": CLIP, "hold_id": 0, "shape": "line", "predicted_shape": "line"},
+        {"clip_id": CLIP, "hold_id": 1, "shape": "not_a_hold", "predicted_shape": ""},
+        # Every hold false: no shaped hold to name, so no skill is written.
+        {"clip_id": OTHER_CLIP, "hold_id": 0, "shape": "not_a_hold", "predicted_shape": ""},
+        {"clip_id": OTHER_CLIP, "hold_id": 1, "shape": "not_a_hold", "predicted_shape": ""},
+    ]
+    summary = hold_shapes.build_summary(rows)
+
+    assert summary.clip_skills == {CLIP: "line"}
+    assert summary.counts["not_a_hold"] == 3
+    assert summary.false_holds == {CLIP: 1, OTHER_CLIP: 2}
+
+    text = hold_shapes.summarise_shapes(summary)
+    assert "false holds (not_a_hold): 3 over 2 clip(s)" in text
+    assert f"{CLIP}=1" in text
+    assert f"{OTHER_CLIP}=2" in text
+    assert "MIN_HOLD_S" in text
+    # Every clip with a label is counted, including the all-false one.
+    assert "over 2 clip(s)" in text
+    # The all-false clip has no skill line of its own.
+    assert "clips: line=1" in text
+
+
+def test_walk_and_mexican_are_real_skills_but_never_line() -> None:
+    rows: list[dict[str, object]] = [
+        # A walk is not line: line + walk disagrees, like any two shapes.
+        {"clip_id": CLIP, "hold_id": 0, "shape": "line", "predicted_shape": "line"},
+        {"clip_id": CLIP, "hold_id": 1, "shape": "walk", "predicted_shape": ""},
+        # All walks is the walk skill; mexican is a shape like any other.
+        {"clip_id": OTHER_CLIP, "hold_id": 0, "shape": "walk", "predicted_shape": ""},
+        {"clip_id": OTHER_CLIP, "hold_id": 1, "shape": "walk", "predicted_shape": ""},
+        {"clip_id": MISSING_CLIP, "hold_id": 0, "shape": "mexican", "predicted_shape": ""},
+    ]
+    summary = hold_shapes.build_summary(rows)
+
+    assert summary.clip_skills == {CLIP: "mixed", OTHER_CLIP: "walk", MISSING_CLIP: "mexican"}
+    assert summary.counts["walk"] == 3
+    assert summary.counts["mexican"] == 1
+    assert summary.false_holds == {}
+
+
+def test_only_line_is_a_line_hold_including_the_new_labels(tmp_path: pathlib.Path) -> None:
+    write_labels(
+        tmp_path / "labels" / "hold_shapes.csv",
+        [
+            {"clip_id": CLIP, "hold_id": 0, "shape": "line", "predicted_shape": "line"},
+            {"clip_id": CLIP, "hold_id": 1, "shape": "walk", "predicted_shape": ""},
+            {"clip_id": CLIP, "hold_id": 2, "shape": "not_a_hold", "predicted_shape": ""},
+            {"clip_id": CLIP, "hold_id": 3, "shape": "mexican", "predicted_shape": ""},
+        ],
+    )
+    shapes = load_hold_shapes(tmp_path)
+    assert is_line_hold(CLIP, 0, shapes) is True
+    assert is_line_hold(CLIP, 1, shapes) is False  # a walk is not line
+    assert is_line_hold(CLIP, 2, shapes) is False  # a false hold is not line
+    assert is_line_hold(CLIP, 3, shapes) is False  # mexican is not line
+    assert is_line_hold(CLIP, 9, shapes) is False  # unlabelled, as before
+
+
+def test_import_keeps_the_new_labels_as_shapes(tmp_path: pathlib.Path) -> None:
+    """not_a_hold / walk / mexican are in SHAPES: imported, kept, no warning."""
+    data = tmp_path / "data"
+    export = tmp_path / "export.json"
+    export.write_text(
+        json.dumps(
+            [
+                {
+                    "data": {"clip_id": CLIP, "hold_id": 0},
+                    "annotations": [annotation("not_a_hold", "2026-10-02T10:00:00Z")],
+                },
+                {
+                    "data": {"clip_id": CLIP, "hold_id": 1},
+                    "annotations": [annotation("walk", "2026-10-02T10:01:00Z")],
+                },
+                {
+                    "data": {"clip_id": OTHER_CLIP, "hold_id": 0},
+                    "annotations": [annotation("mexican", "2026-10-02T10:02:00Z")],
+                },
+                # An actual unknown label is still imported as typed and reported.
+                {
+                    "data": {"clip_id": OTHER_CLIP, "hold_id": 1},
+                    "annotations": [annotation("handstand", "2026-10-02T10:03:00Z")],
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = import_export(export, data=data)
+
+    assert report.unknown_shapes == ("handstand",)
+    rows = read_label_rows(report.out_path)
+    shapes = {(row["clip_id"], row["hold_id"]): row["shape"] for row in rows}
+    assert shapes[(CLIP, 0)] == "not_a_hold"
+    assert shapes[(CLIP, 1)] == "walk"  # kept: it is the training data for #71
+    assert shapes[(OTHER_CLIP, 0)] == "mexican"
+
+
+# --------------------------------------------------------------------------- #
+# prelabel: the weekly subset run (#86)
+# --------------------------------------------------------------------------- #
+
+
+def test_prelabel_only_considers_the_given_clips(
+    workspace: tuple[pathlib.Path, pathlib.Path], tmp_path: pathlib.Path
+) -> None:
+    data, videos = workspace
+    # A second clip with no video at all: it must never be looked at, or its
+    # missing video would show up as a skip note.
+    write_hold_summary(
+        data / "features" / "mediapipe" / "hold_summary.csv",
+        [LINE_HOLD, TUCK_HOLD, {**LINE_HOLD, "clip_id": OTHER_CLIP, "hold_id": 0}],
+    )
+
+    report = run_prelabel(data, videos, tmp_path, clips=[CLIP])
+
+    assert report.written == 2
+    assert report.holds == 2
+    assert report.skipped == []
+    rows = read_manifest(report.manifest)
+    assert {row["clip_id"] for row in rows} == {CLIP}
+    tasks = json.loads(report.json_path.read_text(encoding="utf-8"))
+    assert {task["data"]["clip_id"] for task in tasks} == {CLIP}
+
+
+def test_prelabel_skip_existing_never_touches_queued_or_reviewed_holds(
+    workspace: tuple[pathlib.Path, pathlib.Path], tmp_path: pathlib.Path
+) -> None:
+    data, videos = workspace
+    write_labels(
+        data / "labels" / "hold_shapes.csv",
+        [{"clip_id": CLIP, "hold_id": 0, "shape": "line", "predicted_shape": "line"}],
+    )
+
+    # Hold 0 is reviewed and hold 1 is new: only hold 1 gets an image and a task.
+    report = run_prelabel(data, videos, tmp_path, skip_existing=True)
+    assert (report.written, report.already_done) == (1, 1)
+    assert [row["hold_id"] for row in read_manifest(report.manifest)] == ["1"]
+
+    # A rerun touches nothing: the queued hold still exists, its row and task
+    # are kept rather than dropped by the rewrite.
+    again = run_prelabel(data, videos, tmp_path, skip_existing=True)
+    assert (again.written, again.already_done) == (0, 2)
+    assert [row["hold_id"] for row in read_manifest(again.manifest)] == ["1"]
+    tasks = json.loads(again.json_path.read_text(encoding="utf-8"))
+    assert [task["data"]["hold_id"] for task in tasks] == [1]
+    assert "left untouched" in hold_shapes.summarise_prelabel(again)
+
+
+def test_prelabel_keeps_the_manifest_rows_of_clips_it_was_not_asked_about(
+    workspace: tuple[pathlib.Path, pathlib.Path], tmp_path: pathlib.Path
+) -> None:
+    data, videos = workspace
+    # A first full run writes both holds' rows...
+    run_prelabel(data, videos, tmp_path)
+    assert len(read_manifest(data / "label_frames_holds" / "manifest.csv")) == 2
+
+    # ...and a weekly subset run over another clip must not drop them.
+    write_hold_summary(
+        data / "features" / "mediapipe" / "hold_summary.csv",
+        [LINE_HOLD, TUCK_HOLD, {**TUCK_HOLD, "clip_id": OTHER_CLIP, "hold_id": 0}],
+    )
+    # OTHER_CLIP has no video: its hold is skipped, the reviewed/queued holds of
+    # CLIP are left alone, and neither case drops anything from the two files.
+    report = run_prelabel(data, videos, tmp_path, clips=[CLIP, OTHER_CLIP], skip_existing=True)
+    assert report.written == 0
+    assert report.already_done == 2
+    assert len(read_manifest(report.manifest)) == 2
+    tasks = json.loads(report.json_path.read_text(encoding="utf-8"))
+    assert len(tasks) == 2

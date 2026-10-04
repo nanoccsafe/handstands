@@ -50,6 +50,20 @@ from handstand.catalogue import FilenameStamp
             "WhatsApp Video 2026-07-22 at 7.09.23 PM (12).mp4",
             FilenameStamp("2026-07-22", "2026-07-22T19:09:23"),
         ),
+        # The ingest's rename rule (#86): '(1)' became ' take2' as the file moved
+        # into videos/, and recorded_at must survive the new spelling too.
+        (
+            "WhatsApp Video 2026-10-02 at 12.47.45 PM take2.mp4",
+            FilenameStamp("2026-10-02", "2026-10-02T12:47:45"),
+        ),
+        (
+            "WhatsApp Video 2026-10-02 at 12.47.45 PM take10.mp4",
+            FilenameStamp("2026-10-02", "2026-10-02T12:47:45"),
+        ),
+        (
+            "WhatsApp Video 2026-09-29 at 11.59.18 AM take2.mp4",
+            FilenameStamp("2026-09-29", "2026-09-29T11:59:18"),
+        ),
         # Leading zeroes and a two-digit hour.
         ("VID_20260722_070923.mp4", FilenameStamp("", "")),
         ("clip 2026-07-22 at 07.09.23 PM.mp4", FilenameStamp("2026-07-22", "2026-07-22T19:09:23")),

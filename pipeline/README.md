@@ -46,6 +46,25 @@ uv run ruff check
 uv run ruff format .
 ```
 
+## Weekly ingest
+
+The one command for a week of new clips: drop the exports into
+`$HANDSTAND_VIDEOS/inbox/`, look first, then run.
+
+```sh
+cd pipeline
+uv run python -m handstand.ingest --dry-run    # renames/duplicates/what would run; writes nothing
+uv run python -m handstand.ingest              # catalogue -> pipeline -> shape review queue
+```
+
+It catalogues every new clip **by content** (never by file name), moves the
+files in with the WhatsApp `'(1)'` → `' take2'` rename rule, runs
+`pose_mediapipe → athlete → postprocess → phases → features → hold_shapes
+prelabel` over exactly those clips, and queues every new HOLD for the Label
+Studio shape review (the import JSON, or straight into the project with
+`--label-studio`). Failures are recorded per step and never stop the other
+clips. See `docs/ingest.md` for the rules and how to recover.
+
 ## Catalogue
 
 The entry point of the pipeline: one CSV row per video, ffprobe metadata filled in

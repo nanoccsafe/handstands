@@ -503,16 +503,30 @@ holds found about 155 line, 82 straddle/split, 38 tuck, 16 pike and 17
 unmeasured — which is why this is a small Label Studio project with one image
 per **hold**, not per clip.
 
+**Weekly ingest (#86):** `uv run python -m handstand.ingest` catalogues the new
+clips, runs the pipeline over them and queues only their NEW holds for this
+review — see [`ingest.md`](ingest.md); its `--label-studio` flag imports the
+new tasks into this project directly, and its report says how many holds are
+waiting.
+
 | who | holds taken |
 | --- | --- |
 | #28 reference, #29/#30 scoring and tuning, #32–#34 line fault classifier | **line holds only** |
 | #16 pose bake-off | every shape, reported per shape |
 | `handstand.frame_sampler` (via the catalogue's `skill` column) | `line` by default |
 
-The six shapes are `line`, `straddle`, `split_stag`, `tuck`, `pike`, `other`.
-`unmeasured` exists for the **pre-label only** and never becomes a label: a hold
-whose leg separation, knee or hip median was never measured still gets an image
-and a task, it just arrives with nothing preselected.
+The choices are `line`, `straddle`, `split_stag`, `tuck`, `pike`, `other`,
+`not_a_hold`, `walk`, `mexican` (#86 — hotkeys 1–9, the exact order project 3
+carries). The last three came from your review: **`not_a_hold`** is a
+detector false hold (a 0.4 s "hold" whose middle frame shows an empty gym) —
+not a shape, so it never becomes a clip's skill and it is reported separately
+per clip as evidence for tuning `phases.MIN_HOLD_S`; **`walk`** is a
+handstand walk or hand step — not line, but kept as training data for the
+hand-step detector (#71); **`mexican`** is the deep backbend, a real shape like
+any other, which only you label — `predict_shape` has no rule for any of the
+three. `unmeasured` exists for the **pre-label only** and never becomes a
+label: a hold whose leg separation, knee or hip median was never measured
+still gets an image and a task, it just arrives with nothing preselected.
 
 ```
 handstand.hold_shapes prelabel  ->  data/label_frames_holds/*.jpg + manifest.csv
@@ -552,7 +566,7 @@ shape:
 
 ```
 pre-labelled 300 of 308 hold(s) in 48s -> .../label_frames_holds/manifest.csv
-  written per predicted shape: line=154 straddle=75 split_stag=0 tuck=38 pike=16 other=0 unmeasured=17
+  written per predicted shape: line=154 straddle=75 split_stag=0 tuck=38 pike=16 other=0 not_a_hold=0 walk=0 mexican=0 unmeasured=17
   images: .../label_frames_holds (162 clip(s))
   tasks: .../label_studio_hold_shapes.json
   config: .../tools/labeling/hold_shapes_config.xml
@@ -570,8 +584,10 @@ project has the local storage set up in *Create the project* below.
 `--image-base URL` is the escape hatch for serving the frames from somewhere
 else instead.
 
-Useful flags: `--source`, `--limit N`, `--videos`, `--data`, `--image-base`,
-`--out-json`, `--config`.
+Useful flags: `--source`, `--clips CLIP_ID …` (only those clips' holds),
+`--skip-existing` (skip holds that already have an image or a reviewed row —
+a weekly run only adds NEW holds, `docs/ingest.md`), `--limit N`, `--videos`,
+`--data`, `--image-base`, `--out-json`, `--config`.
 
 ### 2. Create the project
 
@@ -586,7 +602,7 @@ Useful flags: `--source`, `--limit N`, `--videos`, `--data`, `--image-base`,
    sentence and the import fails with `key is expected in task data`.
    `prelabel` joins the four parts into `info` instead of letting the config
    template them. Below the header come the image and one required single
-   choice with the six shapes.
+   choice with the nine labels (`line` … `mexican`).
 3. **Settings → Cloud Storage → Add Source Storage → Local files**, path
    `data/label_frames_holds`, file filter `.*jpg` — this is how project 3,
    `handstand-hold-shapes`, is set up. Save it but do **not** sync it
@@ -602,12 +618,12 @@ Useful flags: `--source`, `--limit N`, `--videos`, `--data`, `--image-base`,
 ### 3. Label
 
 One task per hold: look at the image, keep the preselected shape if it is
-right, change it if it is not. Hotkeys **1–6** are `line`, `straddle`,
-`split_stag`, `tuck`, `pike`, `other`, so a clean pass is one key plus `Down`
-per hold. The header says which clip and hold you are looking at, how long it
-was held and why the pre-label said what it said — a `reason` of
-`not measured: ...` means the features could not see the legs, so decide
-entirely from the image.
+right, change it if it is not. Hotkeys **1–9** are `line`, `straddle`,
+`split_stag`, `tuck`, `pike`, `other`, `not_a_hold`, `walk`, `mexican`, so a
+clean pass is one key plus `Down` per hold. The header says which clip and hold
+you are looking at, how long it was held and why the pre-label said what it
+said — a `reason` of `not measured: ...` means the features could not see the
+legs, so decide entirely from the image.
 
 ### 4. Export and import
 
@@ -634,7 +650,11 @@ uv run python -m handstand.hold_shapes summary --write-catalogue
 
 `summary` prints the holds per shape, the **per-clip skill** — the single shape
 all of a clip's holds share, or `mixed` when they do not — and how often the
-pre-label matched the review. `--write-catalogue` fills that skill into the
+pre-label matched the review. `not_a_hold` never contributes to the skill (a
+clip with line holds plus a false hold is `line`, not `mixed`; a clip whose
+every hold is false gets no skill), and the false holds are listed **separately,
+per clip** — they are the evidence for tuning `phases.MIN_HOLD_S`.
+`--write-catalogue` fills that skill into the
 `skill` column of `data/catalogue.csv` and nothing else: clips with no reviewed
 holds keep whatever they had, and the file is written atomically. Mixed clips
 are written as `mixed`, never as a guess at which shape they mostly are.
