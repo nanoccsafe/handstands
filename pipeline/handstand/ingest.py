@@ -843,18 +843,49 @@ def read_ls_credentials(path: str | pathlib.Path | None = None) -> tuple[str, st
     return values["LS_USER"], values["LS_PASSWORD"]
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Declines every redirect, so the 3xx answer itself comes back (#89).
+
+    A successful Django/Label Studio login answers the POST with a ``302``
+    whose ``Set-Cookie`` carries the **logged-in** ``sessionid``. The default
+    opener follows that redirect, keeps only the final response's headers —
+    losing the cookie off the 302 — and the page it points at hands out a new
+    anonymous ``sessionid``, which would make a failed login look like a
+    success. Returning ``None`` here makes ``urlopen`` treat the 302 as an
+    :class:`urllib.error.HTTPError` with its status, headers and body intact.
+    """
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
+#: The opener every :func:`urllib_http` request goes through: one where a
+#: redirect is never followed (see :class:`_NoRedirectHandler`).
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def urllib_http(
     method: str,
     url: str,
     body: bytes | None,
     headers: Mapping[str, str],
 ) -> tuple[int, Sequence[tuple[str, str]], bytes]:
-    """The default :data:`HttpCall`: one stdlib request, HTTP errors included."""
+    """The default :data:`HttpCall`: one stdlib request, HTTP errors included.
+
+    Redirects are **not** followed (#89): a ``302`` comes back as the answer
+    itself — through :class:`urllib.error.HTTPError` — with its own status,
+    headers and body, so the ``Set-Cookie`` a successful login puts on the
+    redirect is kept instead of being replaced by the redirect target's.
+    """
     request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _NO_REDIRECT_OPENER.open(request, timeout=60) as response:
             return int(response.status), list(response.headers.items()), response.read()
     except urllib.error.HTTPError as error:
+        # 3xx land here too — no handler follows them — and their headers are
+        # exactly what the login needs.
         return int(error.code), list(error.headers.items()), error.read()
 
 
@@ -883,14 +914,19 @@ def csrf_from_login_page(page: bytes) -> str:
 class LabelStudioClient:
     """A logged-in Label Studio session: session cookie + CSRF, the usual way.
 
-    1. ``GET /user/login/`` hands back the ``csrftoken`` cookie and the login
-       page with its hidden ``csrfmiddlewaretoken``;
+    1. ``GET /user/login/`` hands back the ``csrftoken`` cookie, the login
+       page with its hidden ``csrfmiddlewaretoken`` and an *anonymous*
+       ``sessionid``;
     2. ``POST /user/login/`` — Label Studio 1.23's login form, the **same URL**
        the GET used (#89: the old ``/user-login/`` does not exist and answered
        ``HTTP 404``) — carries ``csrfmiddlewaretoken``, ``email`` and
-       ``password`` plus ``Referer: <base>/user/login/``, and is only a
-       success when a ``sessionid`` cookie comes back (a response that is
-       still the login page means the credentials were refused);
+       ``password`` plus ``Referer: <base>/user/login/``. A successful login
+       answers it with a **302** that sets the logged-in ``sessionid``, and
+       the HTTP helper never follows redirects, so that cookie is kept:
+       login succeeds only when the POST answers 302/303 with a ``sessionid``
+       **different** from the anonymous one. A 200 (the form re-rendered) or a
+       redirect that keeps the anonymous cookie is a failed login, raised with
+       an error that never carries the password;
     3. every later API call sends ``X-CSRFToken`` (the ``csrftoken`` cookie)
        and ``Referer: <base>``;
     4. the project is looked up **by title** (``handstand-hold-shapes``), so no
@@ -909,13 +945,22 @@ class LabelStudioClient:
         self._http: HttpCall = http or urllib_http
         self.cookies: dict[str, str] = {}
 
-    def _call(
+    def _exchange(
         self,
         method: str,
         url: str,
         body: bytes | None = None,
         headers: Mapping[str, str] | None = None,
-    ) -> bytes:
+    ) -> tuple[int, bytes]:
+        """One request; the cookie jar follows **every** response (#89).
+
+        Returns ``(status, payload)`` for any status below 400 — a ``302``
+        included, because a successful login sets its ``sessionid`` *on* that
+        redirect. 4xx/5xx raise :class:`LabelStudioError`. The cookie dict is
+        updated before anything can raise, so even an error response's
+        ``Set-Cookie`` is kept. Error messages carry the URL and a snippet of
+        the RESPONSE — never the request body, where the password travels.
+        """
         cookie_header = "; ".join(f"{key}={value}" for key, value in self.cookies.items())
         merged = {"Cookie": cookie_header, **(headers or {})}
         status, response_headers, payload = self._http(method, url, body, merged)
@@ -928,6 +973,29 @@ class LabelStudioClient:
         if status >= 400:
             snippet = payload[:200].decode("utf-8", "replace").replace("\n", " ")
             raise LabelStudioError(f"{method} {url} -> HTTP {status}: {snippet}")
+        return status, payload
+
+    def _call(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> bytes:
+        """``_exchange`` for the calls that must never be redirected.
+
+        The HTTP helper does not follow redirects, so a 3xx here is the answer
+        itself — an API call landing on one means the session never became a
+        logged-in one, which deserves a clear error instead of a JSON parse
+        failure on the login page's HTML.
+        """
+        status, payload = self._exchange(method, url, body, headers)
+        if 300 <= status < 400:
+            raise LabelStudioError(
+                f"{method} {url} -> HTTP {status}: unexpected redirect "
+                "(redirects are never followed, so this is the answer itself; "
+                "the session is probably not logged in)"
+            )
         return payload
 
     def _api_headers(self, content_type: str | None = None) -> dict[str, str]:
@@ -938,12 +1006,22 @@ class LabelStudioClient:
         return headers
 
     def login(self, user: str, password: str) -> None:
-        """Open a session; raises when the cookies say the login did not take.
+        """Open a session; raises unless the POST really logged us in (#89).
 
-        The credentials go into the POST body only, so the error below (and
-        everything printed around it) can never contain the password.
+        A successful Django login answers the POST with a **302** that sets the
+        logged-in ``sessionid``, and the HTTP helper never follows redirects,
+        so that cookie lands in our jar. The POST therefore counts as a success
+        only when it answers 302/303 *and* sets a ``sessionid`` **different**
+        from the anonymous one the GET of the login page already handed out: a
+        200 means the login form was re-rendered (credentials refused), and a
+        redirect that keeps the anonymous cookie means no session was ever
+        established.
+
+        The credentials go into the POST body only, so the errors below — and
+        everything printed around them — can never contain the password.
         """
         page = self._call("GET", f"{self.base_url}/user/login/")
+        anonymous_session = self.cookies.get("sessionid", "")
         csrf = csrf_from_login_page(page) or self.cookies.get("csrftoken", "")
         if not csrf:
             raise LabelStudioError(
@@ -953,7 +1031,7 @@ class LabelStudioClient:
         form = urllib.parse.urlencode(
             {"csrfmiddlewaretoken": csrf, "email": user, "password": password}
         ).encode()
-        self._call(
+        status, _payload = self._exchange(
             "POST",
             f"{self.base_url}/user/login/",
             form,
@@ -963,10 +1041,20 @@ class LabelStudioClient:
                 "Referer": f"{self.base_url}/user/login/",
             },
         )
-        if "sessionid" not in self.cookies:
+        if status not in (302, 303):
             raise LabelStudioError(
-                "Label Studio login failed: Label Studio answered with the login page "
-                "again and set no sessionid cookie — check LS_USER and LS_PASSWORD in "
+                "Label Studio login failed: POST /user/login/ answered "
+                f"HTTP {status} instead of the 302 redirect of a successful login, "
+                "so no new sessionid cookie was set — check LS_USER and LS_PASSWORD in "
+                f"the credentials file ({LS_ENV_PATH} by default); the password is "
+                "never printed"
+            )
+        session = self.cookies.get("sessionid", "")
+        if not session or session == anonymous_session:
+            raise LabelStudioError(
+                "Label Studio login failed: the POST was redirected but the "
+                "sessionid cookie stayed the anonymous one the GET set, so no "
+                "session was established — check LS_USER and LS_PASSWORD in "
                 f"the credentials file ({LS_ENV_PATH} by default); the password is "
                 "never printed"
             )

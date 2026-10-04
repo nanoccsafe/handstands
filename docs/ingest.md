@@ -148,9 +148,11 @@ state of the inbox without changing anything.
 so it is the only part that can fail while everything else worked — the
 2026-10-04 run died at the login with `POST http://localhost:8080/user-login/
 -> HTTP 404`, because that URL does not exist in Label Studio 1.23: its login
-form lives at `/user/login/`. The summary records the failure as
-`label_studio: -: …` (exit code 1) and writes the tasks to a fallback import
-file, so nothing is lost.
+form lives at `/user/login/`. A run can also die later with
+`GET /api/projects?page_size=100 -> HTTP 401 Authentication credentials were
+not provided`, which means the session never became a logged-in one. The
+summary records the failure as `label_studio: -: …` (exit code 1) and writes
+the tasks to a fallback import file, so nothing is lost.
 
 `--import-only` is the recovery: it reads ONE already-written tasks file,
 logs in, finds `handstand-hold-shapes` by title and imports that file's
@@ -178,17 +180,24 @@ time. Exit code 0, no report file, no other side effect.
 How the login works (Label Studio 1.23, and why this command succeeds where
 the first run did not):
 
-1. `GET /user/login/` — picks up the `csrftoken` cookie and the page with its
-   hidden `csrfmiddlewaretoken`.
+1. `GET /user/login/` — picks up the `csrftoken` cookie, the page with its
+   hidden `csrfmiddlewaretoken` and an *anonymous* `sessionid`.
 2. `POST` to that **same** `/user/login/` with the form fields
    `csrfmiddlewaretoken` (from the hidden input, or from the `csrftoken`
    cookie), `email` and `password`, plus `Referer: <base>/user/login/`.
-3. A response that is still the login page — no `sessionid` cookie — is a
-   failed login: the error names `LS_USER`/`LS_PASSWORD` and where the
-   credentials file is, and never prints the password.
+3. Redirects are **never followed**: a successful Django login answers the
+   POST with a **302**, and the logged-in `sessionid` is set *on that 302* —
+   following it would drop that cookie and pick up a fresh anonymous one
+   from the page it points at (which is how a failed login once looked like
+   a success and the API answered 401). So the login only counts as a
+   success when the POST answers 302/303 with a `sessionid` **different**
+   from the anonymous one the GET set. Anything else — a 200 (the login form
+   re-rendered) or a redirect that keeps the anonymous cookie — is a failed
+   login: the error names `LS_USER`/`LS_PASSWORD` and where the credentials
+   file is, and never prints the password.
 4. Every API call afterwards (`/api/projects?page_size=100`,
    `/api/tasks?project=…`, the import) sends `X-CSRFToken` (the `csrftoken`
-   cookie) and `Referer: <base>`.
+   cookie), the logged-in `sessionid` cookie and `Referer: <base>`.
 
 It needs `~/.config/handstand/label-studio.env` (`LS_USER=…`, `LS_PASSWORD=…`,
 `chmod 600`) and `--ls-url` when Label Studio is not on
