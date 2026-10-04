@@ -33,8 +33,10 @@ The rules that matter, in order:
 CLI flags: ``--dry-run`` (print all of it, write nothing), ``--keep`` (copy the
 files instead of moving them), ``--label-studio`` (import the new tasks into
 the ``handstand-hold-shapes`` project through the Label Studio API instead of
-only writing the import JSON) and ``--sample-frames N`` (additionally sample N
-keypoint-labelling frames per new clip into a separate import file).
+only writing the import JSON; tasks the project already holds are skipped,
+#89), ``--sample-frames N`` (additionally sample N keypoint-labelling frames
+per new clip into a separate import file) and ``--import-only TASKS.json``
+(recover a failed import: POST that one file, deduplicated, and nothing else).
 """
 
 from __future__ import annotations
@@ -83,6 +85,7 @@ __all__ = [
     "REPORTS_DIRNAME",
     "STEPS",
     "HttpCall",
+    "ImportOnlyReport",
     "IngestReport",
     "LabelStudioClient",
     "LabelStudioError",
@@ -91,10 +94,12 @@ __all__ = [
     "StepRunner",
     "build_arg_parser",
     "build_runners",
+    "csrf_from_login_page",
     "main",
     "pick_evenly",
     "plan_inbox",
     "read_ls_credentials",
+    "run_import_only",
     "run_ingest",
     "run_pipeline",
     "update_hold_summary",
@@ -853,16 +858,50 @@ def urllib_http(
         return int(error.code), list(error.headers.items()), error.read()
 
 
+#: One ``<input …>`` tag of the login page: the CSRF token is its ``value``.
+_INPUT_TAG_RE = re.compile(r"<input\b[^>]*>", re.IGNORECASE)
+_CSRF_VALUE_RE = re.compile(r"""\bvalue\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+def csrf_from_login_page(page: bytes) -> str:
+    """The hidden ``csrfmiddlewaretoken`` of a Label Studio login page (#89).
+
+    Label Studio 1.23's login form wants the token the page was served with
+    back in the POST (alongside a ``Referer`` of the login page). Returns
+    ``""`` when the page carries no such input — the caller then falls back
+    to the ``csrftoken`` cookie that came with the page.
+    """
+    html = page.decode("utf-8", "replace")
+    for tag in _INPUT_TAG_RE.finditer(html):
+        if "csrfmiddlewaretoken" in tag.group(0).lower():
+            value = _CSRF_VALUE_RE.search(tag.group(0))
+            if value:
+                return value.group(1)
+    return ""
+
+
 class LabelStudioClient:
     """A logged-in Label Studio session: session cookie + CSRF, the usual way.
 
-    1. ``GET /user/login/`` picks up the ``csrftoken`` cookie;
-    2. ``POST /user-login/`` exchanges the credentials for a ``sessionid``,
-       echoing the CSRF token in the ``X-CSRFToken`` header and a ``Referer``;
-    3. the project is looked up **by title** (``handstand-hold-shapes``), so no
-       hard-coded project id can import 200 tasks into the wrong project.
+    1. ``GET /user/login/`` hands back the ``csrftoken`` cookie and the login
+       page with its hidden ``csrfmiddlewaretoken``;
+    2. ``POST /user/login/`` — Label Studio 1.23's login form, the **same URL**
+       the GET used (#89: the old ``/user-login/`` does not exist and answered
+       ``HTTP 404``) — carries ``csrfmiddlewaretoken``, ``email`` and
+       ``password`` plus ``Referer: <base>/user/login/``, and is only a
+       success when a ``sessionid`` cookie comes back (a response that is
+       still the login page means the credentials were refused);
+    3. every later API call sends ``X-CSRFToken`` (the ``csrftoken`` cookie)
+       and ``Referer: <base>``;
+    4. the project is looked up **by title** (``handstand-hold-shapes``), so no
+       hard-coded project id can import 200 tasks into the wrong project;
+    5. before an import the project's existing tasks are read page by page and
+       every ``(clip_id, hold_id)`` already there is skipped, so a re-run (or
+       a file imported by hand) never imports a hold twice.
 
-    ``http`` is injectable, so tests mock the whole HTTP conversation.
+    ``http`` is injectable, so tests mock the whole HTTP conversation. The
+    password only ever goes into the POST body: no error, header or summary
+    can print it.
     """
 
     def __init__(self, base_url: str = DEFAULT_LS_URL, *, http: HttpCall | None = None) -> None:
@@ -891,14 +930,32 @@ class LabelStudioClient:
             raise LabelStudioError(f"{method} {url} -> HTTP {status}: {snippet}")
         return payload
 
+    def _api_headers(self, content_type: str | None = None) -> dict[str, str]:
+        """What every API call after the login carries: CSRF token + Referer."""
+        headers = {"X-CSRFToken": self.cookies.get("csrftoken", ""), "Referer": self.base_url}
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
+
     def login(self, user: str, password: str) -> None:
-        """Open a session; raises when the cookies say the login did not take."""
-        self._call("GET", f"{self.base_url}/user/login/")
-        csrf = self.cookies.get("csrftoken", "")
-        form = urllib.parse.urlencode({"username": user, "password": password}).encode()
+        """Open a session; raises when the cookies say the login did not take.
+
+        The credentials go into the POST body only, so the error below (and
+        everything printed around it) can never contain the password.
+        """
+        page = self._call("GET", f"{self.base_url}/user/login/")
+        csrf = csrf_from_login_page(page) or self.cookies.get("csrftoken", "")
+        if not csrf:
+            raise LabelStudioError(
+                "Label Studio login failed before the POST: neither the login page "
+                "nor the csrftoken cookie carried a CSRF token"
+            )
+        form = urllib.parse.urlencode(
+            {"csrfmiddlewaretoken": csrf, "email": user, "password": password}
+        ).encode()
         self._call(
             "POST",
-            f"{self.base_url}/user-login/",
+            f"{self.base_url}/user/login/",
             form,
             {
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -908,19 +965,59 @@ class LabelStudioClient:
         )
         if "sessionid" not in self.cookies:
             raise LabelStudioError(
-                "Label Studio login failed: no session cookie came back (check LS_USER/LS_PASSWORD)"
+                "Label Studio login failed: Label Studio answered with the login page "
+                "again and set no sessionid cookie — check LS_USER and LS_PASSWORD in "
+                f"the credentials file ({LS_ENV_PATH} by default); the password is "
+                "never printed"
             )
 
     def find_project_id(self, title: str) -> int:
         """The id of the one project whose title is exactly ``title``."""
-        query = urllib.parse.urlencode({"title": title})
-        payload = self._call("GET", f"{self.base_url}/api/projects?{query}")
+        query = urllib.parse.urlencode({"page_size": 100})
+        payload = self._call(
+            "GET", f"{self.base_url}/api/projects?{query}", headers=self._api_headers()
+        )
         data = json.loads(payload)
-        projects = data.get("projects") if isinstance(data, dict) else data
+        if isinstance(data, dict):
+            projects = data.get("projects")
+            if not isinstance(projects, list):
+                projects = data.get("results")
+        else:
+            projects = data
         for project in projects if isinstance(projects, list) else []:
             if isinstance(project, dict) and project.get("title") == title:
                 return int(project["id"])
         raise LabelStudioError(f"no Label Studio project titled {title!r}")
+
+    def existing_holds(self, project_id: int) -> set[tuple[str, int | str]]:
+        """``(clip_id, hold_id)`` of every task the project already holds (#89).
+
+        Read page by page from ``GET /api/tasks?project=<id>`` until a page
+        comes back short of ``page_size`` (or the reported total is reached).
+        Tasks carrying no clip/hold — a hand-made task — can never collide
+        with an import and are ignored.
+        """
+        found: set[tuple[str, int | str]] = set()
+        page_size = 100
+        page = 1
+        collected = 0
+        while True:
+            query = urllib.parse.urlencode(
+                {"project": project_id, "page": page, "page_size": page_size}
+            )
+            payload = self._call(
+                "GET", f"{self.base_url}/api/tasks?{query}", headers=self._api_headers()
+            )
+            batch, total = _tasks_page(json.loads(payload))
+            for task in batch:
+                # The import files' own key function: 0 and "0" are one hold.
+                key = hold_shapes._task_key(task)
+                if key is not None:
+                    found.add(key)
+            collected += len(batch)
+            if len(batch) < page_size or (total is not None and collected >= total):
+                return found
+            page += 1
 
     def import_tasks(self, project_id: int, tasks: Sequence[Mapping[str, Any]]) -> int:
         """POST the tasks into the project; returns how many were sent."""
@@ -929,13 +1026,122 @@ class LabelStudioClient:
             "POST",
             f"{self.base_url}/api/projects/{project_id}/import",
             body,
-            {
-                "Content-Type": "application/json",
-                "X-CSRFToken": self.cookies.get("csrftoken", ""),
-                "Referer": self.base_url,
-            },
+            self._api_headers("application/json"),
         )
         return len(tasks)
+
+    def import_new_tasks(
+        self, project_id: int, tasks: Sequence[Mapping[str, Any]]
+    ) -> tuple[int, int]:
+        """Import only what the project does not have yet (#89).
+
+        Returns ``(already_present, imported)``: the tasks whose
+        ``(clip_id, hold_id)`` is already in the project are skipped, so a
+        re-run of an import (or a file the lead imported by hand) reports
+        what it skipped instead of queueing every hold a second time.
+        """
+        present = self.existing_holds(project_id)
+        fresh = [task for task in tasks if hold_shapes._task_key(task) not in present]
+        if fresh:
+            self.import_tasks(project_id, fresh)
+        return len(tasks) - len(fresh), len(fresh)
+
+
+def _tasks_page(payload: Any) -> tuple[list[Any], int | None]:
+    """One ``GET /api/tasks`` answer as ``(tasks, total)``.
+
+    Label Studio answers either a bare list or a dict holding the page under
+    ``tasks``/``results``, with the whole count next to it under
+    ``total``/``count``; ``total`` stays ``None`` when the answer carries
+    none, and the caller stops at the first short page instead.
+    """
+    if isinstance(payload, list):
+        return [task for task in payload if isinstance(task, Mapping)], None
+    if isinstance(payload, dict):
+        batch = payload.get("tasks")
+        if not isinstance(batch, list):
+            batch = payload.get("results")
+        tasks = [task for task in batch if isinstance(task, Mapping)] if batch else []
+        total = next(
+            (payload[key] for key in ("total", "count") if isinstance(payload.get(key), int)),
+            None,
+        )
+        return tasks, total
+    return [], 0
+
+
+@dataclasses.dataclass(frozen=True)
+class ImportOnlyReport:
+    """What one ``--import-only`` run did: import a tasks file, deduplicated."""
+
+    #: The tasks file it read.
+    tasks_file: pathlib.Path
+    #: Tasks in the file.
+    total: int
+    #: File tasks whose ``(clip_id, hold_id)`` the project already had.
+    present: int
+    #: Tasks actually POSTed into the project.
+    imported: int
+    project_id: int
+    project_title: str
+    base_url: str
+
+    @property
+    def text(self) -> str:
+        """The report — ``… 32 already present, 0 imported`` is its heart."""
+        link = f"{self.base_url}/projects/{self.project_id}"
+        return (
+            f"import-only {self.tasks_file}\n"
+            f"  project: {self.project_title} (project {self.project_id}) — {link}\n"
+            f"  tasks: {self.total} in the file, {self.present} already present, "
+            f"{self.imported} imported"
+        )
+
+
+def run_import_only(
+    tasks_file: str | pathlib.Path,
+    *,
+    ls_url: str = DEFAULT_LS_URL,
+    http: HttpCall | None = None,
+    env_path: str | pathlib.Path | None = None,
+) -> ImportOnlyReport:
+    """Import an already-written tasks file, skipping what is already there (#89).
+
+    The recovery for a failed ``--label-studio`` import: read the JSON a run
+    left behind (``data/reports/ingest/<date>_hold_shapes_tasks.json``), log
+    in, find the project by title and import only the tasks it does not have
+    yet. Running it twice — or after the lead imported the file by hand —
+    therefore reports ``32 already present, 0 imported`` instead of queueing
+    every hold a second time.
+
+    The inbox, the catalogue and the pipeline are never touched. Raises
+    :class:`LabelStudioError` on any failure; the credentials only ever go
+    into the request body.
+    """
+    path = pathlib.Path(tasks_file).expanduser()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise LabelStudioError(f"cannot read the tasks file {path}: {error}") from error
+    except ValueError as error:
+        raise LabelStudioError(f"{path} is not valid JSON: {error}") from error
+    if not isinstance(raw, list) or not all(isinstance(task, Mapping) for task in raw):
+        raise LabelStudioError(f"{path} must hold a JSON list of Label Studio tasks")
+    tasks: list[Mapping[str, Any]] = list(raw)
+    user, password = read_ls_credentials(env_path)
+    client = LabelStudioClient(ls_url, http=http)
+    client.login(user, password)
+    project_id = client.find_project_id(PROJECT_TITLE)
+    present, imported = client.import_new_tasks(project_id, tasks)
+    return ImportOnlyReport(
+        tasks_file=path,
+        total=len(tasks),
+        present=present,
+        imported=imported,
+        project_id=project_id,
+        project_title=PROJECT_TITLE,
+        base_url=client.base_url,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1123,7 +1329,8 @@ def run_ingest(
                 except Exception as error:  # one broken model is a report, not a crash
                     _fail(failures, "sample_frames", "-", f"{type(error).__name__}: {error}")
 
-        # 6. Optional: import the NEW hold tasks into Label Studio.
+        # 6. Optional: import the NEW hold tasks into Label Studio, skipping
+        #    every (clip_id, hold_id) the project already holds (#89).
         if label_studio:
             if queued:
                 try:
@@ -1131,11 +1338,11 @@ def run_ingest(
                     client = LabelStudioClient(ls_url, http=http)
                     client.login(user, password)
                     project_id = client.find_project_id(PROJECT_TITLE)
-                    client.import_tasks(project_id, tasks)
+                    present, imported = client.import_new_tasks(project_id, tasks)
                     link = f"{client.base_url}/projects/{project_id}"
                     label_studio_message = (
-                        f"imported {queued} new task(s) into {PROJECT_TITLE!r} "
-                        f"(project {project_id}) — {link}"
+                        f"{present} already present, {imported} imported into "
+                        f"{PROJECT_TITLE!r} (project {project_id}) — {link}"
                     )
                 except Exception as error:  # a failed import must not lose the tasks
                     message = f"{type(error).__name__}: {error}"
@@ -1392,6 +1599,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--import-only",
+        type=pathlib.Path,
+        default=None,
+        metavar="TASKS.json",
+        help=(
+            "import an already-written tasks file (e.g. after a failed "
+            "--label-studio run) through the Label Studio API, skipping the "
+            "(clip_id, hold_id) pairs the project already has; does NOTHING "
+            "else — no inbox scan, no catalogue, no pipeline "
+            "(--label-studio is accepted and not needed here)"
+        ),
+    )
+    parser.add_argument(
         "--sample-frames",
         type=int,
         default=0,
@@ -1428,6 +1648,24 @@ def main(argv: Sequence[str] | None = None, **seams: Any) -> int:
     args = parser.parse_args(argv)
     if args.sample_frames < 0:
         parser.error("--sample-frames must be >= 0")
+
+    if args.import_only is not None:
+        # Recovery for a failed --label-studio run: import one file, nothing
+        # else. It posts tasks, so it cannot promise a dry run's silence.
+        if args.dry_run:
+            parser.error("--import-only posts tasks; it cannot be combined with --dry-run")
+        try:
+            report = run_import_only(
+                args.import_only,
+                ls_url=args.ls_url,
+                http=seams.get("http"),
+                env_path=seams.get("env_path"),
+            )
+        except LabelStudioError as error:
+            print(f"ingest: {error}", file=sys.stderr)
+            return 1
+        print(report.text)
+        return 0
 
     videos_root = (args.videos or videos_dir()).expanduser()
     if not videos_root.is_dir():

@@ -59,7 +59,10 @@ The real run, in order:
    project id) over the Label Studio API: session login + CSRF, credentials
    from `~/.config/handstand/label-studio.env` (`LS_USER=…`, `LS_PASSWORD=…`,
    `chmod 600`, never printed or committed), URL defaulting to
-   `http://localhost:8080` (`--ls-url` to change it).
+   `http://localhost:8080` (`--ls-url` to change it). Before the POST the
+   project's existing tasks are read page by page and every
+   `(clip_id, hold_id)` already there is skipped, so a re-run — or a file that
+   was imported by hand — never queues a hold twice (#89).
 7. **`--sample-frames N`** (default 0) additionally samples N keypoint-labelling
    frames per new clip and pre-labels them into a *separate* import file
    (`data/reports/ingest/<date>_keypoint_tasks.json`).
@@ -98,7 +101,9 @@ smallest free ` (ingest N)` suffix instead — never overwritten, never skipped.
    and the review to-do line.
 2. Label the new holds: with `--label-studio` they are already in the
    `handstand-hold-shapes` project (project 3); otherwise import
-   `data/reports/ingest/<date>_hold_shapes_tasks.json` into it. Hotkeys 1–9
+   `data/reports/ingest/<date>_hold_shapes_tasks.json` into it — through the
+   API with `--import-only` (see below) or by hand (Import → Import
+   predictions). Hotkeys 1–9
    are `line`, `straddle`, `split_stag`, `tuck`, `pike`, `other`,
    `not_a_hold`, `walk`, `mexican` — see `docs/labeling.md`.
 3. After the review, refresh the catalogue's skill column:
@@ -126,7 +131,7 @@ always "fix the cause, then re-run what failed":
 | `phases` | `uv run python -m handstand.phases --clips <clip_id>` |
 | `features` | `uv run python -m handstand.features --clips <clip_id> --overwrite` (`--overwrite` is what rewrites `hold_summary.csv` for that clip while keeping every other clip's rows) |
 | `prelabel` | `uv run python -m handstand.hold_shapes prelabel --clips <clip_id> --skip-existing` (only adds NEW holds and merges the manifest/tasks) |
-| `label_studio` | the tasks were written to a fallback import file (the path is in the summary): import that JSON into project 3 by hand — Import → Import predictions — once Label Studio and the credentials are reachable again |
+| `label_studio` | the tasks were written to a fallback import file (the path is in the summary): re-import it with `--import-only` once Label Studio and the credentials are reachable again — the holds already in the project are skipped (see below) |
 | `sample_frames` | re-run the ingest with `--sample-frames N` once the cause is fixed: sampling only ever touches the clips it is given |
 
 Once a clip has been moved into `videos/` and catalogued, a fresh ingest run
@@ -136,3 +141,55 @@ it and run the ingest again; the file is still in the inbox.
 
 `uv run python -m handstand.ingest --dry-run` afterwards shows the current
 state of the inbox without changing anything.
+
+## Label Studio import failed
+
+`--label-studio` is the only part of the run that talks to another program,
+so it is the only part that can fail while everything else worked — the
+2026-10-04 run died at the login with `POST http://localhost:8080/user-login/
+-> HTTP 404`, because that URL does not exist in Label Studio 1.23: its login
+form lives at `/user/login/`. The summary records the failure as
+`label_studio: -: …` (exit code 1) and writes the tasks to a fallback import
+file, so nothing is lost.
+
+`--import-only` is the recovery: it reads ONE already-written tasks file,
+logs in, finds `handstand-hold-shapes` by title and imports that file's
+tasks, skipping every `(clip_id, hold_id)` the project already holds. It
+touches nothing else — no inbox scan, no catalogue, no pipeline, no report:
+
+```bash
+cd pipeline
+uv run python -m handstand.ingest \
+  --import-only data/reports/ingest/2026-10-04_hold_shapes_tasks.json --label-studio
+```
+
+It prints what it did:
+
+```
+import-only data/reports/ingest/2026-10-04_hold_shapes_tasks.json
+  project: handstand-hold-shapes (project 3) — http://localhost:8080/projects/3
+  tasks: 32 in the file, 32 already present, 0 imported
+```
+
+so running it twice — or after the tasks were imported by hand — reports
+`32 already present, 0 imported` instead of queueing every hold a second
+time. Exit code 0, no report file, no other side effect.
+
+How the login works (Label Studio 1.23, and why this command succeeds where
+the first run did not):
+
+1. `GET /user/login/` — picks up the `csrftoken` cookie and the page with its
+   hidden `csrfmiddlewaretoken`.
+2. `POST` to that **same** `/user/login/` with the form fields
+   `csrfmiddlewaretoken` (from the hidden input, or from the `csrftoken`
+   cookie), `email` and `password`, plus `Referer: <base>/user/login/`.
+3. A response that is still the login page — no `sessionid` cookie — is a
+   failed login: the error names `LS_USER`/`LS_PASSWORD` and where the
+   credentials file is, and never prints the password.
+4. Every API call afterwards (`/api/projects?page_size=100`,
+   `/api/tasks?project=…`, the import) sends `X-CSRFToken` (the `csrftoken`
+   cookie) and `Referer: <base>`.
+
+It needs `~/.config/handstand/label-studio.env` (`LS_USER=…`, `LS_PASSWORD=…`,
+`chmod 600`) and `--ls-url` when Label Studio is not on
+`http://localhost:8080`.
