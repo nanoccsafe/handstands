@@ -177,6 +177,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- ingest: Label Studio login posts to /user-login/ (404); dedupe imports; --import-only (#89)
 - Weekly ingest: inbox folder -> catalogue -> full pipeline -> hold-shape review queue (#86)
 - MediaPipe pose backend in the app (default, per the bake-off), --rotate best parity (#45)
 - Bake-off evaluation and model decision (#16)
