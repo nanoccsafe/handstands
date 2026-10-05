@@ -11,9 +11,13 @@ generated clip.
 from __future__ import annotations
 
 import csv
+import http.server
 import json
 import pathlib
 import shutil
+import threading
+import urllib.parse
+import urllib.request
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -701,12 +705,48 @@ def test_update_hold_summary_keeps_the_other_clips_rows(tmp_path: pathlib.Path) 
 # Label Studio: only with --label-studio, and only over the API
 # --------------------------------------------------------------------------- #
 
+#: Label Studio 1.23's login page: the hidden token the POST must echo back.
+LOGIN_PAGE = (
+    b'<html><body><form method="post" action="/user/login/">'
+    b'<input type="hidden" name="csrfmiddlewaretoken" value="page-csrf">'
+    b"</form></body></html>"
+)
+#: The same page WITHOUT the hidden input: the csrftoken cookie is the fallback.
+PLAIN_LOGIN_PAGE = b"<html><body><form>login</form></body></html>"
+
 
 class FakeLabelStudio:
-    """The whole HTTP conversation, recorded; answers like Label Studio does."""
+    """The whole HTTP conversation, recorded; answers like Label Studio does.
 
-    def __init__(self) -> None:
+    ``existing`` is what the project already holds, so the dedupe of #89 has
+    something to skip. The GET of the login page hands out the ``csrftoken``
+    and an ANONYMOUS ``sessionid`` (the live server does exactly that); a
+    successful login then answers the POST with a **302** that sets a NEW
+    ``sessionid``. With ``login_sets_session=False`` the POST answers 200 —
+    the login form re-rendered, the way refused credentials do (and, before
+    the fix, the 404 on ``/user-login/`` did). With
+    ``login_keeps_anonymous_session=True`` it answers 302 but leaves the
+    anonymous sessionid in place: still a failed login.
+    """
+
+    def __init__(
+        self,
+        existing: Sequence[tuple[str, int]] = (),
+        *,
+        login_sets_session: bool = True,
+        login_keeps_anonymous_session: bool = False,
+        login_page: bytes = LOGIN_PAGE,
+    ) -> None:
         self.calls: list[tuple[str, str, bytes | None, dict[str, str]]] = []
+        #: Every answer, as ``(status, response headers)`` — the login tests
+        #: need to see which ``Set-Cookie`` came from which response.
+        self.responses: list[tuple[int, list[tuple[str, str]]]] = []
+        self.existing = list(existing)
+        self.login_sets_session = login_sets_session
+        self.login_keeps_anonymous_session = login_keeps_anonymous_session
+        self.login_page = login_page
+        #: The tasks that reached ``POST …/import``.
+        self.imported: list[dict[str, Any]] = []
 
     def __call__(
         self,
@@ -715,24 +755,68 @@ class FakeLabelStudio:
         body: bytes | None,
         headers: Mapping[str, str],
     ) -> tuple[int, list[tuple[str, str]], bytes]:
+        status, response_headers, payload = self._answer(method, url, body, headers)
+        self.responses.append((status, response_headers))
+        return status, response_headers, payload
+
+    def _answer(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None,
+        headers: Mapping[str, str],
+    ) -> tuple[int, list[tuple[str, str]], bytes]:
         self.calls.append((method, url, body, dict(headers)))
-        if url.endswith("/user/login/"):
-            return 200, [("Set-Cookie", "csrftoken=tok123; Path=/")], b""
-        if url.endswith("/user-login/"):
+        if url.endswith("/user/login/") and method == "GET":
+            return 200, [
+                ("Set-Cookie", "csrftoken=tok123; Path=/"),
+                ("Set-Cookie", "sessionid=anon000; Path=/"),
+            ], self.login_page
+        if url.endswith("/user/login/") and method == "POST":
+            if not self.login_sets_session:
+                # 200, not a redirect: the login form re-rendered, refused.
+                return 200, [], self.login_page
+            if self.login_keeps_anonymous_session:
+                # 302 that sets no NEW sessionid: still the anonymous session.
+                return (
+                    302,
+                    [
+                        ("Location", "/"),
+                        ("Set-Cookie", "csrftoken=tok123; Path=/"),
+                    ],
+                    b"",
+                )
+            # The real answer: a 302 carrying the logged-in sessionid.
             return (
-                200,
+                302,
                 [
-                    ("Set-Cookie", "sessionid=sess42; Path=/"),
+                    ("Location", "/"),
+                    ("Set-Cookie", "sessionid=sess42; Path=/; HttpOnly"),
                     ("Set-Cookie", "csrftoken=tok123; Path=/"),
                 ],
-                b"ok",
+                b"",
             )
         if "/api/projects?" in url:
             payload = json.dumps({"projects": [{"id": 3, "title": ingest.PROJECT_TITLE}]}).encode()
             return 200, [], payload
+        if url.split("?")[0].endswith("/api/tasks"):
+            return 200, [], json.dumps(self._tasks_page(url)).encode()
         if url.endswith("/import"):
+            self.imported.extend(json.loads(body or b"[]"))
             return 201, [], b'{"tasks_imported": 2}'
         raise AssertionError(f"unexpected request: {method} {url}")
+
+    def _tasks_page(self, url: str) -> dict[str, Any]:
+        """The requested page of the tasks the project already holds."""
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        page = int(query.get("page", ["1"])[0])
+        page_size = int(query.get("page_size", ["100"])[0])
+        tasks = [
+            {"id": index + 1, "project": 3, "data": {"clip_id": clip_id, "hold_id": hold_id}}
+            for index, (clip_id, hold_id) in enumerate(self.existing)
+        ]
+        start = (page - 1) * page_size
+        return {"tasks": tasks[start : start + page_size], "total": len(tasks)}
 
 
 def two_hold_workspace(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
@@ -777,25 +861,313 @@ def test_the_label_studio_api_is_only_used_with_the_flag(tmp_path: pathlib.Path)
     assert with_flag.ok, with_flag.failures
     methods = [method for method, _url, _body, _headers in http_b.calls]
     urls = [url for _method, url, _body, _headers in http_b.calls]
-    assert methods == ["GET", "POST", "GET", "POST"]
-    assert urls[0].endswith("/user/login/")
-    assert urls[1].endswith("/user-login/")
-    assert urls[2] == f"http://localhost:8080/api/projects?title={ingest.PROJECT_TITLE}"
-    assert urls[3] == "http://localhost:8080/api/projects/3/import"
-    # The imported payload is exactly the two new tasks ...
-    body = http_b.calls[3][2]
+    assert methods == ["GET", "POST", "GET", "GET", "POST"]
+    # The login posts to the login form's URL (#89), never to /user-login/ —
+    # that URL does not exist in Label Studio 1.23 and answered HTTP 404.
+    assert urls[0] == f"{ingest.DEFAULT_LS_URL}/user/login/"
+    assert urls[1] == f"{ingest.DEFAULT_LS_URL}/user/login/"
+    assert all(not url.endswith("/user-login/") for url in urls)
+    assert urls[2] == f"{ingest.DEFAULT_LS_URL}/api/projects?page_size=100"
+    assert urls[3] == f"{ingest.DEFAULT_LS_URL}/api/tasks?project=3&page=1&page_size=100"
+    assert urls[4] == f"{ingest.DEFAULT_LS_URL}/api/projects/3/import"
+    # The login POST carries the form fields and the Referer it asks for …
+    form = urllib.parse.parse_qs(http_b.calls[1][2].decode())
+    assert set(form) == {"csrfmiddlewaretoken", "email", "password"}
+    assert form["csrfmiddlewaretoken"] == ["page-csrf"]
+    assert form["email"] == ["tester@example.com"]
+    assert http_b.calls[1][3]["Referer"] == f"{ingest.DEFAULT_LS_URL}/user/login/"
+    # … and the API calls after it carry the CSRF token and the base Referer.
+    for index in (2, 3, 4):
+        assert http_b.calls[index][3]["X-CSRFToken"] == "tok123"
+        assert http_b.calls[index][3]["Referer"] == ingest.DEFAULT_LS_URL
+    # The imported payload is exactly the two new tasks …
+    body = http_b.calls[4][2]
     assert body is not None and len(json.loads(body)) == 2
+    assert len(http_b.imported) == 2
     # ... carrying the session and the CSRF token, as the API requires.
-    import_headers = http_b.calls[3][3]
-    assert import_headers["Cookie"].startswith("sessionid=sess42") or (
-        "sessionid=sess42" in import_headers["Cookie"]
-    )
+    import_headers = http_b.calls[4][3]
+    assert "sessionid=sess42" in import_headers["Cookie"]
+    assert "anon000" not in import_headers["Cookie"], "the anonymous session never reaches the API"
     assert import_headers["X-CSRFToken"] == "tok123"
+    assert import_headers["Content-Type"] == "application/json"
     # The credentials never reach the summary.
     assert "sekret-please" not in with_flag.text
     assert "tester@example.com" not in with_flag.text
-    assert "imported 2 new task(s) into 'handstand-hold-shapes' (project 3)" in with_flag.text
+    assert (
+        "0 already present, 2 imported into 'handstand-hold-shapes' (project 3)"
+        in with_flag.text
+    )
     assert with_flag.import_file is None, "with the flag the tasks go to the API"
+
+
+def test_login_posts_the_csrf_email_password_form_to_user_login() -> None:
+    """#89's bug: the login POST went to /user-login/ (404), not /user/login/."""
+    http = FakeLabelStudio()
+    client = ingest.LabelStudioClient(ingest.DEFAULT_LS_URL, http=http)
+
+    client.login("tester@example.com", "sekret-please")
+
+    asked = [(method, url) for method, url, _body, _headers in http.calls]
+    assert asked == [
+        ("GET", f"{ingest.DEFAULT_LS_URL}/user/login/"),
+        ("POST", f"{ingest.DEFAULT_LS_URL}/user/login/"),
+    ]
+    _method, url, body, headers = http.calls[1]
+    assert body is not None
+    form = urllib.parse.parse_qs(body.decode())
+    assert set(form) == {"csrfmiddlewaretoken", "email", "password"}
+    assert form["csrfmiddlewaretoken"] == ["page-csrf"], "the hidden input of the page"
+    assert form["email"] == ["tester@example.com"]
+    assert form["password"] == ["sekret-please"]
+    assert headers["Content-Type"] == "application/x-www-form-urlencoded"
+    assert headers["Referer"] == f"{ingest.DEFAULT_LS_URL}/user/login/"
+    assert client.cookies["sessionid"] == "sess42"
+
+
+def test_login_falls_back_to_the_csrftoken_cookie() -> None:
+    """The token can come from the cookie when the page has no hidden input."""
+    http = FakeLabelStudio(login_page=PLAIN_LOGIN_PAGE)
+    client = ingest.LabelStudioClient(ingest.DEFAULT_LS_URL, http=http)
+
+    client.login("tester@example.com", "sekret-please")
+
+    _method, url, body, _headers = http.calls[1]
+    assert url.endswith("/user/login/")
+    assert body is not None
+    form = urllib.parse.parse_qs(body.decode())
+    assert form["csrfmiddlewaretoken"] == ["tok123"], "the csrftoken cookie"
+    assert client.cookies["sessionid"] == "sess42"
+
+
+def test_the_api_calls_send_the_sessionid_the_302_set() -> None:
+    """#89's live failure: the login POST must answer a 302 with a NEW session.
+
+    The GET already handed out an ANONYMOUS sessionid; the 302 of a successful
+    login overwrites it, and every later API call must send that new one —
+    sending the anonymous cookie is what answered 401 on the real server.
+    """
+    http = FakeLabelStudio()
+    client = ingest.LabelStudioClient(ingest.DEFAULT_LS_URL, http=http)
+
+    client.login("tester@example.com", "sekret-please")
+
+    # The GET set the anonymous sessionid …
+    get_status, get_headers = http.responses[0]
+    assert get_status == 200
+    assert ("Set-Cookie", "sessionid=anon000; Path=/") in get_headers
+    # … and the POST answered 302 with a DIFFERENT, logged-in one.
+    post_status, post_headers = http.responses[1]
+    assert post_status == 302
+    assert ("Set-Cookie", "sessionid=sess42; Path=/; HttpOnly") in post_headers
+    assert client.cookies["sessionid"] == "sess42", "the NEW sessionid off the 302"
+
+    client.find_project_id(ingest.PROJECT_TITLE)
+    cookie = http.calls[-1][3]["Cookie"]
+    assert "sessionid=sess42" in cookie, "the API call must send the logged-in session"
+    assert "anon000" not in cookie, "…never the anonymous session the GET set"
+
+
+def test_a_302_that_keeps_the_anonymous_session_is_a_failed_login() -> None:
+    """A redirect that sets no NEW sessionid did not log anyone in."""
+    http = FakeLabelStudio(login_keeps_anonymous_session=True)
+    client = ingest.LabelStudioClient(ingest.DEFAULT_LS_URL, http=http)
+
+    with pytest.raises(ingest.LabelStudioError) as error:
+        client.login("tester@example.com", "sekret-please")
+
+    message = str(error.value)
+    assert "login failed" in message
+    assert "sessionid" in message
+    assert "LS_PASSWORD" in message
+    assert "sekret-please" not in message
+
+
+def test_a_login_without_a_session_cookie_is_a_clear_error() -> None:
+    """POST answering 200 (form re-rendered): a failed login, never the password."""
+    http = FakeLabelStudio(login_sets_session=False)
+    client = ingest.LabelStudioClient(ingest.DEFAULT_LS_URL, http=http)
+
+    with pytest.raises(ingest.LabelStudioError) as error:
+        client.login("tester@example.com", "sekret-please")
+
+    message = str(error.value)
+    assert "login failed" in message
+    assert "HTTP 200" in message, "a 200 is not the 302 a successful login sends"
+    assert "sessionid" in message, "the error says exactly what is missing"
+    assert "LS_PASSWORD" in message, "…and where to look"
+    assert "sekret-please" not in message
+    # It still asked the right URL — /user-login/ would only give a 404.
+    assert http.calls[1][1] == f"{ingest.DEFAULT_LS_URL}/user/login/"
+
+
+def test_urllib_http_does_not_follow_redirects() -> None:
+    """#89's root cause: the session cookie sits ON the 302, which must survive.
+
+    Against a local ``http.server`` that answers ``/start`` with a 302 to
+    ``/end``: the stdlib default follows it and keeps only the final
+    response's headers (the 302's cookie is lost), while ``urllib_http``
+    answers with the 302 itself and never asks for ``/end`` at all.
+    """
+    hits: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            if self.path == "/start":
+                self.send_response(302)
+                self.send_header("Location", "/end")
+                self.send_header("Set-Cookie", "sessionid=logged-in; Path=/")
+                self.end_headers()
+                self.wfile.write(b"redirecting")
+            else:
+                self.send_response(200)
+                self.send_header("Set-Cookie", "sessionid=anonymous; Path=/")
+                self.end_headers()
+                self.wfile.write(b"the far page")
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/start"
+    try:
+        # The default helper follows the redirect: it lands on /end and only
+        # sees THAT response's Set-Cookie — the logged-in one is gone.
+        with urllib.request.urlopen(url, timeout=5) as response:
+            assert response.status == 200
+            assert response.read() == b"the far page"
+            assert response.headers.get_all("Set-Cookie") == [
+                "sessionid=anonymous; Path=/"
+            ]
+        assert hits == ["/start", "/end"], "the default really does follow it"
+
+        hits.clear()
+        status, headers, payload = ingest.urllib_http("GET", url, None, {})
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 302, "the 302 is the answer, not the page it points at"
+    assert payload == b"redirecting"
+    assert hits == ["/start"], "the redirect target was never requested"
+    cookies = [value for name, value in headers if name.lower() == "set-cookie"]
+    assert any("sessionid=logged-in" in cookie for cookie in cookies)
+    assert any(name.lower() == "location" for name, _value in headers)
+
+
+def test_the_default_helper_is_built_on_a_no_redirect_opener() -> None:
+    """The opener behind ``urllib_http`` carries a redirect handler that says no."""
+    handler = ingest._NoRedirectHandler()
+    assert handler.redirect_request(None, None, 302, "Found", {}, "/elsewhere") is None
+    assert any(
+        isinstance(installed, ingest._NoRedirectHandler)
+        for installed in ingest._NO_REDIRECT_OPENER.handlers
+    )
+
+
+def test_a_failed_login_is_reported_in_the_summary_without_the_password(
+    tmp_path: pathlib.Path,
+) -> None:
+    data, videos = two_hold_workspace(tmp_path)
+    credentials = tmp_path / "label-studio.env"
+    credentials.write_text(
+        "LS_USER=tester@example.com\nLS_PASSWORD=sekret-please\n", encoding="utf-8"
+    )
+    http = FakeLabelStudio(login_sets_session=False)
+
+    report = run(
+        data, videos, label_studio=True, http=http, env_path=credentials, today="2026-10-02"
+    )
+
+    assert not report.ok
+    assert "login failed" in report.failures["label_studio"]["-"]
+    assert "sekret-please" not in report.text
+    assert "tester@example.com" not in report.text
+    # A failed import must not lose the tasks: the fallback file is written.
+    assert report.import_file is not None and report.import_file.is_file()
+    assert len(json.loads(report.import_file.read_text(encoding="utf-8"))) == 2
+
+
+def test_holds_already_in_the_project_are_not_imported_again(
+    tmp_path: pathlib.Path,
+) -> None:
+    """#89's dedupe: a hold the project already has is skipped, not re-added."""
+    data, videos = two_hold_workspace(tmp_path)
+    clip_id = catalogue_module.file_clip_id(next((videos / "inbox").iterdir()))
+    credentials = tmp_path / "label-studio.env"
+    credentials.write_text(
+        "LS_USER=tester@example.com\nLS_PASSWORD=sekret-please\n", encoding="utf-8"
+    )
+    http = FakeLabelStudio(existing=[(clip_id, 0)])  # the line hold is in already
+
+    report = run(
+        data, videos, label_studio=True, http=http, env_path=credentials, today="2026-10-02"
+    )
+
+    assert report.ok, report.failures
+    assert (
+        "1 already present, 1 imported into 'handstand-hold-shapes' (project 3)" in report.text
+    )
+    # The project was asked what it holds before anything was POSTed …
+    asked = [url for _method, url, _body, _headers in http.calls]
+    assert asked[3].split("?")[0].endswith("/api/tasks")
+    assert asked[3] == f"{ingest.DEFAULT_LS_URL}/api/tasks?project=3&page=1&page_size=100"
+    # … and only the OTHER hold crossed the wire.
+    assert len(http.imported) == 1
+    assert http.imported[0]["data"]["clip_id"] == clip_id
+    assert http.imported[0]["data"]["hold_id"] == 1
+
+
+def test_import_only_reports_present_and_imported(tmp_path, capsys) -> None:
+    """``--import-only``: the recovery for a failed import (#89), deduplicated."""
+    data, videos = two_hold_workspace(tmp_path)
+    clip_id = catalogue_module.file_clip_id(next((videos / "inbox").iterdir()))
+    first = run(data, videos, today="2026-10-02")  # no --label-studio: writes the file
+    tasks_file = first.import_file
+    assert tasks_file is not None
+    assert len(json.loads(tasks_file.read_text(encoding="utf-8"))) == 2
+    credentials = tmp_path / "label-studio.env"
+    credentials.write_text(
+        "LS_USER=tester@example.com\nLS_PASSWORD=sekret-please\n", encoding="utf-8"
+    )
+
+    # Everything is in the project already (the lead imported the file by hand).
+    already = FakeLabelStudio(existing=[(clip_id, 0), (clip_id, 1)])
+    code = ingest.main(
+        ["--import-only", str(tasks_file)], http=already, env_path=credentials
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "2 already present, 0 imported" in out
+    assert "sekret-please" not in out
+    assert already.imported == [], "nothing may be POSTed when everything is present"
+    assert not any(url.endswith("/import") for _m, url, _b, _h in already.calls)
+    # It only touches Label Studio: no report, no catalogue, no pipeline.
+    assert not list((data / "reports" / "ingest").glob("*.txt"))
+
+    # A project without those tasks gets them (with --label-studio, as documented).
+    fresh = FakeLabelStudio()
+    code = ingest.main(
+        ["--import-only", str(tasks_file), "--label-studio"],
+        http=fresh,
+        env_path=credentials,
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "0 already present, 2 imported" in out
+    assert len(fresh.imported) == 2
+
+
+def test_import_only_of_a_missing_file_is_an_error(tmp_path, capsys) -> None:
+    missing = tmp_path / "never-written.json"
+    code = ingest.main(["--import-only", str(missing)])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert str(missing) in err
+    assert "LS_PASSWORD" not in err
 
 
 # --------------------------------------------------------------------------- #

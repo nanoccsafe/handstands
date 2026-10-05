@@ -136,6 +136,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   annotations (#8)
 
 ### Fixed
+- The weekly ingest's Label Studio import logs in for real now (#89): the
+  credentials were POSTed to `/user-login/`, a URL Label Studio 1.23 does not
+  have, so the first real run (2026-10-04) died at the login with `HTTP 404`
+  after everything else had worked. The POST goes to the login form's own
+  `/user/login/` with `csrfmiddlewaretoken` (the hidden input of the login
+  page, or the `csrftoken` cookie), `email`, `password` and
+  `Referer: <base>/user/login/`. Redirects are never followed: a successful
+  Django login answers the POST with a **302** that carries the logged-in
+  `sessionid`, which the default urllib opener would follow — keeping only the
+  final response's headers, losing that cookie and looking like a success on
+  the anonymous one the page then handed out (that is how the API came to
+  answer `401 Authentication credentials were not provided`). The helper
+  therefore uses an opener whose redirect handler declines, and the login
+  succeeds only when the POST answers 302/303 with a `sessionid` **different**
+  from the anonymous one the GET set: a 200 (the login form re-rendered) or a
+  redirect that keeps the anonymous cookie is a failed login whose error names
+  `LS_USER`/`LS_PASSWORD` and never prints the password. Every API call after
+  the login sends the logged-in `sessionid` cookie, `X-CSRFToken` (the
+  `csrftoken` cookie) and `Referer: <base>`.
+  The import now reads the project's tasks first (`GET /api/tasks`, page by
+  page) and skips every `(clip_id, hold_id)` already there, so a re-run — or
+  the file the lead imported by hand — reports "already present" instead of
+  queueing a hold twice, and `uv run python -m handstand.ingest --import-only
+  <tasks.json> --label-studio` imports one already-written tasks file with the
+  same dedupe (no inbox, catalogue or pipeline touched): the recovery for a
+  failed import, written up in `docs/ingest.md`
 - 11 of the 19 labelling frames that got no pre-label now get one (chainlink
   #78): 6 because #79 made the MediaPipe reference read the handstand the right
   way up and the keypoints agree again (`438c3693d6d7_138`, `64184de33f84_1`,
