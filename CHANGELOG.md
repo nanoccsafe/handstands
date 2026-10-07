@@ -7,6 +7,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Analysis diagnostics per take — `<basename>.diagnostics.json` beside each
+  recording (chainlink #93), a few KB of counts written after every analysis of
+  a recording: schema 1, app version, backend + analysis version, the run's wall
+  time (against the "30 s of video in 5–10 s" baseline), the video's
+  duration/frame rate/size, frames total and frames with a person (plus
+  `frames_with_person_pct`), the **analysed** frame rate against the **recorded**
+  one (the phone records ~60 fps, the analysis keeps 30), the phase segmenter's
+  `unknown_reasons` histogram verbatim, the out-of-frame counts and which edges
+  cut the body off, and the hold count / durations / `usable` /
+  `unusable_reason`. Counts only — no keypoints (those are `.pose.json`'s), no
+  per-frame rows, so a thousand frames cost no more bytes than sixty; local to
+  the phone and never sent anywhere, `SessionStore.delete` removes it with the
+  recording and `reconcile()` still keeps only `.mov`. Plus the **Details**
+  disclosure on the session screen, which reads the same file back compactly.
+- The reason a take had no hold, said out loud (chainlink #93): an
+  **out-of-frame** reason computed from the keypoints — a frame counts as
+  *partly out of frame* when a wrist, ankle or hip is missing **and** the
+  visible body touches a border (any joint within 3% of an edge), and as *not
+  in frame* when nothing was detected, with the edges recorded in the
+  diagnostics — and a **"No hold found"** explanation that names the dominant
+  reason in plain words plus one setup tip (distance/height for anything out of
+  frame, light/contrast for joints the model could not read). A frame the
+  athlete was out of frame in counts as out of frame rather than as the missing
+  joint the segmenter had to report, so the framing outranks its own symptom —
+  the first iPhone takes (39% of frames with a person, handstand outside the
+  picture) read as "you were out of frame" instead of "your hands were not
+  visible". More than half the take unseen is what makes a reason worth saying;
+  below that the answer is "no one was upside down long enough (0.3 s
+  minimum)", and a clip the app could not measure still says only
+  **Couldn't measure**.
 - Orientation-aware athlete matching in the pre-labeler, and the re-run of the
   19 frames it left without a pre-label (chainlink #78). Keypoints identify a
   body only when both models read it the same way up: when the MediaPipe

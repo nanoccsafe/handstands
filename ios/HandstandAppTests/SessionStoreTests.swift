@@ -483,6 +483,79 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(try sut.store.sessions().count, 0)
     }
 
+    // MARK: - The analysis diagnostics (chainlink #93)
+
+    /// A diagnostics document for a test: the store never reads the
+    /// numbers, only the file's name and existence, so this spells the
+    /// shape out rather than running an analysis to get one.
+    private func diagnostics() -> AnalysisDiagnostics {
+        AnalysisDiagnostics(
+            schema: AnalysisDiagnostics.schema,
+            appVersion: "0.1.0",
+            backend: "vision",
+            analysisVersion: "vision-1",
+            analysisWallTimeS: 1.5,
+            video: AnalysisDiagnostics.Video(
+                durationS: 10, fps: 59.9, width: 1080, height: 1920),
+            analysedFps: 30,
+            framesTotal: 300,
+            framesWithPerson: 210,
+            framesWithPersonPct: 70,
+            unknownReasons: ["no_visible_wrist": 40],
+            outOfFrame: AnalysisDiagnostics.OutOfFrame(
+                partly: 40, notInFrame: 0, edges: ["top": 40]),
+            dominantReason: "out_of_frame",
+            holdCount: 1,
+            holdDurationsS: [1.5],
+            usable: true,
+            unusableReason: ""
+        )
+    }
+
+    /// Deleting a recording takes its `.diagnostics.json` with it: a file
+    /// of numbers about a take nobody can play is a file nobody would ever
+    /// read again.
+    func testDeleteRemovesTheDiagnosticsFile() throws {
+        let sut = try makeSUT()
+        defer { try? FileManager.default.removeItem(at: sut.directory) }
+        let movie = try makeMovie(named: "20260928-143059.mov", in: sut.directory)
+        let session = try sut.store.add(
+            movie: movie,
+            metadata: nil,
+            info: VideoInfo(duration: 10, width: 1080, height: 1920)
+        )
+        try AnalysisDiagnostics.write(diagnostics(), for: movie)
+        let file = AnalysisDiagnostics.url(for: movie)
+        XCTAssertEqual(file.lastPathComponent, "20260928-143059.diagnostics.json")
+        XCTAssertTrue(exists(file), "the diagnostics sit beside the movie")
+
+        try sut.store.delete(session)
+
+        XCTAssertFalse(exists(file), "the diagnostics go with the recording")
+        XCTAssertFalse(exists(movie))
+        XCTAssertEqual(try sut.store.sessions().count, 0)
+    }
+
+    /// A `.diagnostics.json` beside nothing is not a recording, and one
+    /// beside a recording is not a second one: `reconcile()` filters on the
+    /// movie's own extension, so the file is never a History row of its
+    /// own and never a reason to add or remove one.
+    func testReconcileIgnoresTheDiagnosticsFile() async throws {
+        let sut = try makeSUT(
+            readInfo: fixedReader(VideoInfo(duration: 8.5, width: 720, height: 1280))
+        )
+        defer { try? FileManager.default.removeItem(at: sut.directory) }
+        try Data(#"{"schema": 1, "frames_total": 10}"#.utf8).write(
+            to: sut.directory.appendingPathComponent("20260928-143059.diagnostics.json")
+        )
+
+        let result = try await sut.store.reconcile()
+
+        XCTAssertEqual(result.added, 0)
+        XCTAssertEqual(result.removed, 0)
+        XCTAssertEqual(try sut.store.sessions().count, 0)
+    }
+
     // MARK: - The annotated export (chainlink #50)
 
     /// The export's name, spelled once for the export button and for

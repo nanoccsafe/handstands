@@ -246,6 +246,10 @@ What happens, in order:
    **pose cache** beside the movie — `<basename>.pose.json`, same folder,
    same stem (see **Stress diagram** below). The next time the session
    screen opens it reads those frames instead of running Vision again.
+7. For a recording, the run's numbers are written beside it too as
+   `<basename>.diagnostics.json` (chainlink #93), and what the run found
+   — including why it found no hold — is shown in words; both are spelled
+   out under **Diagnostics and the "No hold found" explanation** below.
 
 Worth knowing:
 
@@ -266,6 +270,65 @@ Worth knowing:
 - A video picked from **Analyse a video** runs the same analysis with the
   Line hold and is *not* saved anywhere — a pick is not a recording, so it
   never appears in History.
+
+### Diagnostics and the "No hold found" explanation
+
+Every analysis of a **recording** also writes a few KB of numbers beside
+it: `<basename>.diagnostics.json`, same folder, same stem as the movie
+(chainlink #93). It is what the lead pulls off the phone with `xcrun
+devicectl` to see why a take went the way it did, and what the session
+screen's **Details** disclosure shows.
+
+```json
+{"schema": 1, "app_version": "0.1.0", "backend": "mediapipe",
+ "analysis_version": "mediapipe-1", "analysis_wall_time_s": 6.42,
+ "video": {"duration_s": 24.316, "fps": 59.94, "width": 1080, "height": 1920},
+ "analysed_fps": 29.7, "frames_total": 714, "frames_with_person": 281,
+ "frames_with_person_pct": 39.4,
+ "unknown_reasons": {"no_visible_wrist": 609, "no_visible_ankle": 310},
+ "out_of_frame": {"partly": 62, "not_in_frame": 433, "edges": {"top": 40}},
+ "dominant_reason": "not_in_frame", "hold_count": 0, "hold_durations_s": [],
+ "usable": true, "unusable_reason": ""}
+```
+
+- **Counts only.** No keypoints (those are `.pose.json`'s) and no
+  per-frame rows, so the file is a few KB whatever the take — a thousand
+  frames cost no more than sixty. Local to the phone, never sent
+  anywhere; `SessionStore.delete` removes it with the recording and
+  `reconcile()` ignores it (it keeps only the movie's own extension).
+- **Two frame rates.** `video.fps` is what the camera recorded at (about
+  60 on the iPhone), `analysed_fps` what the analysis was actually fed at
+  (the 30 fps cap, measured over the frames' own timestamps);
+  `frames_with_person_pct` is the share of frames with a person in them.
+- **The out-of-frame reason.** The phase segmenter only ever reports the
+  *symptom* — `no_visible_wrist`, `no_visible_ankle`, … — because it is
+  not told how big the picture is. `Framing` puts the two together: a
+  frame counts as *partly out of frame* when a wrist, ankle or hip is
+  missing **and** the visible body touches a border (any joint within 3%
+  of an edge), and as *not in frame* when nothing was detected. The
+  edges it was cut off at (`top` / `bottom` / `left` / `right`) are in
+  `out_of_frame.edges`.
+- **`dominant_reason`** is the reason for *no hold*: the bucket the most
+  unseen frames fell in when **more than half** the take could not be
+  seen into, `not_inverted` otherwise (visible, just never upside down
+  long enough), and `""` when there was a hold or the clip could not be
+  measured. A frame that was out of frame counts as *out of frame* rather
+  than as the missing joint, so the framing outranks its own symptom.
+
+**"No hold found"** (the same words on the panel right after a run and in
+the session screen for a take analysed earlier): `NoHoldReason` maps each
+reason to one sentence, and the message ends in **one** setup tip from a
+three-entry table — distance/height (`positionTip`) for anything out of
+frame or never inverted, light/contrast (`lightTip`) for joints the model
+could not read, `clearViewTip` for a blocked camera:
+
+> **No hold found**
+> You were partly out of frame (top and right edges) for most of the
+> take. Place the phone about 3 m away at hip height, so your whole body
+> fits upside down.
+
+A take the app could *not measure* never reaches this: it says
+**Couldn't measure** with its own words instead, as it always has.
 
 ### The scoring reference (never committed)
 

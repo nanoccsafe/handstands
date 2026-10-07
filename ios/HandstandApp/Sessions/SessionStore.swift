@@ -115,10 +115,11 @@ final class SessionStore {
     }
 
     /// Deletes a session **and its video**: the `.mov`, its `.json` sidecar,
-    /// its `.pose.json` pose cache (chainlink #48), its leftover annotated
-    /// export in Caches (chainlink #50) and the row. A missing sidecar,
-    /// cache or export is not an error — the movie goes and the row goes
-    /// with it. Files outside the Recordings folder are never touched:
+    /// its `.pose.json` pose cache (chainlink #48), its `.diagnostics.json`
+    /// analysis diagnostics (chainlink #93), its leftover annotated export
+    /// in Caches (chainlink #50) and the row. A missing sidecar, cache,
+    /// diagnostics or export is not an error — the movie goes and the row
+    /// goes with it. Files outside the Recordings folder are never touched:
     /// only URLs that resolve inside it are removed, so a filename that
     /// somehow points elsewhere costs the file nothing (the row still goes,
     /// otherwise History would keep listing a take the app refuses to open).
@@ -135,6 +136,15 @@ final class SessionStore {
             let cache = PoseCache.cacheURL(for: movie)
             if isInsideRecordingsFolder(cache), fileManager.fileExists(atPath: cache.path) {
                 try fileManager.removeItem(at: cache)
+            }
+            // The analysis diagnostics (chainlink #93): a few KB beside the
+            // recording, and a file of numbers about a take nobody can play
+            // is a file nobody would ever read again.
+            let diagnostics = AnalysisDiagnostics.url(for: movie)
+            if isInsideRecordingsFolder(diagnostics),
+                fileManager.fileExists(atPath: diagnostics.path)
+            {
+                try fileManager.removeItem(at: diagnostics)
             }
             if fileManager.fileExists(atPath: movie.path) {
                 try fileManager.removeItem(at: movie)
