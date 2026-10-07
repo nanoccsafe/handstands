@@ -3,9 +3,11 @@ import CoreTransferable
 import Foundation
 import UniformTypeIdentifiers
 
-/// What the app shows after a video is picked: how long it is and how big its
-/// frame is. Plain values, `Sendable`, no UI — `VideoInfoFormatter` turns them
-/// into the strings on screen, which is what the unit tests pin down.
+/// What the app shows after a video is picked: how long it is, how big its
+/// frame is and how fast the camera wrote it. Plain values, `Sendable`, no UI
+/// — `VideoInfoFormatter` turns them into the strings on screen, which is
+/// what the unit tests pin down; the analysis diagnostics (chainlink #93)
+/// record them as they are.
 struct VideoInfo: Sendable, Equatable {
     /// Length in seconds exactly as AVFoundation reports it.
     let duration: TimeInterval
@@ -13,6 +15,11 @@ struct VideoInfo: Sendable, Equatable {
     /// portrait phone recording reads 1080 × 1920, not 1920 × 1080.
     let width: Int
     let height: Int
+    /// The track's nominal frame rate in frames per second — what the
+    /// *recording* was made at (about 60 on the iPhone), against the ~30 fps
+    /// the app analyses at (chainlink #93). `0` when the track reports none,
+    /// which is a value rather than a guess.
+    var frameRate: Double = 0
 }
 
 /// The picked video as a file: PhotosPicker hands it over through this
@@ -51,11 +58,15 @@ enum VideoInfoReader {
         }
         let naturalSize = try await track.load(.naturalSize)
         let preferredTransform = try await track.load(.preferredTransform)
+        let nominalFrameRate = Double(try await track.load(.nominalFrameRate))
         let oriented = naturalSize.applying(preferredTransform)
         return VideoInfo(
             duration: seconds,
             width: Int(abs(oriented.width).rounded()),
-            height: Int(abs(oriented.height).rounded())
+            height: Int(abs(oriented.height).rounded()),
+            // A track that will not say reads 0, not a made-up 30: the
+            // diagnostics record what the file says.
+            frameRate: nominalFrameRate.isFinite && nominalFrameRate > 0 ? nominalFrameRate : 0
         )
     }
 }

@@ -61,17 +61,23 @@ final class AnalysisService {
     /// `state` as it goes.
     ///
     /// When a `session` and its `store` are given the result is recorded on
-    /// that row (`analyzedAt`, score, holds, version) — a video picked from
-    /// Photos passes `nil` for both, because it is not in History. A video
-    /// with nobody in it finishes with `holdCount` 0 rather than failing;
-    /// only a video that cannot be read (or a model failure) ends in
-    /// `.failed`.
+    /// that row (`analyzedAt`, score, holds, version) and the run's
+    /// diagnostics are written beside the movie as
+    /// `<basename>.diagnostics.json` (chainlink #93) — a few KB, local
+    /// only, removed with the recording. A video picked from Photos passes
+    /// `nil` for both, because it is not in History and has nothing to sit
+    /// beside. A video with nobody in it finishes with `holdCount` 0 rather
+    /// than failing; only a video that cannot be read (or a model failure)
+    /// ends in `.failed`.
     func analyse(movie: URL, holdType: HoldType, session: Session?, store: SessionStore?) async {
         // One run at a time: the previous one stops and loses the right to
         // write anything.
         cancel()
         let mine = generation
         state = .running(progress: 0)
+        // The whole run's wall time — what the diagnostics (chainlink #93)
+        // record against the "30 s of video in 5–10 s" baseline.
+        let startedAt = Date()
 
         do {
             // Which backend this run is: decided once, so the extraction,
@@ -79,6 +85,12 @@ final class AnalysisService {
             // its model is bundled (chainlink #45's default, per the
             // bake-off), Vision otherwise.
             let backend = PoseBackend.preferred
+            // The movie's own numbers (length, frame rate, frame size):
+            // the diagnostics record them and "out of frame" is measured
+            // against the size. `nil` costs only those — the extraction
+            // below is about to fail on the same unreadable file anyway.
+            let info = try? await VideoInfoReader.read(url: movie)
+            let frameSize = info.map { FrameSize(width: $0.width, height: $0.height) }
             // 1. The reference for this hold, if the app was built with one
             //    (`ReferenceLoader`; the real file is never in the repo).
             let reference = ReferenceLoader.load(for: holdType)
@@ -101,9 +113,13 @@ final class AnalysisService {
             let analysis = await Task.detached {
                 Analyzer.analyze(frames, reference: reference, config: config)
             }.value
-            // 5. What the screen shows.
+            // 5. What the screen shows. The frame size is what lets the
+            //    summary say *why* there was no hold (chainlink #93): a
+            //    missing joint only reads as "out of frame" against the
+            //    picture's own edges.
             let summary = AnalysisSummary.make(
-                from: analysis, frames: frames, hasReference: reference != nil
+                from: analysis, frames: frames, hasReference: reference != nil,
+                frameSize: frameSize
             )
             // Cancelled (or a newer run started) while the pipeline ran: not
             // ours to report, and nothing may be saved.
@@ -123,6 +139,25 @@ final class AnalysisService {
                     version: backend.analysisVersion,
                     note: unusable
                 )
+                // 7. The diagnostics beside the recording (chainlink #93): a
+                //    few KB of numbers — the wall time, the video, the frame
+                //    counts, the unknown-reason histogram, the out-of-frame
+                //    edges and the holds. Local to the phone, never sent
+                //    anywhere, removed by `SessionStore.delete`. Only a
+                //    *recording* gets one: a video picked from Photos is a
+                //    temporary copy with no History row to sit beside.
+                if let info {
+                    let diagnostics = AnalysisDiagnostics.make(
+                        analysis: analysis,
+                        frames: frames,
+                        video: info,
+                        wallTimeS: Date().timeIntervalSince(startedAt),
+                        appVersion: RecordingMetadata.currentAppVersion,
+                        backend: backend.rawValue,
+                        analysisVersion: backend.analysisVersion
+                    )
+                    try? AnalysisDiagnostics.write(diagnostics, for: movie)
+                }
             }
             state = .finished(summary)
         } catch is CancellationError {
@@ -251,6 +286,14 @@ struct AnalysisSummary: Equatable {
     /// How many of the analysed frames had a person in them (`detected`) —
     /// "Person found in X of Y frames" on the unmeasurable-clip screen.
     var detectedFrames: Int
+    /// What to tell the user when the take had no hold (chainlink #93):
+    /// the dominant reason in plain words, then one setup tip — "You were
+    /// partly out of frame (top and right edges) for most of the take.
+    /// Place the phone about 3 m away at hip height, …". `nil` when there
+    /// is a hold to show, and when the clip could not be measured (that
+    /// screen has its own words: this is the *measurable* take that simply
+    /// found nothing).
+    var noHoldExplanation: String?
 
     /// `summary` from the pipeline's own answer.
     ///
@@ -262,12 +305,18 @@ struct AnalysisSummary: Equatable {
     ///
     /// `frames` are the frames that went *into* the pipeline: `detected` is
     /// their flag, not something the `Analysis` carries.
+    ///
+    /// - Parameter frameSize: the pixels the model saw those keypoints in
+    ///   (`nil` when the movie's size could not be read, which costs only
+    ///   the out-of-frame half of the no-hold explanation).
     static func make(
         from analysis: Analysis,
         frames: [PostProcessInputFrame],
-        hasReference: Bool
+        hasReference: Bool,
+        frameSize: FrameSize? = nil
     ) -> AnalysisSummary {
         let durations = analysis.phases.holdDurationsS()
+        let unusable = unusableReason(of: analysis)
         return AnalysisSummary(
             frames: analysis.phases.tMs.count,
             holdCount: analysis.phases.holdCount,
@@ -277,15 +326,35 @@ struct AnalysisSummary: Equatable {
                 .prefix(Scorer.topFaults)
                 .map(\.feature),
             hasReference: hasReference,
-            unusableReason: unusableReason(of: analysis),
-            detectedFrames: frames.filter(\.detected).count
+            unusableReason: unusable,
+            detectedFrames: frames.filter(\.detected).count,
+            noHoldExplanation: noHoldMessage(
+                of: analysis, frames: frames, size: frameSize, unusable: unusable)
         )
+    }
+
+    /// The "No hold found" message, or `nil` when there is nothing to
+    /// explain (chainlink #93) — a hold was found, or the clip could not
+    /// be measured and says that instead. The reason comes from one pass
+    /// over the frames (`AnalysisDiagnostics.Tally`), the same pass the
+    /// diagnostics file counts with, so the two can never disagree.
+    private static func noHoldMessage(
+        of analysis: Analysis,
+        frames: [PostProcessInputFrame],
+        size: FrameSize?,
+        unusable: String?
+    ) -> String? {
+        guard unusable == nil, analysis.phases.holdCount == 0 else { return nil }
+        return AnalysisDiagnostics.Tally(analysis: analysis, frames: frames, size: size)
+            .noHoldMessage(frameCount: frames.count)
     }
 
     /// Why the clip could not be measured, or `nil` when it could — the
     /// post-process's reason first (no body length, e.g. Vision's leg
     /// confidences under `MIN_VISIBILITY`), the segmenter's otherwise.
-    private static func unusableReason(of analysis: Analysis) -> String? {
+    /// Spelled once: the diagnostics file (chainlink #93) records the same
+    /// `usable` / `unusable_reason` pair the screens show.
+    static func unusableReason(of analysis: Analysis) -> String? {
         if !analysis.processed.usable {
             return analysis.processed.bodyLength.reason
         }

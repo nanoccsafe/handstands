@@ -69,6 +69,12 @@ struct SessionDetailView: View {
     /// (see `onDisappear`). Starts `.idle`, like the analysis service.
     @State private var exporter = ExportService()
 
+    /// What the last analysis saw, read from the `.diagnostics.json` beside
+    /// the movie (chainlink #93): once when the screen opens and again
+    /// after a run, because the panel starts over on every visit while the
+    /// file keeps the last run's numbers.
+    @State private var diagnostics: AnalysisDiagnostics?
+
     /// Is a run in flight — the state the screen has to stay awake for.
     private var isAnalysing: Bool {
         if case .running = service.state { return true }
@@ -211,6 +217,19 @@ struct SessionDetailView: View {
                     } else {
                         if let holds = session.holdCount {
                             LabeledContent("Holds", value: "\(holds)")
+                            // Why there was none (chainlink #93): the same
+                            // message the panel shows right after a run,
+                            // read back from the diagnostics file — the two
+                            // are never on screen together, because the
+                            // panel only has results while a run is the
+                            // current state.
+                            if holds == 0, let explanation = diagnostics?.noHoldExplanation {
+                                Text("No hold found")
+                                    .font(.subheadline.weight(.semibold))
+                                Text(explanation)
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         if let longest = session.longestHoldS {
                             LabeledContent(
@@ -227,6 +246,20 @@ struct SessionDetailView: View {
                     startLabel: session.analyzedAt == nil ? "Analyse" : "Analyse again",
                     onStart: analyse
                 )
+            }
+
+            // What the run saw (chainlink #93): the numbers from the few KB
+            // of diagnostics written beside this recording, behind one
+            // disclosure so they stay out of the way until somebody wants
+            // them — the wall time, the frame counts, the reasons the
+            // analysis could not see into, and the holds.
+            if let diagnostics {
+                Section {
+                    DisclosureGroup("Details") {
+                        diagnosticsRows(diagnostics)
+                            .font(.footnote)
+                    }
+                }
             }
 
             // The annotated video (chainlink #50): the picture with the
@@ -288,6 +321,10 @@ struct SessionDetailView: View {
             // An already-analysed take: the pose cache has the frames, the
             // pipeline over them is milliseconds, and the overlay is on.
             loadDiagram()
+            // What the last run saw (chainlink #93), if there is a file —
+            // it is what the Details section and a stored "No hold found"
+            // read from.
+            loadDiagnostics()
         }
         .onDisappear {
             // Leaving the screen takes the sound with it, the analysis with
@@ -322,9 +359,11 @@ struct SessionDetailView: View {
             // A finished run has just written its pose cache (chainlink
             // #48): re-read it so the overlay appears without leaving the
             // screen. Forced, because a diagram loaded earlier is exactly
-            // what a re-run must replace.
+            // what a re-run must replace. The diagnostics file (chainlink
+            // #93) was written by the same run, so it is re-read too.
             if case .finished = state {
                 loadDiagram(force: true)
+                loadDiagnostics()
             }
         }
         .confirmationDialog(
@@ -346,6 +385,95 @@ struct SessionDetailView: View {
         } message: {
             Text(deletionError ?? "")
         }
+    }
+
+    // MARK: - Diagnostics (chainlink #93)
+
+    /// The diagnostics file beside this movie: `nil` when there is none —
+    /// never analysed, or a take from before the file existed — which is
+    /// exactly when there is no Details section to show.
+    private func loadDiagnostics() {
+        diagnostics = AnalysisDiagnostics.read(for: store.movieURL(for: session))
+    }
+
+    /// The rows of the Details disclosure: the diagnostics read compactly,
+    /// one line per fact. The file itself has no per-frame rows and no
+    /// keypoints (they are the pose cache's), so neither has this.
+    private func diagnosticsRows(_ d: AnalysisDiagnostics) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent(
+                "Analysed in", value: String(format: "%.1f s", d.analysisWallTimeS))
+            LabeledContent("Backend", value: "\(d.backend) · \(d.analysisVersion)")
+            LabeledContent(
+                "Video",
+                value: "\(VideoInfoFormatter.duration(d.video.durationS)) · "
+                    + VideoInfoFormatter.pixelSize(width: d.video.width, height: d.video.height)
+                    + " · \(frameRate(d.video.fps))"
+            )
+            LabeledContent(
+                "Frame rate",
+                value: "\(frameRate(d.analysedFps)) analysed / \(frameRate(d.video.fps)) recorded"
+            )
+            LabeledContent(
+                "Frames with a person",
+                value: "\(d.framesWithPerson) of \(d.framesTotal) "
+                    + String(format: "(%.1f%%)", d.framesWithPersonPct)
+            )
+            if !d.unknownReasons.isEmpty {
+                LabeledContent("Not seen in", value: reasonHistogram(d.unknownReasons))
+            }
+            if d.outOfFrame.notInFrame > 0 {
+                LabeledContent(
+                    "Nobody in frame", value: "\(d.outOfFrame.notInFrame) frames")
+            }
+            if d.outOfFrame.partly > 0 {
+                LabeledContent("Partly out of frame", value: outOfFrameLine(d))
+            }
+            if d.usable {
+                LabeledContent("Holds", value: holdsLine(d))
+            } else {
+                Text("Couldn't measure: \(d.unusableReason)")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// "29.9 fps" — a frame rate with its unit and one decimal, for both
+    /// the rate the camera recorded at and the one the analysis kept.
+    private func frameRate(_ value: Double) -> String {
+        String(format: "%.1f fps", value)
+    }
+
+    /// The unknown-reason histogram as the file spells it — the segmenter's
+    /// own keys (`no_visible_wrist 609`), most frames first. They stay in
+    /// their own words because that is what the diagnostics are grepped
+    /// for, on the phone and in the issue.
+    private func reasonHistogram(_ counts: [String: Int]) -> String {
+        counts.sorted { first, second in
+                first.value == second.value ? first.key < second.key : first.value > second.value
+            }
+            .map { "\($0.key) \($0.value)" }
+            .joined(separator: " · ")
+    }
+
+    /// "62 frames (top, right)" — how many frames were cut off, and at
+    /// which edges, in `Edge.allCases` order.
+    private func outOfFrameLine(_ d: AnalysisDiagnostics) -> String {
+        let edges = Edge.allCases
+            .filter { (d.outOfFrame.edges[$0.rawValue] ?? 0) > 0 }
+            .map(\.rawValue)
+        guard !edges.isEmpty else { return "\(d.outOfFrame.partly) frames" }
+        return "\(d.outOfFrame.partly) frames (\(edges.joined(separator: ", ")))"
+    }
+
+    /// "2 (1.5 s)" — how many holds were found and each one's length; a
+    /// take with none simply says `0`.
+    private func holdsLine(_ d: AnalysisDiagnostics) -> String {
+        guard d.holdCount > 0 else { return "0" }
+        let lengths = d.holdDurationsS
+            .map { String(format: "%.1f s", $0) }
+            .joined(separator: ", ")
+        return "\(d.holdCount) (\(lengths))"
     }
 
     // MARK: - Playback controls

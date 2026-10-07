@@ -70,6 +70,10 @@ struct AnalysisPanel: View {
     /// why there is none) and the worst faults, in words. A clip that could
     /// not be measured says so instead: "Holds: 0" would read as "you did
     /// not hold", which is not what an unmeasurable clip means.
+    ///
+    /// A take that *was* measurable but found nothing says **No hold
+    /// found** and why, in plain words plus one setup tip (chainlink #93) —
+    /// never just a zero.
     private func results(_ summary: AnalysisSummary) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             if summary.unusableReason != nil {
@@ -80,6 +84,16 @@ struct AnalysisPanel: View {
                     "Longest hold",
                     value: String(format: "%.1f s", summary.longestHoldS)
                 )
+                if summary.holdCount == 0, let explanation = summary.noHoldExplanation {
+                    // The dominant reason the analysis could not see into
+                    // (out of frame, hands not visible, never upside down …)
+                    // in the words of `NoHoldExplanation`, tip included.
+                    Text("No hold found")
+                        .font(.subheadline.weight(.semibold))
+                    Text(explanation)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 if let score = summary.clipScore {
                     LabeledContent("Score", value: SessionFormatter.score(score))
                 } else {
