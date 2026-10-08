@@ -42,7 +42,9 @@ swift/HandstandCore/
 │   ├── StressDiagram.swift             the overlay's logic: severities, bands, one frame (#48)
 │   ├── SessionSummary.swift            the summary: heat strip, worst moment, cues (#49)
 │   ├── BodyFrame.swift                 handstand.bodyframe
-│   └── FramingCheck.swift              the Record screen's live framing guide (#46)
+│   ├── FramingCheck.swift              the Record screen's live framing guide (#46)
+│   ├── LiveLine.swift                  the live "line" detector + its events (#91)
+│   └── CueScheduler.swift              which cue, if any, each tick earns (#91)
 └── Tests/HandstandCoreTests/
     ├── JointTests.swift                raw values == handstand.postprocess.TRACKED_JOINTS
     ├── RotationTests.swift             mirrors pipeline/tests/test_rotation.py
@@ -58,6 +60,8 @@ swift/HandstandCore/
     ├── GoldenComparison.swift          the one comparison every parity test runs (#42)
     ├── BodyFrameTests.swift            mirrors the body-frame cases in test_postprocess.py
     ├── FramingCheckTests.swift         whole body in frame / cut off / too small / alone (#46)
+    ├── LiveLineTests.swift             onset / loss / marks / geometry + the offline-agreement check (#91)
+    ├── CueSchedulerTests.swift         every pacing rule, tick by tick (#91)
     ├── PoseFrameTests.swift            midpoint / isValid
     ├── FixtureTests.swift              reads the fixture through Bundle.module
     ├── GoldenFixtures.swift            the golden fixture schema, shared by the parity tests
@@ -1005,6 +1009,45 @@ On the phone the chooser runs inside `MediaPipeClipExtractor` (the app,
 `ios/HandstandApp/Pose/MediaPipePoseService.swift`): both passes of the clip
 first, then one `chooseOrientations` call over the whole clip, then the
 chosen pass's keypoints mapped back to display pixels.
+
+## LiveLine and CueScheduler (chainlink #91)
+
+Live mode stage 1 is two pure pieces in `HandstandCore`, so the pacing of the
+cues can be tested without a phone, a camera or a voice:
+
+* `Sources/HandstandCore/LiveLine.swift` — **`LiveLineConfig`** (body angle
+  **15°**, hip **160°**, onset **0.5 s**, loss **0.4 s**, visibility **0.5**),
+  the **`LiveEvent`** enum (`lineAchieved`, `lineLost(tMs:heldS:)`,
+  `timeMark(tMs:seconds:)`) and **`LiveLineDetector`**: one frame of display
+  pixels in, the events it earned out. "Line" on a frame means *inverted*
+  (wrists below ankles — hips when the ankles are missing, confident joints
+  only), `|wrist→ankle|` within 15° of vertical, the shoulder–hip–ankle angle
+  of the visible side ≥ 160°, and wrists, hips and ankles all confident. Both
+  angles are the existing helpers' — `BodyFrame.toBodyFrame`'s `atan2(u, v)`
+  (the body length cancels, so a single frame is measured in its own pixels)
+  and `Features.angleAt` — so the live cue and the offline report cannot drift
+  apart on the maths. Everything is measured in the frame's `tMs`
+  (variable frame rate, never a frame count), and `isInLine` / `isInverted`
+  expose the state the app reads between frames.
+* `Sources/HandstandCore/CueScheduler.swift` — **`CueSettings`** (voice on,
+  time marks off, framing hints on), **`Cue`**, **`FramingHint`** and
+  **`CueScheduler`**: one `decide(tMs:events:framing:inverted:recording:)`
+  per tick, at most one cue out. The rules are the static constants at the top
+  of the file — 3 s global debounce, 1 s for the line cue, 1.5 s after coming
+  down out of inversion, one hint every 4 s and never the same one twice
+  within 8 s — plus the mapping (`tooSmall` → come closer, sideways edges →
+  move to the middle, top-only while standing → raise the phone, …) and the
+  voice toggle that silences everything except the framing hints.
+
+**The offline-agreement test** is the one that matters:
+`LiveLineTests.testEveryLiveCueFallsInsideAnOfflineHoldOnTheGoldenFixtures`
+feeds every golden fixture's **input** to the detector *and* to
+`PostProcess.process` → `PhaseSegmenter.classify`, and asserts every
+`lineAchieved` falls inside a hold the offline analysis found — the cue can
+never fire where the report will say "no hold" (`line_hold` cues exactly once,
+`banana_hold` — an arched back — never). The rest of `LiveLineTests` is
+synthetic frames: onset, flicker, pike, lean, loss hysteresis, marks at 5/10 s
+and VFR timestamps; `CueSchedulerTests` walks every rule above.
 
 ## Running the tests
 

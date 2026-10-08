@@ -105,4 +105,83 @@ final class RecordingMetadataTests: XCTestCase {
         try Data(line.utf8).write(to: RecordingMetadata.sidecarURL(for: movie))
         XCTAssertEqual(try RecordingMetadata.read(for: movie)?.holdType, .line)
     }
+
+    // MARK: - The live stats (chainlink #91)
+
+    /// The five optional fields live mode writes beside a take, and the round
+    /// trip they make: numbers stay numbers, the cues stay in order, and the
+    /// schema is still 1.
+    func testTheLiveStatsRoundTrip() throws {
+        var metadata = sample()
+        metadata.liveFpsTarget = 5.0
+        metadata.liveFpsAchieved = 4.8
+        metadata.avgInferenceMs = 96.3
+        metadata.recordingFramesDropped = 0
+        metadata.cuesSpoken = [
+            SpokenCue(tMs: 1_240, cue: "line_hold"),
+            SpokenCue(tMs: 6_020, cue: "time_mark_5"),
+            SpokenCue(tMs: 11_040, cue: "time_mark_10"),
+        ]
+        try metadata.write(for: movie)
+
+        let read = try XCTUnwrap(RecordingMetadata.read(for: movie))
+        XCTAssertEqual(read, metadata)
+        XCTAssertEqual(read.schema, 1, "the schema does not move for optional fields")
+        XCTAssertEqual(read.liveFpsTarget, 5.0)
+        XCTAssertEqual(read.liveFpsAchieved, 4.8)
+        XCTAssertEqual(read.avgInferenceMs, 96.3)
+        XCTAssertEqual(read.recordingFramesDropped, 0)
+        XCTAssertEqual(read.cuesSpoken?.map(\.cue), ["line_hold", "time_mark_5", "time_mark_10"])
+
+        let object = try sidecarJSON()
+        XCTAssertEqual(
+            Set(object.keys),
+            [
+                "schema", "hold_type", "recorded_at", "app_version",
+                "live_fps_target", "live_fps_achieved", "avg_inference_ms",
+                "recording_frames_dropped", "cues_spoken",
+            ]
+        )
+        XCTAssertEqual(object["live_fps_target"] as? Double, 5.0)
+        XCTAssertEqual(object["live_fps_achieved"] as? Double, 4.8)
+        XCTAssertEqual(object["avg_inference_ms"] as? Double, 96.3)
+        XCTAssertEqual(object["recording_frames_dropped"] as? Int, 0)
+        let cues = try XCTUnwrap(object["cues_spoken"] as? [[String: Any]])
+        XCTAssertEqual(cues.count, 3)
+        XCTAssertEqual(cues.first?["t_ms"] as? Int, 1_240)
+        XCTAssertEqual(cues.first?["cue"] as? String, "line_hold")
+    }
+
+    /// A take live mode never touched (no model in the bundle, a simulator
+    /// build) writes the sidecar it always wrote: the fields are absent, not
+    /// zero — and an *old* sidecar reads back the same way.
+    func testTheLiveFieldsAreAbsentWhenThereWereNone() throws {
+        try sample().write(for: movie)
+
+        let object = try sidecarJSON()
+        XCTAssertNil(object["live_fps_target"])
+        XCTAssertNil(object["live_fps_achieved"])
+        XCTAssertNil(object["avg_inference_ms"])
+        XCTAssertNil(object["recording_frames_dropped"])
+        XCTAssertNil(object["cues_spoken"])
+
+        let read = try XCTUnwrap(RecordingMetadata.read(for: movie))
+        XCTAssertNil(read.liveFpsTarget)
+        XCTAssertNil(read.cuesSpoken)
+        XCTAssertEqual(read, sample(), "the four original fields are unchanged")
+    }
+
+    /// One field present without the others — a take that dropped frames but
+    /// had no live pose (or stopped before its first frame) — must still read.
+    func testTheLiveFieldsAreIndependentlyOptional() throws {
+        let json = """
+        {"schema":1,"hold_type":"line","recorded_at":"2026-09-28T14:30:59Z",
+         "app_version":"0.1.0","recording_frames_dropped":3}
+        """
+        try Data(json.utf8).write(to: RecordingMetadata.sidecarURL(for: movie))
+        let read = try XCTUnwrap(RecordingMetadata.read(for: movie))
+        XCTAssertEqual(read.recordingFramesDropped, 3)
+        XCTAssertNil(read.liveFpsTarget)
+        XCTAssertNil(read.cuesSpoken)
+    }
 }

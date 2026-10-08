@@ -154,7 +154,115 @@ written the video is kept — never deleted — and `errorMessage` explains the
 problem. Analysis (chainlink #47) reads `hold_type` to pick the matching
 scoring reference (`HoldType.referenceResourceName`, `"reference-line"` for
 Line); see **Analysis** below for where that file comes from (it is never
-committed — chainlink #28's real one is user data).
+committed — chainlink #28's real one is user data). Live mode (chainlink #91)
+adds five more **optional** keys to the same sidecar — see **Live mode**
+below.
+
+## Live mode (spoken cues)
+
+While the camera is up the phone says **one short cue** when you achieve a
+line, and little else (chainlink #91, stage 1). The philosophy is the user's
+(2026-10-06): *sparse encouraging audio, every cue optional*, because how much
+is too much has to be tested at the gym. And the split is fixed:
+**live cues only confirm — the analysis afterwards gives the critique.** No
+correction is ever spoken mid-hold; the holds, the faults and the score come
+from **Analyse**, which is unchanged and stays authoritative.
+
+### What is spoken, and when
+
+| Cue | Words | When |
+| --- | --- | --- |
+| Line | "Line. Hold it." | the frame has been a *line* for 0.5 s — upside down, wrist→ankle within **15°** of vertical, hips open at **≥ 160°**, wrists/hips/ankles confident. **Once per line.** |
+| Time marks | "Five." / "Ten." / "Fifteen." … | every 5 s of line time while the line holds — only with **Time marks** on. |
+| Framing hints | "Step back." · "Come closer." · "Move to the middle." · "Only you in the frame." · "Raise the phone." | **before the attempt**, upright and out of a line: at most one every 4 s, never the same one twice within 8 s, and never within 1.5 s of coming down out of inversion. Cut off at the top *only* while standing → "Raise the phone." (the phone is too low); any sideways edge → "Move to the middle."; too small → "Come closer."; two bodies → "Only you in the frame."; nobody → nothing (the border already says so). |
+| Ready | "Ready." | the framing goes from wrong back to right while you are upright, once per transition. |
+
+Nothing at all is said when **Voice cues** is off, except the framing hints —
+they have their own toggle. Every cue is also shown as a small **banner** under
+the border for **2 s**, the same words, so the screen works with the sound off
+(and while the phone is muted).
+
+### Settings
+
+The **gear** on the home screen opens **Settings** with three toggles, stored
+with `@AppStorage` and remembered per device:
+
+- **Voice cues** — default **on**: the line cue, the time marks and "Ready.".
+- **Time marks** — default **off**: the optional "Five." / "Ten." marks.
+- **Framing hints** — default **on**: the pre-attempt hints above.
+
+Under the toggles, the philosophy in one line:
+
+> Live cues only confirm; the analysis afterwards gives the critique.
+
+### The moving parts
+
+- **Live pose.** MediaPipe runs on the camera frames **on the analysis queue**,
+  throttled to **at most 10 fps** (configurable, and only while the Record
+  screen is up), with its **own** VIDEO-mode landmarker instance — never the
+  analysis one — and the capture clock's own monotonic `t_ms`, so variable
+  frame rate is handled by timestamps, never by a fixed fps. One pass per
+  frame only: the frame is fed 180°-turned when the *previous* live frame was
+  judged upside down (`VisionPoseCore.AutoRotation`'s rule, made causal) —
+  both passes are too expensive live. A build without the fetched model (the
+  `.task` file is never committed) simply has no live cues and records
+  exactly as it did before.
+- **Pure policy.** `HandstandCore.LiveLineDetector` (the line, its 0.5 s
+  onset / 0.4 s loss hysteresis, the marks) and `HandstandCore.CueScheduler`
+  (every rule in the table) are pure and unit-tested — including the check
+  that **every live cue on the golden fixtures falls inside a hold the offline
+  `PhaseSegmenter` finds on the same input**, so the cue can never fire where
+  the analysis will say "no hold".
+- **Speech.** `AVSpeechSynthesizer` on an audio session of `.playback` with
+  `.duckOthers` and `.mixWithOthers`: background music keeps playing (it ducks
+  while a cue is said) and **an utterance is never interrupted** — the next cue
+  waits its turn, which the debounce keeps short. The rate is slightly slower
+  than the default so the words carry in a gym. The writer records **video
+  only**, so nothing spoken reaches the take's file today; if a microphone is
+  ever added to `RecordingWriter`, cues on the recording's audio are
+  acceptable (they are the point of the feature, not a leak).
+
+### Performance guard
+
+The recording must never drop a frame because of live mode, so live analysis
+drops **its own** frames first: at most one inference is ever in flight, new
+frames are *skipped* while it runs (never queued), and the capture queue never
+waits for MediaPipe. On top of that:
+
+- if the **average inference over a 2 s window exceeds 80 ms**, the live rate
+  **halves** (10 → 5 → 4 fps, floor 4);
+- if **any frame is dropped from the recording** (`didDrop`), the live rate
+  halves too.
+
+Every halving is logged: `Handstand: live mode <reason> — rate halved to
+N fps`.
+
+### The per-take numbers
+
+The sidecar (`20260928-143059.json`) gains five **optional** keys — schema
+stays 1, and a take from a build without live mode reads exactly as before:
+
+```json
+{"schema": 1, "hold_type": "line", "recorded_at": "2026-09-28T14:30:59Z",
+ "app_version": "0.1.0",
+ "live_fps_target": 5.0, "live_fps_achieved": 4.8, "avg_inference_ms": 96.3,
+ "recording_frames_dropped": 0,
+ "cues_spoken": [{"t_ms": 1240, "cue": "line_hold"},
+                 {"t_ms": 6020, "cue": "time_mark_5"}]}
+```
+
+- `live_fps_target` — the live rate in force at the end of the take (the
+  guard may have halved it mid-take), `live_fps_achieved` — the live frames
+  actually analysed over the take's length.
+- `avg_inference_ms` — what one live inference cost on average.
+- `recording_frames_dropped` — what the *recording* lost (the number the
+  guard exists to keep at 0).
+- `cues_spoken` — every cue spoken during the take: `t_ms` into the take and
+  the cue's stable name (`line_hold`, `time_mark_5`, `step_back`, …), not the
+  words, which you may reword in `CueText`.
+
+They are shown in the session screen's **Details** disclosure (chainlink #93),
+and they exist to tune one question: *how much feedback is too much?*
 
 ## History
 
@@ -527,6 +635,34 @@ Recordings land in `Application Support/Recordings/<yyyyMMdd-HHmmss>.mov`
 on the phone and stay there — nothing is uploaded, and the folder is
 deliberately *not* excluded from an iCloud backup.
 
+## Testing live mode on the phone (the "Live mode test" checklist)
+
+The simulator has no camera, so the cues are felt on the iPhone itself
+(sideload as above). Five things to check:
+
+1. **Record a line hold with voice on.** Open **Record** with **Voice cues**
+   on (gear on Home), kick up into a line and hold it for a few seconds: you
+   must hear **"Line. Hold it."** once, about half a second *after* you are
+   straight — and only once for that hold. The same words appear as the small
+   banner under the border.
+2. **Check the cue timing.** The cue must come when you are actually in the
+   line (not on the way up, not after you come down), a brief wobble must not
+   produce a second cue, and **Analyse** on that take must still find the hold
+   the cue announced — the analysis stays the authority on what you held.
+3. **Try silent mode.** Turn **Voice cues** off: nothing is spoken during the
+   attempt, and a pre-attempt framing hint (its own toggle) is still shown as
+   a banner. With the phone's own mute switch on, check whether the cues are
+   still audible (the `.playback` session says they should be) and that the
+   banner always carries the words anyway.
+4. **Try time marks.** Turn **Time marks** on and hold a line past 5 s: you
+   should hear "Five." (and "Ten." past 10 s), each once, and never a mark
+   while you are not in the line.
+5. **Read the live stats in Details.** Open the take from **History** and
+   expand **Details**: `Live rate` (target → achieved fps), `Live inference`
+   (ms), `Recording dropped` (frames — should read 0) and `Cues` with each
+   cue's name and second. The same numbers are in the sidecar
+   (`<take>.json`) for `jq`.
+
 ## Testing analysis on the phone
 
 Analysis needs a real recording and the Vision model on real frames, so
@@ -579,6 +715,7 @@ this checklist is for the iPhone (sideload as above):
    with one tap.
 
 Everything stays on the phone: no networking, no analytics, recordings are
-not uploaded anywhere. The app ships the home, record, history, analysis,
-stress-diagram overlay, summary (heat strip, worst moment, cues), annotated
-video export, video-pick and about screens.
+not uploaded anywhere. The app ships the home, settings, record (with live
+cues, chainlink #91), history, analysis, stress-diagram overlay, summary
+(heat strip, worst moment, cues), annotated video export, video-pick and
+about screens.

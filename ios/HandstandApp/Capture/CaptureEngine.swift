@@ -4,20 +4,22 @@ import Foundation
 import HandstandCore
 
 /// The AVFoundation half of the Record screen: the session, the explicit
-/// format choice, the sample buffers, the writer, and the scheduling of the
-/// framing checks.
+/// format choice, the sample buffers, the writer, the scheduling of the
+/// framing checks and the hand-off to the live cue pipeline (chainlink #91).
 ///
 /// Everything runs on `queue` (which is also the session's sample-buffer
-/// queue) or on `analysisQueue` (Vision) — never the main actor. The main
-/// actor only ever sees this object through the three `@Sendable` callbacks,
-/// which hop themselves; that is what makes the `@unchecked Sendable` below
-/// honest: every stored property is confined to `queue` except
-/// `lastAnalysisTime`, which is confined to `analysisQueue`.
+/// queue) or on `analysisQueue` (Vision, and MediaPipe for the cues) — never
+/// the main actor. The main actor only ever sees this object through the
+/// `@Sendable` callbacks, which hop themselves; that is what makes the
+/// `@unchecked Sendable` below honest: every stored property is confined to
+/// `queue` except `lastAnalysisTime`, which is confined to `analysisQueue`,
+/// and the live pipeline, whose own state is documented in `LivePose.swift`.
 ///
-/// The same buffers do both jobs: each frame is appended to the file (when
-/// recording) and, at most ``analysisInterval`` apart, handed to the framing
-/// guide — which is why this is a data output rather than
-/// `AVCaptureMovieFileOutput`, whose frames nothing else can see.
+/// The same buffers do all three jobs: each frame is appended to the file
+/// (when recording) and, at most ``analysisInterval`` apart, handed to the
+/// framing guide — plus, at the live rate, to the cue pipeline — which is why
+/// this is a data output rather than `AVCaptureMovieFileOutput`, whose frames
+/// nothing else can see.
 final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
     /// The capture session the preview layer displays and the frames come
     /// from. Configured on `queue`, read by the preview on the main actor —
@@ -41,22 +43,33 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var writer: RecordingWriter?
     private var pendingURL: URL?
 
+    /// The live cue pipeline (chainlink #91), `nil` in a build without the
+    /// pose model — then there are no cues, and nothing else changes.
+    /// Read and written on `queue` only.
+    private var live: LivePosePipeline?
+
     /// Analysis-queue only: the presentation time of the last frame the
     /// guide was asked about.
     private var lastAnalysisTime = CMTime.invalid
 
     private let onFraming: @Sendable (FramingStatus) -> Void
+    private let onLive: @Sendable (LiveFrame) -> Void
+    private let onRecordingFrameDropped: @Sendable () -> Void
     private let onRecordingFinished: @Sendable (Result<URL, any Error>) -> Void
     private let onFailure: @Sendable (String) -> Void
 
     init(
         device: AVCaptureDevice,
         onFraming: @escaping @Sendable (FramingStatus) -> Void,
+        onLive: @escaping @Sendable (LiveFrame) -> Void,
+        onRecordingFrameDropped: @escaping @Sendable () -> Void,
         onRecordingFinished: @escaping @Sendable (Result<URL, any Error>) -> Void,
         onFailure: @escaping @Sendable (String) -> Void
     ) {
         self.device = device
         self.onFraming = onFraming
+        self.onLive = onLive
+        self.onRecordingFrameDropped = onRecordingFrameDropped
         self.onRecordingFinished = onRecordingFinished
         self.onFailure = onFailure
         super.init()
@@ -193,6 +206,24 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if let connection = output.connection(with: .video), connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
         }
+
+        // The live cue pipeline (chainlink #91): built once, here, so it
+        // exists before the first frame arrives and only when the pose model
+        // is in the bundle (it never is in a fresh clone — `*.task` is
+        // git-ignored). Without it the app records exactly as it did before;
+        // it just never speaks.
+        if live == nil {
+            if let modelURL = PoseBackend.mediapipeModelURL {
+                live = LivePosePipeline(
+                    modelURL: modelURL,
+                    queue: analysisQueue,
+                    rate: LiveRateController(),
+                    onFrame: onLive
+                )
+            } else {
+                NSLog("Handstand: no live cues (pose_landmarker_full.task is not in the bundle)")
+            }
+        }
         return true
     }
 
@@ -250,13 +281,38 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         //    analysis queue, where the timestamps it compares are read in
         //    order.
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let frame = FramingFrame(
-            buffer: pixelBuffer,
-            time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        )
+        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let frame = FramingFrame(buffer: pixelBuffer, time: time)
         analysisQueue.async { [weak self] in
             self?.analyse(frame)
         }
+
+        // 3. To the live cue pipeline (chainlink #91): it throttles itself on
+        //    this queue and skips frames while an inference is in flight, so
+        //    this hand-off is a timestamp and nothing else — the delegate
+        //    queue never waits for MediaPipe.
+        live?.offer(pixelBuffer, tMs: Self.milliseconds(time))
+    }
+
+    /// A frame dropped by the data output — `alwaysDiscardsLateVideoFrames`
+    /// keeping the queue honest. Only a drop from the *recording* counts (the
+    /// performance guard's second trigger, and a sidecar number): a drop
+    /// nobody was writing to disk is not a take losing a frame.
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didDrop sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard writer != nil else { return }
+        onRecordingFrameDropped()
+        live?.noteRecordingDrop()
+    }
+
+    /// A presentation timestamp in milliseconds on the capture clock —
+    /// monotonic, variable frame rate, the clock `LiveLineDetector` measures
+    /// its onset and loss in.
+    private static func milliseconds(_ time: CMTime) -> Int {
+        Int((CMTimeGetSeconds(time) * 1000).rounded())
     }
 
     /// Analysis-queue only: run the check if this frame is far enough past
