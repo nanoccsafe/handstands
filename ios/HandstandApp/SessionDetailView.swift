@@ -75,6 +75,13 @@ struct SessionDetailView: View {
     /// file keeps the last run's numbers.
     @State private var diagnostics: AnalysisDiagnostics?
 
+    /// The recording's own sidecar (chainlink #66), read for the live-cue
+    /// rows of Details (chainlink #91): what the phone said and how fast it
+    /// thought while the camera rolled. `nil` for a take with no sidecar, or
+    /// one written before live mode — which is exactly when those rows stay
+    /// home.
+    @State private var sidecar: RecordingMetadata?
+
     /// Is a run in flight — the state the screen has to stay awake for.
     private var isAnalysing: Bool {
         if case .running = service.state { return true }
@@ -252,12 +259,22 @@ struct SessionDetailView: View {
             // of diagnostics written beside this recording, behind one
             // disclosure so they stay out of the way until somebody wants
             // them — the wall time, the frame counts, the reasons the
-            // analysis could not see into, and the holds.
-            if let diagnostics {
+            // analysis could not see into, and the holds. Live mode's own
+            // rows (chainlink #91) ride in the same disclosure, from the
+            // recording's sidecar: the live rate, what an inference cost,
+            // how many frames the recording dropped, and what was said.
+            if diagnostics != nil || hasLiveRows {
                 Section {
                     DisclosureGroup("Details") {
-                        diagnosticsRows(diagnostics)
-                            .font(.footnote)
+                        VStack(alignment: .leading, spacing: 6) {
+                            if let diagnostics {
+                                diagnosticsRows(diagnostics)
+                            }
+                            if let sidecar {
+                                liveRows(sidecar)
+                            }
+                        }
+                        .font(.footnote)
                     }
                 }
             }
@@ -391,9 +408,55 @@ struct SessionDetailView: View {
 
     /// The diagnostics file beside this movie: `nil` when there is none —
     /// never analysed, or a take from before the file existed — which is
-    /// exactly when there is no Details section to show.
+    /// exactly when there is no Details section to show. The recording's
+    /// sidecar comes along for the ride: it is written with the take, so it
+    /// is there whenever the video is (and it, not the diagnostics, is what
+    /// carries live mode's rows).
     private func loadDiagnostics() {
-        diagnostics = AnalysisDiagnostics.read(for: store.movieURL(for: session))
+        let url = store.movieURL(for: session)
+        diagnostics = AnalysisDiagnostics.read(for: url)
+        sidecar = try? RecordingMetadata.read(for: url)
+    }
+
+    /// Does the sidecar carry anything live mode wrote (chainlink #91)? Then
+    /// **Details** exists even for a take nobody has analysed yet — the live
+    /// numbers are written with the recording, not with the analysis.
+    private var hasLiveRows: Bool {
+        guard let sidecar else { return false }
+        return sidecar.liveFpsTarget != nil
+            || sidecar.recordingFramesDropped != nil
+            || !(sidecar.cuesSpoken ?? []).isEmpty
+    }
+
+    /// The live rows of Details (chainlink #91): the tuning numbers from the
+    /// recording's own sidecar. Each one is optional, so a take from a build
+    /// without live mode shows only what it actually has.
+    private func liveRows(_ m: RecordingMetadata) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let target = m.liveFpsTarget {
+                // The rate the take ended at, and what it actually managed:
+                // the gap between them is what the performance guard did.
+                let rate = m.liveFpsAchieved.map { String(format: "%.1f → %.1f fps", target, $0) }
+                    ?? String(format: "%.1f fps", target)
+                LabeledContent("Live rate", value: rate)
+            }
+            if let inference = m.avgInferenceMs {
+                LabeledContent("Live inference", value: String(format: "%.1f ms", inference))
+            }
+            if let dropped = m.recordingFramesDropped {
+                LabeledContent("Recording dropped", value: "\(dropped) frames")
+            }
+            if let cues = m.cuesSpoken, !cues.isEmpty {
+                Text(
+                    "Cues: "
+                        + cues.map { cue in
+                            "\(cue.cue) \(String(format: "%.1f", Double(cue.tMs) / 1000)) s"
+                        }
+                        .joined(separator: " · ")
+                )
+                .foregroundStyle(.secondary)
+            }
+        }
     }
 
     /// The rows of the Details disclosure: the diagnostics read compactly,

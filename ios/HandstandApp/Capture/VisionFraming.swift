@@ -86,6 +86,12 @@ struct FramingAnalyzer {
 
     private let context = CIContext(options: [.cacheIntermediates: false])
 
+    /// A fresh analyzer: just its `CIContext`. The explicit initializer is
+    /// here because `context` is private — without one, the implicit
+    /// memberwise initializer would be private too, and the live cue pipeline
+    /// (chainlink #91) builds one of these as well to downscale with.
+    init() {}
+
     /// The verdict for one camera frame, or `nil` when the frame could not
     /// be prepared at all — the caller keeps the previous status rather than
     /// flashing red at a glitch.

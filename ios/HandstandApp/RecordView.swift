@@ -13,6 +13,8 @@ import UIKit
 /// Two things the screen owns beyond the picture: the framing message under
 /// the border (from `HandstandCore`'s `FramingCheck`), and the screen staying
 /// awake while it is visible — a phone that locks mid-attempt loses the take.
+/// Live mode (chainlink #91) adds a third: the cue banner, the words the
+/// voice is saying for as long as they are saying them.
 struct RecordView: View {
     @State private var model = CaptureService()
     @Environment(\.dismiss) private var dismiss
@@ -25,7 +27,22 @@ struct RecordView: View {
     /// shows Line.
     @AppStorage("holdType") private var holdTypeRaw: String = HoldType.default.rawValue
 
+    // The live cue toggles (chainlink #91): the same `@AppStorage` keys the
+    // gear on Home writes, so a change there takes effect on the next tick
+    // here without leaving the screen.
+    @AppStorage(CueSettingsStorage.voiceCuesKey)
+    private var voiceCues = CueSettingsStorage.defaults.voiceCues
+    @AppStorage(CueSettingsStorage.timeMarksKey)
+    private var timeMarks = CueSettingsStorage.defaults.timeMarks
+    @AppStorage(CueSettingsStorage.framingHintsKey)
+    private var framingHints = CueSettingsStorage.defaults.framingHints
+
     private var holdType: HoldType { HoldType.resolved(holdTypeRaw) }
+
+    /// The toggles as the scheduler wants them.
+    private var cueSettings: CueSettings {
+        CueSettings(voiceCues: voiceCues, timeMarks: timeMarks, framingHints: framingHints)
+    }
 
     var body: some View {
         ZStack {
@@ -50,6 +67,7 @@ struct RecordView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             model.holdType = holdType
+            model.cueSettings = cueSettings
             // History (chainlink #51): the store a finished take is
             // recorded into. Without a folder there is no store — the video
             // would not be writable either, and `reconcile()` on the
@@ -58,6 +76,11 @@ struct RecordView: View {
                 model.sessionStore = SessionStore(context: context, recordingsDirectory: directory)
             }
             await model.start()
+        }
+        .onChange(of: cueSettings) { _, settings in
+            // The gear on Home writes the same keys; keep the running
+            // scheduler in step with them.
+            model.cueSettings = settings
         }
         .onChange(of: holdType) { _, selected in
             // Keep the model in step with `@AppStorage`, so the take that
@@ -115,6 +138,20 @@ struct RecordView: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                     .background(.ultraThinMaterial, in: Capsule())
+
+                // The cue, as words (chainlink #91): the same one the voice
+                // is saying, for 2 s — the half that works with the sound
+                // off. Silent mode shows exactly what a gym hears.
+                if let cue = model.cueBanner {
+                    Text(CueText.phrase(for: cue))
+                        .font(.subheadline.weight(.semibold))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .transition(.opacity)
+                        .accessibilityLabel("Cue: \(CueText.phrase(for: cue))")
+                }
 
                 Spacer()
 

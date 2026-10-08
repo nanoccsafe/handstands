@@ -53,6 +53,15 @@ struct ContentView: View {
             .padding(.horizontal, 24)
             .navigationTitle("Handstand")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    // Live cues on and off (chainlink #91): the gear opens the
+                    // three toggles and the philosophy line under them.
+                    NavigationLink {
+                        SettingsView()
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink("About") {
                         AboutView()
