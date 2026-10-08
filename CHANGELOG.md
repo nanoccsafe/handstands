@@ -207,6 +207,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Live mode stage 1: spoken cue when a line hold is achieved (TTS), critique stays post-hold (#91)
 - Analysis diagnostics (small JSON per session) + explain 'No hold found' with the reason (#93)
 - ingest: Label Studio login posts to /user-login/ (404); dedupe imports; --import-only (#89)
 - Weekly ingest: inbox folder -> catalogue -> full pipeline -> hold-shape review queue (#86)
