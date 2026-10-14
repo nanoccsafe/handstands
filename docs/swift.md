@@ -928,8 +928,10 @@ How a run goes, in order:
    flipped to top-left, then the strip (`SessionSummary.heatStrip`,
    capped at the analysed frame count so a short clip's strip has no bins
    nothing fell into) along the bottom 3 %, then the CoreText footer
-   bottom-left: "Handstand · \<yyyy-mm-dd\>", plus "Score 78" when the clip
-   has one.
+   bottom-left: "Handstand · \<yyyy-mm-dd\>" — the day `AnnotatedExport`'s
+   `date:` was given, i.e. the session's **recording** date in the app
+   (#84), never the export's own day (`Date()` is only the default) — plus
+   "Score 78" when the clip has one.
 4. Audio, when present: the source's AAC passed through sample for sample,
    interleaved with the video by timestamp. Anything an `.mp4` cannot carry
    unchanged (LPCM, say) is dropped rather than transcoded — the video
@@ -954,7 +956,8 @@ source within a frame; **a pixel on a bone's midpoint is not grey** while a
 pixel far from the skeleton still is (the same check over the sideways
 source — orientation included); the strip's coloured bins are coloured; an
 unusable analysis still exports, with no bone pixels and a neutral strip;
-a cancellation deletes the partial file; and `DiagramRendererTests` puts
+a cancellation deletes the partial file; the footer stamps the **injected**
+date (the recording's, not the export's); and `DiagramRendererTests` puts
 red on a bad joint's own pixel in a small bitmap context, plus the radius
 rule and the strip's bins, playhead and neutral fill.
 

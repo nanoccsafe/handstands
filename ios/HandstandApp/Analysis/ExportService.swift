@@ -57,11 +57,15 @@ final class ExportService {
     /// (`.finished(output)`), cancelled (`.idle`) or failed (`.failed`, with
     /// a sentence a person can read).
     ///
+    /// `recordedAt` is what the footer stamps (chainlink #84): the
+    /// **session's** recording date, never the day the export ran.
+    ///
     /// The output file is **overwritten**, and a run that stops early leaves
     /// no file at all: `AnnotatedExport.run` deletes its own partial movie,
     /// which is what makes Cancel a button that costs nothing.
     func export(
-        movie: URL, analysis: Analysis, reference: ScoreReference?, to output: URL
+        movie: URL, analysis: Analysis, reference: ScoreReference?,
+        recordedAt: Date, to output: URL
     ) async {
         // One run at a time: the previous one stops and loses the right to
         // write anything.
@@ -70,7 +74,8 @@ final class ExportService {
         state = .running(progress: 0)
 
         let run = AnnotatedExport(
-            source: movie, analysis: analysis, reference: reference, output: output)
+            source: movie, analysis: analysis, reference: reference, output: output,
+            date: recordedAt)
         let runTask = Task {
             do {
                 try await run.run { progress in

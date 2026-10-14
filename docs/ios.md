@@ -578,9 +578,10 @@ bottom**, as an H.264 `.mp4`.
   mass drawn exactly as the overlay draws them — the same band colours and
   sizes, scaled to the video's resolution (`scale = videoHeight / 1000`) —
   the heat strip along the bottom 3 % with a white playhead at each frame's
-  time, and a small footer bottom-left: "Handstand · 2026-09-30", plus
-  "Score 78" when the clip has one. The source's audio comes along when the
-  container can carry it unchanged (AAC).
+  time, and a small footer bottom-left: "Handstand · 2026-09-30" — the
+  **recording's** date (`session.recordedAt`), never the day the export
+  ran (chainlink #84) — plus "Score 78" when the clip has one. The source's
+  audio comes along when the container can carry it unchanged (AAC).
 - **Where it is written**: the app's **Caches** directory, as
   `<basename>-annotated.mp4` — never in Recordings, never a History row,
   and nothing is uploaded anywhere.
@@ -710,9 +711,9 @@ this checklist is for the iPhone (sideload as above):
    Video**, then open the clip **in Photos** and check the **skeleton
    lines up with your body** (upright and unmirrored, even for a recording
    made sideways), the **strip runs along the bottom** with its white
-   playhead, and the footer shows the date. Leave the session and come
-   back: the export is gone from the phone's Caches and can be made again
-   with one tap.
+   playhead, and the footer shows the **recording's** date (not today's).
+   Leave the session and come back: the export is gone from the phone's
+   Caches and can be made again with one tap.
 
 Everything stays on the phone: no networking, no analytics, recordings are
 not uploaded anywhere. The app ships the home, settings, record (with live

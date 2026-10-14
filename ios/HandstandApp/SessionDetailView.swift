@@ -692,7 +692,8 @@ struct SessionDetailView: View {
     /// screen, into the app's Caches as `<basename>-annotated.mp4`
     /// (`SessionStore`'s own spelling, so `delete` removes exactly this
     /// file). Anything a previous export left behind is deleted first, so
-    /// two exports never share a file.
+    /// two exports never share a file. The footer stamps this session's
+    /// own recording date, not the day of the export (chainlink #84).
     private func exportVideo() {
         guard let analysis = diagramAnalysis else { return }
         let output = store.annotatedExportURL(for: session)
@@ -701,7 +702,8 @@ struct SessionDetailView: View {
         let movie = store.movieURL(for: session)
         Task {
             await exporter.export(
-                movie: movie, analysis: analysis, reference: reference, to: output)
+                movie: movie, analysis: analysis, reference: reference,
+                recordedAt: session.recordedAt, to: output)
         }
     }
 
