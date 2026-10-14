@@ -166,6 +166,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   annotations (#8)
 
 ### Fixed
+- Two ingest runs on the same day no longer overwrite each other's report and
+  tasks files (#90): the 2026-10-04 morning run (23 clips) and the evening run
+  (10 clips) both wrote `data/reports/ingest/2026-10-04.txt` and
+  `2026-10-04_hold_shapes_tasks.json`, so the first run's report and tasks were
+  replaced by the second's. Every run's outputs (the summary report, the
+  hold-shape import and the keypoint import) are now named
+  `<date>_<HHMMSS>` — the run's start time — with the smallest free `_2`, `_3`
+  … appended when even that name is taken (two runs in the same second), so an
+  earlier run's files are never replaced; all three files of one run share one
+  tag, and the summary always names the exact paths it wrote
 - The weekly ingest's Label Studio import logs in for real now (#89): the
   credentials were POSTed to `/user-login/`, a URL Label Studio 1.23 does not
   have, so the first real run (2026-10-04) died at the login with `HTTP 404`
@@ -209,6 +219,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 - Live mode stage 1: spoken cue when a line hold is achieved (TTS), critique stays post-hold (#91)
 - Analysis diagnostics (small JSON per session) + explain 'No hold found' with the reason (#93)
+- ingest: per-run report/tasks names `<date>_<HHMMSS>`, never overwritten (#90)
 - ingest: Label Studio login posts to /user-login/ (404); dedupe imports; --import-only (#89)
 - Weekly ingest: inbox folder -> catalogue -> full pipeline -> hold-shape review queue (#86)
 - MediaPipe pose backend in the app (default, per the bake-off), --rotate best parity (#45)
