@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Catalogue auto-fill + reference review project (line holds) (#94)
 - Left/right side correction from nose direction + inversion (side views) (#88)
 - ingest: same-day runs overwrite the report and the tasks file (#90)
 - Export footer: stamp the recording date, not the export date (#84)
