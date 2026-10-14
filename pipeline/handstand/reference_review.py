@@ -33,7 +33,7 @@ CLI::
 
     cd pipeline
     uv run python -m handstand.reference_review fill [--dry-run]
-    uv run python -m handstand.reference_review prelabel
+    uv run python -m handstand.reference_review prelabel [--min-duration SECONDS]
     uv run python -m handstand.reference_review import <export.json>
 """
 
@@ -78,6 +78,7 @@ __all__ = [
     "LABEL_COLUMNS",
     "LABELS_CSV_NAME",
     "LOCAL_FILES_URL",
+    "MIN_DURATION_S",
     "QUANTILES",
     "REFERENCE_CHOICE",
     "TASKS_FILENAME",
@@ -127,6 +128,13 @@ BACKUPS_DIRNAME = "backups"
 
 #: The fractions of a hold the review shows, in order: quarter, middle, three-quarters.
 QUANTILES: tuple[int, ...] = (25, 50, 75)
+
+#: The shortest hold that is worth reviewing, in seconds. A hold under this can
+#: never be the user's reference (the reference build wants a steady hold), so
+#: ``prelabel`` queues no task and writes no frames for it — of the real line
+#: holds, only a minority last this long, and the rest would waste the review.
+#: ``prelabel --min-duration 0`` queues every line hold.
+MIN_DURATION_S = 3.0
 
 #: ``from_name``/``toName`` names of the two config choices; the import matches
 #: a result by these names.
@@ -607,7 +615,8 @@ def build_task(
 class PrelabelReport:
     """What one pre-label run produced."""
 
-    #: Line holds considered (after skipping missing clips).
+    #: Line holds queued: after skipping missing clips and holds under
+    #: :attr:`min_duration_s`.
     holds: int
     #: The Label Studio tasks, longest hold first.
     tasks: list[dict[str, Any]]
@@ -617,6 +626,10 @@ class PrelabelReport:
     frames_skipped: int
     #: ``(clip_id, reason)`` for every clip whose video could not be read.
     clips_skipped: list[tuple[str, str]]
+    #: The shortest hold the run queued, in seconds.
+    min_duration_s: float
+    #: Line holds the minimum left out: no task and no frames.
+    left_out: int
     frames_dir: pathlib.Path
     json_path: pathlib.Path
     config_path: pathlib.Path
@@ -633,14 +646,19 @@ def prelabel(
     videos: str | pathlib.Path | None = None,
     out_json: str | pathlib.Path | None = None,
     config_path: str | pathlib.Path | None = None,
+    min_duration: float = MIN_DURATION_S,
     open_video: Callable[[Any], Any] | None = None,
 ) -> PrelabelReport:
     """Write three frames per line hold and the Label Studio import for the review.
 
     The holds are the **line** holds of ``hold_summary.csv`` whose clip is not
-    flagged ``missing`` in the catalogue, longest first. For each of the 25 %,
-    50 % and 75 % points of ``[hold_start_ms, hold_end_ms]`` the nearest frame is
-    decoded in display orientation — the sampler's own decoder — and written as
+    flagged ``missing`` in the catalogue and whose duration is at least
+    ``min_duration`` seconds (:data:`MIN_DURATION_S` by default), longest first.
+    A shorter hold can never be the reference, so it gets no task and no frames;
+    its count is :attr:`PrelabelReport.left_out`, and ``min_duration=0`` queues
+    every line hold. For each of the 25 %, 50 % and 75 % points of
+    ``[hold_start_ms, hold_end_ms]`` the nearest frame is decoded in display
+    orientation — the sampler's own decoder — and written as
     ``<clip_id>_h<hold_id>_<q>.jpg``. A frame file that already exists is left
     alone; a clip whose video is missing or unreadable is skipped with a note
     rather than ending the run.
@@ -655,7 +673,9 @@ def prelabel(
     )
     missing = _missing_clips(root)
     holds = [hold for hold in holds if str(hold["clip_id"]) not in missing]
-    holds = sorted(holds, key=_hold_duration, reverse=True)
+    eligible = [hold for hold in holds if _hold_duration(hold) >= min_duration]
+    left_out = len(holds) - len(eligible)
+    holds = sorted(eligible, key=_hold_duration, reverse=True)
 
     destination = frames_dir(root)
     destination.mkdir(parents=True, exist_ok=True)
@@ -743,6 +763,8 @@ def prelabel(
         frames_written=frames_written,
         frames_skipped=frames_skipped,
         clips_skipped=clips_skipped,
+        min_duration_s=min_duration,
+        left_out=left_out,
         frames_dir=destination,
         json_path=json_out,
         config_path=config_out,
@@ -757,6 +779,8 @@ def summarise_prelabel(report: PrelabelReport) -> str:
         f"present -> {report.frames_dir}",
         f"  tasks: {report.json_path}",
         f"  config: {report.config_path}",
+        f"  {report.left_out} line hold(s) shorter than "
+        f"{report.min_duration_s:.1f} s left out",
     ]
     if report.clips_skipped:
         lines.append(f"  {len(report.clips_skipped)} clip(s) skipped:")
@@ -1098,6 +1122,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Label Studio import to write (default: <data_dir>/{TASKS_FILENAME})",
     )
     pre.add_argument(
+        "--min-duration",
+        type=float,
+        default=MIN_DURATION_S,
+        metavar="SECONDS",
+        help=(
+            "skip line holds shorter than this many seconds; they can never be "
+            f"the reference (default: {MIN_DURATION_S:g}; 0 keeps every hold)"
+        ),
+    )
+    pre.add_argument(
         "--config",
         type=pathlib.Path,
         default=None,
@@ -1147,6 +1181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         videos=args.videos,
                         out_json=args.out,
                         config_path=args.config,
+                        min_duration=args.min_duration,
                     )
                 )
             )

@@ -719,15 +719,21 @@ prints the same counts and writes nothing.
 
 ```bash
 uv run python -m handstand.reference_review prelabel
+uv run python -m handstand.reference_review prelabel --min-duration 0
 ```
 
 This takes the **line** holds of `data/features/mediapipe/hold_summary.csv`
-(skipping clips flagged `missing` in the catalogue), longest first, and writes
-three frames per hold at **25 %, 50 % and 75 %** of
-`[hold_start_ms, hold_end_ms]` (nearest frame, the sampler's own decoder) as
-`data/label_frames_reference/<clip_id>_h<hold_id>_<q>.jpg`. A frame file that
-already exists is left alone; a clip whose video is missing is skipped with a
-note rather than ending the run. One Label Studio task per hold goes to
+(skipping clips flagged `missing` in the catalogue and holds shorter than
+`--min-duration`), longest first, and writes three frames per hold at
+**25 %, 50 % and 75 %** of `[hold_start_ms, hold_end_ms]` (nearest frame, the
+sampler's own decoder) as
+`data/label_frames_reference/<clip_id>_h<hold_id>_<q>.jpg`. A hold below
+`--min-duration` (default `3.0` s, `MIN_DURATION_S` in the module) can never be
+the reference, so it gets no task and no frames; the summary prints how many
+were left out (`N line hold(s) shorter than 3.0 s left out`). Pass
+`--min-duration 0` to review every line hold. A frame file that already exists
+is left alone; a clip whose video is missing is skipped with a note rather than
+ending the run. One Label Studio task per hold goes to
 `data/label_studio_reference_review.json`; its `info` header reads
 `clip / hold / duration / line dev <line_deviation_median> / sway sd
 <com_sway_sd>` (two decimals, `n/a` when a feature was never measured). There is

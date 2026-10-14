@@ -326,12 +326,16 @@ def test_prelabel_prelabels_only_line_holds_longest_first(
     )
 
     report = prelabel(
-        data=data, videos=videos, config_path=tmp_path / "reference_review_config.xml"
+        data=data,
+        videos=videos,
+        min_duration=0,
+        config_path=tmp_path / "reference_review_config.xml",
     )
 
     # CLIP's two line holds (0.6 s then 0.3 s); the tuck, the missing and the
     # video-less clips are not.
     assert report.holds == 3  # CLIP, MISSING and GONE line holds survive the shape filter
+    assert report.left_out == 0  # --min-duration 0 leaves nothing out
     assert report.tasks_written == 2
     # Only the video-less clip is skipped; the missing clip never entered the list.
     assert [clip for clip, _ in report.clips_skipped] == [GONE_CLIP]
@@ -385,11 +389,11 @@ def test_prelabel_skips_existing_frames_and_rewrites_tasks(
         ],
     )
     config = tmp_path / "config.xml"
-    first = prelabel(data=data, videos=videos, config_path=config)
+    first = prelabel(data=data, videos=videos, min_duration=0, config_path=config)
     assert first.frames_written == 6
     assert first.frames_skipped == 0
 
-    second = prelabel(data=data, videos=videos, config_path=config)
+    second = prelabel(data=data, videos=videos, min_duration=0, config_path=config)
     assert second.frames_written == 0
     assert second.frames_skipped == 6
     assert second.tasks_written == first.tasks_written
@@ -402,7 +406,7 @@ def test_prelabel_config_is_single_variable_per_value(
     data, videos = workspace
     write_catalogue(data / "catalogue.csv", [{"clip_id": CLIP, "filename": VIDEO_NAME}])
     config = tmp_path / "config.xml"
-    report = prelabel(data=data, videos=videos, config_path=config)
+    report = prelabel(data=data, videos=videos, min_duration=0, config_path=config)
 
     root = ET.parse(config).getroot()
     assert root.tag == "View"
@@ -439,6 +443,59 @@ def test_prelabel_config_is_single_variable_per_value(
     assert reference_review.default_config_path().read_text(encoding="utf-8") == (
         reference_review.config_xml()
     )
+
+
+def test_prelabel_min_duration_leaves_short_holds_out(
+    workspace: tuple[pathlib.Path, pathlib.Path], tmp_path: pathlib.Path
+) -> None:
+    """A hold under MIN_DURATION_S gets no task and no frames; 0 keeps all."""
+    data, videos = workspace
+    write_csv(
+        data / "features" / "mediapipe" / "hold_summary.csv",
+        HOLD_COLUMNS,
+        [hold(CLIP, 0, 0, 5000), hold(CLIP, 1, 0, 1000)],  # 5.0 s and 1.0 s
+    )
+    write_hold_shapes(
+        data / "labels" / "hold_shapes.csv",
+        [
+            {"clip_id": CLIP, "hold_id": 0, "shape": "line", "predicted_shape": "line"},
+            {"clip_id": CLIP, "hold_id": 1, "shape": "line", "predicted_shape": "line"},
+        ],
+    )
+    write_catalogue(data / "catalogue.csv", [{"clip_id": CLIP, "filename": VIDEO_NAME}])
+    config = tmp_path / "config.xml"
+
+    report = prelabel(data=data, videos=videos, config_path=config)
+
+    assert reference_review.MIN_DURATION_S == 3.0
+    assert report.min_duration_s == reference_review.MIN_DURATION_S
+    assert report.holds == 1  # only the 5.0 s hold is queued
+    assert report.left_out == 1  # the 1.0 s hold is left out
+    assert report.tasks_written == 1
+    assert [task["data"]["hold_id"] for task in report.tasks] == [0]
+    frames = sorted((data / FRAMES_DIRNAME).glob("*.jpg"))
+    assert [path.name for path in frames] == [
+        f"{CLIP}_h0_25.jpg",
+        f"{CLIP}_h0_50.jpg",
+        f"{CLIP}_h0_75.jpg",
+    ]
+    assert "1 line hold(s) shorter than 3.0 s left out" in reference_review.summarise_prelabel(
+        report
+    )
+
+    # --min-duration 0 queues every line hold, short ones included.
+    kept = prelabel(data=data, videos=videos, min_duration=0, config_path=config)
+    assert kept.left_out == 0
+    assert kept.holds == 2
+    assert kept.tasks_written == 2
+    assert sorted(task["data"]["hold_id"] for task in kept.tasks) == [0, 1]
+    assert len(sorted((data / FRAMES_DIRNAME).glob("*.jpg"))) == 6
+
+
+def test_min_duration_flag_defaults_to_the_constant() -> None:
+    parser = reference_review.build_arg_parser()
+    args = parser.parse_args(["prelabel"])
+    assert args.min_duration == reference_review.MIN_DURATION_S
 
 
 # --------------------------------------------------------------------------- #
