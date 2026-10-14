@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- ingest: same-day runs overwrite the report and the tasks file (#90)
 - Export footer: stamp the recording date, not the export date (#84)
 - Live mode stage 1: spoken cue when a line hold is achieved (TTS), critique stays post-hold (#91)
 - Analysis diagnostics (small JSON per session) + explain 'No hold found' with the reason (#93)
