@@ -44,8 +44,10 @@ public struct AnnotatedExport: Sendable {
 
     /// The palette and sizes — `.standard`, i.e. the on-screen overlay's.
     private let style = DiagramStyle.standard
-    /// The day stamped in the footer; `Date()` for a real export, injectable
-    /// so a test's footer is deterministic.
+    /// The day stamped in the footer: the **recording's** date in the app
+    /// (chainlink #84), never the export's own day — `Date()` is only the
+    /// fallback when nothing better is at hand, and what makes a test's
+    /// footer deterministic.
     private let date: Date
     /// The heat strip's bin count — the screen's own (chainlink #49), capped
     /// at the number of analysed frames so a short clip's strip has no bins
@@ -60,14 +62,13 @@ public struct AnnotatedExport: Sendable {
     ///     goes out, with no skeleton and a neutral strip.
     ///   - reference: the scoring reference the colours are severed against.
     ///   - output: the `.mp4` to write, replaced if it is already there.
-    public init(source: URL, analysis: Analysis, reference: ScoreReference?, output: URL) {
-        self.init(
-            source: source, analysis: analysis, reference: reference,
-            output: output, date: Date())
-    }
-
-    init(
-        source: URL, analysis: Analysis, reference: ScoreReference?, output: URL, date: Date
+    ///   - date: the day stamped in the footer — the **recording's** date
+    ///     when there is one to give (the app passes the session's
+    ///     `recordedAt`, chainlink #84); `Date()` — the export's own day —
+    ///     only as the default when the caller has nothing better.
+    public init(
+        source: URL, analysis: Analysis, reference: ScoreReference?, output: URL,
+        date: Date = Date()
     ) {
         self.source = source
         self.analysis = analysis
@@ -297,8 +298,11 @@ public struct AnnotatedExport: Sendable {
     }
 
     /// "Handstand · 2026-09-30", with the clip's score when it has one —
-    /// the footer's two facts, drawn bottom-left above the strip.
-    private func footerText() -> String {
+    /// the footer's two facts, drawn bottom-left above the strip. The day
+    /// is the `date` the export was built with — the recording's own date
+    /// in the app (chainlink #84) — formatted here so the tests can read
+    /// the sentence (`@testable`) without a pixel in sight.
+    func footerText() -> String {
         var parts = ["Handstand · \(Self.dateString(date))"]
         if let score = analysis.clipScore?.score, score.isFinite {
             parts.append("Score \(String(format: "%.0f", score))")

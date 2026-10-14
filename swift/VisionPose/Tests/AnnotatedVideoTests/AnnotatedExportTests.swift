@@ -2,7 +2,7 @@ import AVFoundation
 import CoreGraphics
 import XCTest
 
-import AnnotatedVideo
+@testable import AnnotatedVideo
 import HandstandCore
 
 // --------------------------------------------------------------------------- #
@@ -10,7 +10,8 @@ import HandstandCore
 // on the **pixel** it belongs to (upright source and quarter-turn source
 // alike — the orientation check is the whole point), the strip along the
 // bottom, an unusable analysis still exporting, and a cancellation that
-// leaves no file behind.
+// leaves no file behind — plus the footer stamping the **recording's** date,
+// not the export's (chainlink #84).
 //
 // Everything is synthetic: mid-grey frames written here, an analysis built
 // from hand-made `PostProcessInputFrame`s (`SyntheticClip`). The checks are
@@ -193,7 +194,51 @@ final class AnnotatedExportTests: XCTestCase {
             "the partial file is deleted")
     }
 
+    // MARK: - The footer's date
+
+    /// The footer stamps the date it is handed — the session's **recording**
+    /// date in the app (chainlink #84) — and never the day the export ran.
+    func testTheFooterStampsTheInjectedDate() {
+        let now = Date()
+        let recorded = Date(timeIntervalSince1970: 1_000_000_000)
+
+        let stamped = footerExport(date: recorded).footerText()
+        let exportedToday = footerExport(date: now).footerText()
+
+        XCTAssertEqual(
+            stamped, "Handstand · \(Self.stamp(recorded))",
+            "the footer's day is the injected (recording) date")
+        XCTAssertNotEqual(
+            stamped, exportedToday,
+            "a recording date from 2001 is not the day this test ran")
+        XCTAssertEqual(
+            exportedToday, "Handstand · \(Self.stamp(now))",
+            "the default the caller hands nothing better is Date() itself")
+    }
+
     // MARK: - Helpers
+
+    /// An export whose footer is exactly the "Handstand · \<date\>" sentence:
+    /// a clip nobody was measured in has no score to append (and this needs
+    /// no movie on disk — the footer never reads one).
+    private func footerExport(date: Date) -> AnnotatedExport {
+        AnnotatedExport(
+            source: URL(fileURLWithPath: "/tmp/no-such-clip.mov"),
+            analysis: SyntheticClip.nobodyAnalysis(), reference: nil,
+            output: URL(fileURLWithPath: "/tmp/no-such-export.mp4"),
+            date: date)
+    }
+
+    /// The stamp the footer must carry, spelled out with the export's own
+    /// rules (POSIX locale, gregorian calendar, `yyyy-MM-dd`, the machine's
+    /// own time zone) so the test pins the **date**, not the formatter.
+    private static func stamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
 
     /// Runs the export into `directory`'s `annotated.mp4` and hands back the
     /// output and the progress it reported.

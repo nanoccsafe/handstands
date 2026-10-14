@@ -41,7 +41,8 @@ final class ExportServiceTests: XCTestCase {
         let output = outputURL()
 
         await service.export(
-            movie: missingMovie(), analysis: analysis(), reference: nil, to: output)
+            movie: missingMovie(), analysis: analysis(), reference: nil,
+            recordedAt: Date(timeIntervalSince1970: 1_000_000_000), to: output)
 
         guard case .failed(let message) = service.state else {
             return XCTFail("expected .failed, got \(service.state)")
