@@ -1196,8 +1196,9 @@ def run_import_only(
     """Import an already-written tasks file, skipping what is already there (#89).
 
     The recovery for a failed ``--label-studio`` import: read the JSON a run
-    left behind (``data/reports/ingest/<date>_hold_shapes_tasks.json``), log
-    in, find the project by title and import only the tasks it does not have
+    left behind
+    (``data/reports/ingest/<date>_<HHMMSS>_hold_shapes_tasks.json``), log in,
+    find the project by title and import only the tasks it does not have
     yet. Running it twice — or after the lead imported the file by hand —
     therefore reports ``32 already present, 0 imported`` instead of queueing
     every hold a second time.
@@ -1285,6 +1286,37 @@ def _fail(failures: dict[str, dict[str, str]], step: str, key: str, message: str
     failures.setdefault(step, {})[key] = message
 
 
+#: The three files one run writes into ``data/reports/ingest`` under ONE tag:
+#: the summary report, the hold-shape review import and the keypoint import.
+_REPORT_SUFFIXES = (".txt", "_hold_shapes_tasks.json", "_keypoint_tasks.json")
+
+
+def _report_paths(
+    reports_dir: pathlib.Path, day: str, now: dt.datetime
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """The (report, hold-shape tasks, keypoint tasks) paths of ONE run.
+
+    Every run is named ``<date>_<HHMMSS>`` — its day and start time — so two
+    runs on the same day can never overwrite each other's files (#90): the
+    23-clip morning run and the 10-clip evening run each keep their report and
+    tasks file. When even that name is taken (two runs in the same second, or
+    a leftover file), the smallest free ``_2``, ``_3`` … is appended to the
+    tag. The names are chosen before anything is written, so an earlier run's
+    report or tasks file is never replaced.
+    """
+    stamp = now.strftime("%H%M%S")
+    tag = f"{day}_{stamp}"
+    index = 1
+    while any((reports_dir / f"{tag}{suffix}").exists() for suffix in _REPORT_SUFFIXES):
+        index += 1
+        tag = f"{day}_{stamp}_{index}"
+    return (
+        reports_dir / f"{tag}.txt",
+        reports_dir / f"{tag}_hold_shapes_tasks.json",
+        reports_dir / f"{tag}_keypoint_tasks.json",
+    )
+
+
 def run_ingest(
     *,
     data: str | pathlib.Path | None = None,
@@ -1299,6 +1331,7 @@ def run_ingest(
     env_path: str | pathlib.Path | None = None,
     step_overrides: Mapping[str, StepRunner] | None = None,
     today: str | None = None,
+    now: dt.datetime | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> IngestReport:
     """Do the whole weekly ingest (or, with ``dry_run``, only describe it).
@@ -1311,19 +1344,20 @@ def run_ingest(
     never stops the rest of the run.
 
     ``step_overrides`` replaces step runners (tests stub the model steps);
-    ``probe``/``http``/``env_path``/``today`` are the injectable seams for
-    ffprobe, the Label Studio HTTP, the credentials file and the report name.
+    ``probe``/``http``/``env_path``/``today``/``now`` are the injectable seams
+    for ffprobe, the Label Studio HTTP, the credentials file and the report
+    name (``<date>_<HHMMSS>``, so two runs on one day never overwrite each
+    other — #90).
     """
     say = progress if progress is not None else (lambda message: print(message, flush=True))
     root = pathlib.Path(data) if data is not None else data_dir()
     videos_root = pathlib.Path(videos) if videos is not None else videos_dir()
     inbox = videos_root / INBOX_DIRNAME
     catalogue_path = root / CATALOGUE_NAME
-    day = today or dt.date.today().isoformat()
+    moment = now if now is not None else dt.datetime.now()
+    day = today or moment.date().isoformat()
     reports_dir = root / REPORTS_DIRNAME / INGEST_DIRNAME
-    report_path = reports_dir / f"{day}.txt"
-    import_path = reports_dir / f"{day}_hold_shapes_tasks.json"
-    sample_path = reports_dir / f"{day}_keypoint_tasks.json"
+    report_path, import_path, sample_path = _report_paths(reports_dir, day, moment)
     failures: dict[str, dict[str, str]] = {}
 
     if not dry_run:

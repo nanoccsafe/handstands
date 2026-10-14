@@ -11,6 +11,7 @@ generated clip.
 from __future__ import annotations
 
 import csv
+import datetime as dt
 import http.server
 import json
 import pathlib
@@ -345,6 +346,7 @@ def test_a_take2_rename_is_catalogued_and_processed(tmp_path, capsys) -> None:
         probe=fake_probe,
         step_overrides=recorder(calls),
         today="2026-10-02",
+        now=dt.datetime(2026, 10, 2, 9, 30, 0),
     )
 
     assert code == 0
@@ -376,8 +378,9 @@ def test_a_take2_rename_is_catalogued_and_processed(tmp_path, capsys) -> None:
     for _step, clips in calls:
         assert set(clips) == expected_ids
 
-    # The report was written to data/reports/ingest/<date>.txt.
-    report_path = data / "reports" / "ingest" / "2026-10-02.txt"
+    # The report was written to data/reports/ingest/<date>_<HHMMSS>.txt (#90:
+    # the stamp keeps two runs on one day from overwriting each other).
+    report_path = data / "reports" / "ingest" / "2026-10-02_093000.txt"
     assert report_path.is_file()
     assert report_path.read_text(encoding="utf-8").startswith("weekly ingest 2026-10-02")
 
@@ -455,6 +458,110 @@ def test_dry_run_prints_everything_and_writes_nothing(tmp_path, capsys) -> None:
     assert sorted(p.name for p in inbox.iterdir()) == inbox_before
     assert plain.is_file() and twin.is_file() and jpeg.is_file()
     assert list(videos.glob("*.mp4")) == []
+
+
+# --------------------------------------------------------------------------- #
+# One report per RUN: the <date>_<HHMMSS> names (#90)
+# --------------------------------------------------------------------------- #
+
+
+def test_two_runs_on_one_day_keep_separate_reports_and_tasks_files(tmp_path, capsys) -> None:
+    """#90: a morning run and an evening run the same day never overwrite."""
+    data = tmp_path / "data"
+    videos = tmp_path / "videos"
+    inbox = videos / "inbox"
+    clip_a = write_clip(inbox, "WhatsApp Video 2026-10-04 at 9.00.00 AM.mp4", seed=20)
+    hold_a = catalogue_module.file_clip_id(clip_a)
+    write_hold_summary(
+        data / "features" / "mediapipe" / "hold_summary.csv",
+        [{**LINE_HOLD, "clip_id": hold_a}],
+    )
+
+    code = ingest.main(
+        ["--data", str(data), "--videos", str(videos)],
+        probe=fake_probe,
+        step_overrides=stub_model_steps(),
+        today="2026-10-04",
+        now=dt.datetime(2026, 10, 4, 10, 15, 0),
+    )
+    assert code == 0
+    first_out = capsys.readouterr().out
+    first_report = data / "reports" / "ingest" / "2026-10-04_101500.txt"
+    first_tasks = data / "reports" / "ingest" / "2026-10-04_101500_hold_shapes_tasks.json"
+    assert first_report.is_file()
+    assert first_tasks.is_file()
+    first_report_text = first_report.read_text(encoding="utf-8")
+    first_tasks_text = first_tasks.read_text(encoding="utf-8")
+
+    # The second run of the day: another clip, another batch of holds.
+    clip_b = write_clip(inbox, "WhatsApp Video 2026-10-04 at 5.00.00 PM.mp4", seed=21)
+    hold_b = catalogue_module.file_clip_id(clip_b)
+    write_hold_summary(
+        data / "features" / "mediapipe" / "hold_summary.csv",
+        [{**LINE_HOLD, "clip_id": hold_a}, {**TUCK_HOLD, "clip_id": hold_b}],
+    )
+
+    code = ingest.main(
+        ["--data", str(data), "--videos", str(videos)],
+        probe=fake_probe,
+        step_overrides=stub_model_steps(),
+        today="2026-10-04",
+        now=dt.datetime(2026, 10, 4, 17, 30, 0),
+    )
+    assert code == 0
+    second_out = capsys.readouterr().out
+    second_report = data / "reports" / "ingest" / "2026-10-04_173000.txt"
+    second_tasks = data / "reports" / "ingest" / "2026-10-04_173000_hold_shapes_tasks.json"
+
+    # Both runs' files exist side by side, and the first is exactly as run 1
+    # left it — the second run overwrote nothing.
+    assert second_report.is_file()
+    assert second_tasks.is_file()
+    assert first_report.read_text(encoding="utf-8") == first_report_text
+    assert first_tasks.read_text(encoding="utf-8") == first_tasks_text
+    assert json.loads(first_tasks_text) != json.loads(second_tasks.read_text(encoding="utf-8"))
+    # Each tasks file holds only its own run's hold.
+    assert [task["data"]["clip_id"] for task in json.loads(first_tasks_text)] == [hold_a]
+    second_task_list = json.loads(second_tasks.read_text(encoding="utf-8"))
+    assert [task["data"]["clip_id"] for task in second_task_list] == [hold_b]
+    # The summary of each run printed the actual paths it used.
+    assert str(first_report) in first_out
+    assert str(first_tasks) in first_out
+    assert str(second_report) in second_out
+    assert str(second_tasks) in second_out
+
+
+def test_report_paths_add_the_smallest_free_number_when_even_the_stamp_is_taken(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Same-second runs share the stamp: the fallback is _2, then _3 …"""
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    moment = dt.datetime(2026, 10, 4, 10, 15, 0)
+
+    first = ingest._report_paths(reports, "2026-10-04", moment)
+    for path in first:
+        path.write_text("x\n", encoding="utf-8")
+    second = ingest._report_paths(reports, "2026-10-04", moment)
+    for path in second:
+        path.write_text("y\n", encoding="utf-8")
+    third = ingest._report_paths(reports, "2026-10-04", moment)
+
+    assert [path.name for path in first] == [
+        "2026-10-04_101500.txt",
+        "2026-10-04_101500_hold_shapes_tasks.json",
+        "2026-10-04_101500_keypoint_tasks.json",
+    ]
+    # All three files of one run share the one tag, so a run stays findable.
+    assert [path.name for path in second] == [
+        "2026-10-04_101500_2.txt",
+        "2026-10-04_101500_2_hold_shapes_tasks.json",
+        "2026-10-04_101500_2_keypoint_tasks.json",
+    ]
+    assert third[0].name == "2026-10-04_101500_3.txt"
+    # Nothing written so far was touched.
+    assert first[0].read_text(encoding="utf-8") == "x\n"
+    assert second[0].read_text(encoding="utf-8") == "y\n"
 
 
 # --------------------------------------------------------------------------- #

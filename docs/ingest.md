@@ -8,7 +8,8 @@ handstand.ingest  ->  videos/inbox/*.mp4 moved into videos/
                       catalogue.csv appended (new rows only)
                       pose_mediapipe -> athlete -> postprocess -> phases
                         -> features -> hold_shapes prelabel   (new clips only)
-                      data/reports/ingest/<date>.txt + the hold-shape import
+                      data/reports/ingest/<date>_<HHMMSS>.txt + the hold-shape
+                        import (one set of files per run, never overwritten)
 ```
 
 ## Where to drop the clips
@@ -52,8 +53,8 @@ The real run, in order:
    already has an image or a reviewed row in `hold_shapes.csv` is never
    touched again, so a re-run only ever adds NEW holds. Without
    `--label-studio` the new tasks are written to
-   `data/reports/ingest/<date>_hold_shapes_tasks.json` and the summary says
-   where it is.
+   `data/reports/ingest/<date>_<HHMMSS>_hold_shapes_tasks.json` and the summary
+   says where it is.
 6. **Optional** — `--label-studio` imports those new tasks straight into the
    `handstand-hold-shapes` project (looked up **by title**, so no hard-coded
    project id) over the Label Studio API: session login + CSRF, credentials
@@ -65,14 +66,21 @@ The real run, in order:
    was imported by hand — never queues a hold twice (#89).
 7. **`--sample-frames N`** (default 0) additionally samples N keypoint-labelling
    frames per new clip and pre-labels them into a *separate* import file
-   (`data/reports/ingest/<date>_keypoint_tasks.json`).
+   (`data/reports/ingest/<date>_<HHMMSS>_keypoint_tasks.json`).
 
-The summary is printed and written to `data/reports/ingest/<date>.txt`: the
-new clips with their holds per clip and per predicted shape, duplicates,
+The summary is printed and written to `data/reports/ingest/<date>_<HHMMSS>.txt`:
+the new clips with their holds per clip and per predicted shape, duplicates,
 renames (old → new), failures per step, clips with a trainer present, clips
 with no hold, and the review to-do — N new holds to label, with the Label
 Studio link or the import file. Exit code 0 when everything succeeded, 1 when
 anything failed (the failures are listed).
+
+The `<HHMMSS>` stamp is the run's start time, and every file of one run
+(report, hold-shape import, keypoint import) carries the same stamp; if even
+that name is taken (two runs in the same second), the smallest free `_2`, `_3`
+… is appended. Two runs on the same day therefore never overwrite each
+other's report or tasks files (#90) — the summary always names the exact
+paths the run wrote.
 
 ## The rename rule: `(N)` is not a copy
 
@@ -97,12 +105,12 @@ smallest free ` (ingest N)` suffix instead — never overwritten, never skipped.
 
 ## What to review afterwards
 
-1. Read `data/reports/ingest/<date>.txt` — failures first, then the new clips
-   and the review to-do line.
+1. Read `data/reports/ingest/<date>_<HHMMSS>.txt` — failures first, then the
+   new clips and the review to-do line.
 2. Label the new holds: with `--label-studio` they are already in the
    `handstand-hold-shapes` project (project 3); otherwise import
-   `data/reports/ingest/<date>_hold_shapes_tasks.json` into it — through the
-   API with `--import-only` (see below) or by hand (Import → Import
+   `data/reports/ingest/<date>_<HHMMSS>_hold_shapes_tasks.json` into it —
+   through the API with `--import-only` (see below) or by hand (Import → Import
    predictions). Hotkeys 1–9
    are `line`, `straddle`, `split_stag`, `tuck`, `pike`, `other`,
    `not_a_hold`, `walk`, `mexican` — see `docs/labeling.md`.
@@ -162,13 +170,13 @@ touches nothing else — no inbox scan, no catalogue, no pipeline, no report:
 ```bash
 cd pipeline
 uv run python -m handstand.ingest \
-  --import-only data/reports/ingest/2026-10-04_hold_shapes_tasks.json --label-studio
+  --import-only data/reports/ingest/2026-10-04_170412_hold_shapes_tasks.json --label-studio
 ```
 
 It prints what it did:
 
 ```
-import-only data/reports/ingest/2026-10-04_hold_shapes_tasks.json
+import-only data/reports/ingest/2026-10-04_170412_hold_shapes_tasks.json
   project: handstand-hold-shapes (project 3) — http://localhost:8080/projects/3
   tasks: 32 in the file, 32 already present, 0 imported
 ```
