@@ -68,6 +68,16 @@ final class CaptureService {
     /// wall, steps, camera angle and phases are detected (#72).
     var holdType: HoldType = .default
 
+    /// Which wide-angle camera to use, pushed here from the Record screen's
+    /// `@AppStorage("cameraPosition")` (chainlink #95) — read the same way
+    /// the cue toggles are.
+    var cameraPosition: CameraPosition = .default
+
+    /// The camera the running engine actually opened: `cameraPosition` when
+    /// the device has it, otherwise the fallback. `nil` before the first
+    /// `start()`, and what the flip button takes the opposite of.
+    private var activePosition: CameraPosition?
+
     // MARK: - Live cues (chainlink #91): the state
 
     /// The cue toggles in force, pushed here from the Record screen's
@@ -180,14 +190,22 @@ final class CaptureService {
         didStart = true
         phase = .starting
 
-        // The simulator — and any device without a back wide camera — has no
-        // capture device at all. Say so instead of asking for a permission
-        // with nothing behind it (and instead of crashing on a nil device).
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+        // The camera the user chose (chainlink #95), falling back to the
+        // other wide-angle camera when this device does not have it. The
+        // simulator — and any device with neither camera — has no capture
+        // device at all: say so instead of asking for a permission with
+        // nothing behind it (and instead of crashing on a nil device).
+        guard
+            let position = Self.resolvedPosition(
+                preferred: cameraPosition, available: Self.availablePositions()),
+            let device = AVCaptureDevice.default(
+                .builtInWideAngleCamera, for: .video, position: position.avPosition)
+        else {
             unavailableMessage = "Camera not available on this device"
             phase = .unavailable
             return
         }
+        activePosition = position
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -214,7 +232,46 @@ final class CaptureService {
         // on the main actor, so the flag is exact.
         guard !isShutdown, !Task.isCancelled else { return }
 
-        let engine = CaptureEngine(
+        let engine = makeEngine(device: device)
+        self.engine = engine
+        session = engine.session
+        engine.start()
+        phase = .ready
+    }
+
+    /// Flip between the back and front wide-angle cameras (chainlink #95):
+    /// stop the running engine, bring a fresh one up on the other device —
+    /// same callbacks — and start it, so the preview, the framing guide and
+    /// live mode carry on. Never mid-take; a device with only one camera has
+    /// nothing to switch to.
+    func switchCamera() {
+        guard phase == .ready, !isRecording, !isShutdown else { return }
+
+        // The `@AppStorage` write that triggered this already moved
+        // `cameraPosition`; when it matches what is open, take the opposite.
+        let target = cameraPosition == activePosition ? cameraPosition.opposite : cameraPosition
+        guard
+            let position = Self.resolvedPosition(
+                preferred: target, available: Self.availablePositions()),
+            position != activePosition,
+            let device = AVCaptureDevice.default(
+                .builtInWideAngleCamera, for: .video, position: position.avPosition)
+        else { return }
+
+        cameraPosition = position
+        activePosition = position
+
+        engine?.stop()
+        let engine = makeEngine(device: device)
+        self.engine = engine
+        session = engine.session
+        engine.start()
+    }
+
+    /// The engine for one camera, with the callbacks every engine shares —
+    /// built in one place so `start()` and `switchCamera()` cannot drift.
+    private func makeEngine(device: AVCaptureDevice) -> CaptureEngine {
+        CaptureEngine(
             device: device,
             onFraming: { [weak self] status in
                 Task { @MainActor in self?.framingStatus = status }
@@ -245,10 +302,26 @@ final class CaptureService {
                 Task { @MainActor in self?.configurationFailed(message) }
             }
         )
-        self.engine = engine
-        session = engine.session
-        engine.start()
-        phase = .ready
+    }
+
+    /// Which camera to open, given the stored preference and the wide-angle
+    /// positions the device actually has: the preference when present, the
+    /// other one when it is not, and `nil` when the device has neither.
+    /// Pure, so the fallback is tested without a camera.
+    nonisolated static func resolvedPosition(
+        preferred: CameraPosition, available: [CameraPosition]
+    ) -> CameraPosition? {
+        if available.contains(preferred) { return preferred }
+        return available.first
+    }
+
+    /// The wide-angle positions this device actually has, back first — the
+    /// input `resolvedPosition` is asked about.
+    private static func availablePositions() -> [CameraPosition] {
+        CameraPosition.allCases.filter {
+            AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: $0.avPosition)
+                != nil
+        }
     }
 
     /// The record/stop button.
@@ -360,6 +433,7 @@ final class CaptureService {
                 holdType: take.hold,
                 recordedAt: take.startedAt,
                 appVersion: RecordingMetadata.currentAppVersion,
+                camera: activePosition ?? cameraPosition,
                 liveFpsTarget: stats.fpsTarget.map(Self.tenth),
                 liveFpsAchieved: achieved.map(Self.tenth),
                 avgInferenceMs: inference.map(Self.tenth),
