@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Detect side-view holds (pipeline) (#74)
 - Build the line-hold reference stats from the reviewed holds (#28)
 - Live Up cue and coach-mode alignment cues (hips, arch) (#100)
 - Label good clips (clean holds >= 5-10 s) (#27)
