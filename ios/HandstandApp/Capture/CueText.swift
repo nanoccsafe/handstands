@@ -24,6 +24,8 @@ enum CueText {
             return hintPhrase(hint)
         case .ready:
             return "Ready."
+        case .form(let fault):
+            return formPhrase(fault)
         }
     }
 
@@ -39,6 +41,8 @@ enum CueText {
             return hintIdentifier(hint)
         case .ready:
             return "ready"
+        case .form(let fault):
+            return formIdentifier(fault)
         }
     }
 
@@ -61,6 +65,25 @@ enum CueText {
         case .moveToMiddle: return "move_to_middle"
         case .onlyYou: return "only_you"
         case .raisePhone: return "raise_phone"
+        }
+    }
+
+    /// The three mid-hold form phrases (chainlink #97): the user's short,
+    /// imperative words — ribs in for the arch, hips open for the hollow, and
+    /// a plain "straighten" when the nose could not say which way it curved.
+    private static func formPhrase(_ fault: FormFault) -> String {
+        switch fault {
+        case .arch: return "Ribs in."
+        case .hollow: return "Open the hips."
+        case .bent: return "Straighten."
+        }
+    }
+
+    private static func formIdentifier(_ fault: FormFault) -> String {
+        switch fault {
+        case .arch: return "form_arch"
+        case .hollow: return "form_hollow"
+        case .bent: return "form_bent"
         }
     }
 

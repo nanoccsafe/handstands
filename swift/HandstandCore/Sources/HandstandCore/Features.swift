@@ -1139,24 +1139,46 @@ public enum Features {
             shoulderMid.count == ankleMid.count && shoulderMid.count == nose.count,
             "the torso line and the nose must have the same shape")
         return shoulderMid.indices.map { index in
-            let axisU = ankleMid[index].u - shoulderMid[index].u
-            let axisV = ankleMid[index].v - shoulderMid[index].v
-            let span = hypot(axisU, axisV)
-            // `-axis_v / span` and `axis_u / span`: `span` is `NaN` or zero
-            // exactly when the axis has no direction, and the division is
-            // numpy's, `NaN` and all.
-            let acrossU = -axisV / span
-            let acrossV = axisU / span
-            let front = (nose[index].u - shoulderMid[index].u) * acrossU
-                + (nose[index].v - shoulderMid[index].v) * acrossV
-            if front > 0.0 {
-                return 1.0
-            }
-            if front < 0.0 {
-                return -1.0
-            }
-            return .nan
+            facingSign(
+                shoulderMid: shoulderMid[index], ankleMid: ankleMid[index], nose: nose[index])
         }
+    }
+
+    /// One frame's facing sign — the body of `facingSign` above, shared with
+    /// the live form detector so the two cannot drift apart.
+    static func facingSign(
+        shoulderMid: BodyPoint, ankleMid: BodyPoint, nose: BodyPoint
+    ) -> Double {
+        let axisU = ankleMid.u - shoulderMid.u
+        let axisV = ankleMid.v - shoulderMid.v
+        let span = hypot(axisU, axisV)
+        // `-axis_v / span` and `axis_u / span`: `span` is `NaN` or zero
+        // exactly when the axis has no direction, and the division is numpy's,
+        // `NaN` and all.
+        let acrossU = -axisV / span
+        let acrossV = axisU / span
+        let front = (nose.u - shoulderMid.u) * acrossU + (nose.v - shoulderMid.v) * acrossV
+        if front > 0.0 {
+            return 1.0
+        }
+        if front < 0.0 {
+            return -1.0
+        }
+        return .nan
+    }
+
+    /// One frame's unsigned perpendicular offset of the hip midpoint from the
+    /// shoulder→ankle line, in the units of the points it is given — the
+    /// magnitude half of `_banana`, shared with the live form detector.
+    static func bananaOffset(
+        shoulderMid: BodyPoint, hipMid: BodyPoint, ankleMid: BodyPoint
+    ) -> Double {
+        let axisU = ankleMid.u - shoulderMid.u
+        let axisV = ankleMid.v - shoulderMid.v
+        let span = hypot(axisU, axisV)
+        let acrossU = -axisV / span
+        let acrossV = axisU / span
+        return (hipMid.u - shoulderMid.u) * acrossU + (hipMid.v - shoulderMid.v) * acrossV
     }
 
     /// The signed distance of the hip midpoint from the shoulder→ankle line,
@@ -1169,18 +1191,25 @@ public enum Features {
     static func banana(
         shoulderMid: [BodyPoint], hipMid: [BodyPoint], ankleMid: [BodyPoint], nose: [BodyPoint]
     ) -> [Double] {
-        let facing = facingSign(
-            shoulderMid: shoulderMid, ankleMid: ankleMid, nose: nose)
+        precondition(
+            shoulderMid.count == hipMid.count && shoulderMid.count == ankleMid.count
+                && shoulderMid.count == nose.count,
+            "the torso line, the hip and the nose must have the same shape")
         return shoulderMid.indices.map { index in
-            let axisU = ankleMid[index].u - shoulderMid[index].u
-            let axisV = ankleMid[index].v - shoulderMid[index].v
-            let span = hypot(axisU, axisV)
-            let acrossU = -axisV / span
-            let acrossV = axisU / span
-            let offset = (hipMid[index].u - shoulderMid[index].u) * acrossU
-                + (hipMid[index].v - shoulderMid[index].v) * acrossV
-            return offset * facing[index]
+            banana(
+                shoulderMid: shoulderMid[index], hipMid: hipMid[index],
+                ankleMid: ankleMid[index], nose: nose[index])
         }
+    }
+
+    /// One frame's signed banana — the body of `banana` above, shared with the
+    /// live form detector so a live "red" and an offline `banana` are the same
+    /// measurement.
+    static func banana(
+        shoulderMid: BodyPoint, hipMid: BodyPoint, ankleMid: BodyPoint, nose: BodyPoint
+    ) -> Double {
+        bananaOffset(shoulderMid: shoulderMid, hipMid: hipMid, ankleMid: ankleMid)
+            * facingSign(shoulderMid: shoulderMid, ankleMid: ankleMid, nose: nose)
     }
 
     /// The angle of the shoulder→nose vector against the spine, in degrees,

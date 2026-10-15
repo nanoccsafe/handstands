@@ -3,9 +3,9 @@ import XCTest
 
 @testable import HandstandApp
 
-/// The gear on the home screen (chainlink #91): what a fresh install shows,
-/// that the three toggles round-trip through `UserDefaults`, and that the
-/// three keys are three keys — the settings `SettingsView` renders and
+/// The gear on the home screen (chainlink #91, extended by #97): what a fresh
+/// install shows, that the toggles round-trip through `UserDefaults`, and that
+/// the four keys are four keys — the settings `SettingsView` renders and
 /// `RecordView` reads are these, and nothing else.
 final class SettingsDefaultsTests: XCTestCase {
     private let suiteName = "SettingsDefaultsTests"
@@ -21,28 +21,35 @@ final class SettingsDefaultsTests: XCTestCase {
         defaults = nil
     }
 
-    func testAFreshInstallShowsVoiceOnTimeMarksOffAndHintsOn() {
+    func testAFreshInstallShowsVoiceOnTimeMarksOffHintsOnAndFormCuesOn() {
         XCTAssertEqual(
             CueSettingsStorage.read(defaults),
-            CueSettings(voiceCues: true, timeMarks: false, framingHints: true)
+            CueSettings(
+                voiceCues: true, timeMarks: false, framingHints: true, formCues: true)
         )
         // The same defaults the core's own `CueSettings()` starts with — one
         // definition, not two that can drift.
         XCTAssertEqual(CueSettingsStorage.defaults, CueSettings())
-        XCTAssertEqual(CueSettings(), CueSettings(voiceCues: true, timeMarks: false, framingHints: true))
+        XCTAssertEqual(
+            CueSettings(),
+            CueSettings(voiceCues: true, timeMarks: false, framingHints: true, formCues: true))
     }
 
-    func testTheThreeTogglesRoundTrip() {
-        let everythingOn = CueSettings(voiceCues: true, timeMarks: true, framingHints: true)
+    func testTheFourTogglesRoundTrip() {
+        let everythingOn = CueSettings(
+            voiceCues: true, timeMarks: true, framingHints: true, formCues: true)
         defaults.set(everythingOn.voiceCues, forKey: CueSettingsStorage.voiceCuesKey)
         defaults.set(everythingOn.timeMarks, forKey: CueSettingsStorage.timeMarksKey)
         defaults.set(everythingOn.framingHints, forKey: CueSettingsStorage.framingHintsKey)
+        defaults.set(everythingOn.formCues, forKey: CueSettingsStorage.formCuesKey)
         XCTAssertEqual(CueSettingsStorage.read(defaults), everythingOn)
 
-        let everythingOff = CueSettings(voiceCues: false, timeMarks: false, framingHints: false)
+        let everythingOff = CueSettings(
+            voiceCues: false, timeMarks: false, framingHints: false, formCues: false)
         defaults.set(everythingOff.voiceCues, forKey: CueSettingsStorage.voiceCuesKey)
         defaults.set(everythingOff.timeMarks, forKey: CueSettingsStorage.timeMarksKey)
         defaults.set(everythingOff.framingHints, forKey: CueSettingsStorage.framingHintsKey)
+        defaults.set(everythingOff.formCues, forKey: CueSettingsStorage.formCuesKey)
         XCTAssertEqual(CueSettingsStorage.read(defaults), everythingOff)
     }
 
@@ -51,18 +58,26 @@ final class SettingsDefaultsTests: XCTestCase {
         // voice cues' default indistinguishable from "switched off" — the
         // read checks presence instead, which is what this pins down.
         defaults.set(false, forKey: CueSettingsStorage.voiceCuesKey)
+        defaults.set(false, forKey: CueSettingsStorage.formCuesKey)
         XCTAssertEqual(CueSettingsStorage.read(defaults).voiceCues, false)
         XCTAssertEqual(CueSettingsStorage.read(defaults).timeMarks, false, "never written: the default")
         XCTAssertEqual(CueSettingsStorage.read(defaults).framingHints, true, "never written: the default")
+        XCTAssertEqual(CueSettingsStorage.read(defaults).formCues, false)
     }
 
-    func testTheThreeKeysAreThreeKeys() {
+    func testTheFourKeysAreFourKeys() {
         let keys = [
             CueSettingsStorage.voiceCuesKey,
             CueSettingsStorage.timeMarksKey,
             CueSettingsStorage.framingHintsKey,
+            CueSettingsStorage.formCuesKey,
         ]
-        XCTAssertEqual(Set(keys).count, 3, "three distinct @AppStorage keys")
+        XCTAssertEqual(Set(keys).count, 4, "four distinct @AppStorage keys")
+    }
+
+    func testFormCuesAreOnByDefault() {
+        XCTAssertTrue(CueSettingsStorage.defaults.formCues)
+        XCTAssertTrue(CueSettings().formCues, "the user asked for form cues, so a fresh install has them on")
     }
 
     func testThePhilosophyLineUnderTheToggles() {

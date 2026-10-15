@@ -36,6 +36,8 @@ struct RecordView: View {
     private var timeMarks = CueSettingsStorage.defaults.timeMarks
     @AppStorage(CueSettingsStorage.framingHintsKey)
     private var framingHints = CueSettingsStorage.defaults.framingHints
+    @AppStorage(CueSettingsStorage.formCuesKey)
+    private var formCues = CueSettingsStorage.defaults.formCues
 
     /// Which wide-angle camera the flip button selects (chainlink #95). The
     /// stored raw value is read through `CameraSettingsStorage.resolved`, so
@@ -51,7 +53,9 @@ struct RecordView: View {
 
     /// The toggles as the scheduler wants them.
     private var cueSettings: CueSettings {
-        CueSettings(voiceCues: voiceCues, timeMarks: timeMarks, framingHints: framingHints)
+        CueSettings(
+            voiceCues: voiceCues, timeMarks: timeMarks, framingHints: framingHints,
+            formCues: formCues)
     }
 
     var body: some View {

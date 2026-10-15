@@ -14,14 +14,19 @@ import Foundation
 // The philosophy (user, 2026-10-06) is *sparse and encouraging*: one cue when a
 // line is achieved, optional time marks, framing hints before the attempt, and
 // **no corrections during a hold** — the critique belongs to the analysis that
-// runs after the recording, which stays authoritative.
+// runs after the recording, which stays authoritative. The user changed that
+// last rule at the gym (2026-10-14, chainlink #97): a *sustained red fault*
+// mid-hold now earns one short form cue. It is still sparse — one phrase, one
+// direction, one attempt — and it has its own toggle, on by default because
+// the user asked for it.
 // --------------------------------------------------------------------------- #
 
-/// The three toggles behind the gear on the home screen (chainlink #91), the
-/// defaults a fresh install shows.
+/// The toggles behind the gear on the home screen (chainlink #91, extended by
+/// #97), the defaults a fresh install shows.
 public struct CueSettings: Equatable, Sendable {
-    /// Speak the line cue, the time marks and "Ready." — the master switch for
-    /// everything the *attempt* earns. Framing hints have their own toggle.
+    /// Speak the line cue, the time marks, "Ready." and the form cues — the
+    /// master switch for everything the *attempt* earns. Framing hints have
+    /// their own toggle.
     public var voiceCues = true
 
     /// Speak the optional "Five." / "Ten." marks while a line is held.
@@ -30,13 +35,32 @@ public struct CueSettings: Equatable, Sendable {
     /// Speak (and show) the framing hints *before* the attempt.
     public var framingHints = true
 
+    /// Speak one short phrase when the line goes red during a hold (chainlink
+    /// #97) — the user asked for it at the gym (2026-10-14), so a fresh
+    /// install has it **on**.
+    public var formCues = true
+
     public init() {}
 
-    public init(voiceCues: Bool, timeMarks: Bool, framingHints: Bool) {
+    public init(voiceCues: Bool, timeMarks: Bool, framingHints: Bool, formCues: Bool = true) {
         self.voiceCues = voiceCues
         self.timeMarks = timeMarks
         self.framingHints = framingHints
+        self.formCues = formCues
     }
+}
+
+/// Which way the line broke during a hold (chainlink #97), with the same
+/// spellings the `banana` coaching cues use: positive banana is the belly
+/// side, negative the back.
+public enum FormFault: String, Sendable, CaseIterable {
+    /// The line curved towards the belly — "Ribs in.".
+    case arch
+    /// The line curved away from the belly — "Open the hips.".
+    case hollow
+    /// The line is red but the nose cannot say which way it curves —
+    /// "Straighten.".
+    case bent
 }
 
 /// What a framing hint tells the user to do about the picture.
@@ -54,7 +78,7 @@ public enum FramingHint: String, Sendable {
     case raisePhone
 }
 
-/// One thing worth saying (and showing as a banner) — chainlink #91.
+/// One thing worth saying (and showing as a banner) — chainlink #91, #97.
 public enum Cue: Equatable, Sendable {
     /// "Line. Hold it." — a line has been achieved, once per line.
     case lineHold
@@ -64,6 +88,9 @@ public enum Cue: Equatable, Sendable {
     case framing(FramingHint)
     /// "Ready." — the framing went from wrong to right while upright.
     case ready
+    /// "Ribs in." / "Open the hips." / "Straighten." — the line broke during
+    /// a hold (chainlink #97).
+    case form(FormFault)
 }
 
 /// Which cue to speak now — the whole of live mode's policy (chainlink #91).
@@ -120,6 +147,13 @@ public struct CueScheduler: Sendable {
     /// A `timeMark` waiting for its turn; the newest mark replaces an older one.
     private var pendingTimeMark: Int?
 
+    /// A form cue (chainlink #97) waiting for its turn; the newest fault
+    /// replaces an older one. It is queued like the line cue and the marks —
+    /// the fault is a real correction, not a stale edge — but it is only
+    /// spoken when framing hints have nothing to say (they outrank it), and
+    /// only with ``CueSettings/formCues`` on.
+    private var pendingForm: FormFault?
+
     /// When the last cue was spoken, and which — the global debounce reads it.
     private var lastSpokenTMs: Int?
 
@@ -160,6 +194,7 @@ public struct CueScheduler: Sendable {
     public mutating func decide(
         tMs: Int,
         events: [LiveEvent],
+        formEvents: [LiveFormEvent] = [],
         framing: FramingStatus?,
         inverted: Bool,
         recording: Bool
@@ -169,6 +204,9 @@ public struct CueScheduler: Sendable {
         if !settings.voiceCues {
             pendingLineHold = false
             pendingTimeMark = nil
+        }
+        if !settings.voiceCues || !settings.formCues {
+            pendingForm = nil
         }
 
         // The inversion edge: cooldown starts the tick the athlete comes down.
@@ -190,6 +228,9 @@ public struct CueScheduler: Sendable {
             case .timeMark(_, let seconds):
                 if settings.voiceCues, settings.timeMarks { pendingTimeMark = seconds }
             }
+        }
+        for event in formEvents where settings.voiceCues && settings.formCues {
+            pendingForm = event.fault
         }
 
         // 1. The line cue — highest priority, shortest debounce.
@@ -215,8 +256,18 @@ public struct CueScheduler: Sendable {
             return ready
         }
 
-        // 4. A framing hint — pre-attempt only, throttled three ways.
-        return hintCue(tMs: tMs, framing: framing, inverted: inverted, recording: recording)
+        // 4. A framing hint — pre-attempt only, throttled three ways. It
+        //    outranks the form cue below, so a hint is never held back for a
+        //    correction (in practice a form cue only fires upside down, where
+        //    the hints are already silent).
+        if let hint = hintCue(tMs: tMs, framing: framing, inverted: inverted, recording: recording)
+        {
+            return hint
+        }
+
+        // 5. A waiting form cue — the last of the cues, and only after the
+        //    hints had nothing to say.
+        return formCue(tMs: tMs)
     }
 
     // MARK: - The edge-triggered cues
@@ -263,6 +314,21 @@ public struct CueScheduler: Sendable {
         lastHint = hint
         lastHintTMs = tMs
         return spoken(.framing(hint), tMs: tMs)
+    }
+
+    /// A form cue (chainlink #97) waiting for its turn: queued (the correction
+    /// is the point, not a stale edge), held back by the global debounce,
+    /// dropped the moment its toggle goes off. It is checked after the framing
+    /// hints, so a hint always outranks it.
+    private mutating func formCue(tMs: Int) -> Cue? {
+        guard let fault = pendingForm else { return nil }
+        guard settings.voiceCues, settings.formCues else {
+            pendingForm = nil
+            return nil
+        }
+        guard allowed(tMs: tMs, gapS: Self.debounceGapS) else { return nil }
+        pendingForm = nil
+        return spoken(.form(fault), tMs: tMs)
     }
 
     // MARK: - The mapping

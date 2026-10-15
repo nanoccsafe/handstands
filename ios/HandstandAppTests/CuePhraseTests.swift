@@ -20,6 +20,9 @@ final class CuePhraseTests: XCTestCase {
         .framing(.onlyYou),
         .framing(.raisePhone),
         .ready,
+        .form(.arch),
+        .form(.hollow),
+        .form(.bent),
     ]
 
     func testThePhraseTable() {
@@ -32,6 +35,9 @@ final class CuePhraseTests: XCTestCase {
         XCTAssertEqual(CueText.phrase(for: .framing(.onlyYou)), "Only you in the frame.")
         XCTAssertEqual(CueText.phrase(for: .framing(.raisePhone)), "Raise the phone.")
         XCTAssertEqual(CueText.phrase(for: .ready), "Ready.")
+        XCTAssertEqual(CueText.phrase(for: .form(.arch)), "Ribs in.")
+        XCTAssertEqual(CueText.phrase(for: .form(.hollow)), "Open the hips.")
+        XCTAssertEqual(CueText.phrase(for: .form(.bent)), "Straighten.")
     }
 
     func testEveryCueHasNonEmptyWords() {
@@ -59,6 +65,9 @@ final class CuePhraseTests: XCTestCase {
         XCTAssertEqual(CueText.identifier(for: .framing(.onlyYou)), "only_you")
         XCTAssertEqual(CueText.identifier(for: .framing(.raisePhone)), "raise_phone")
         XCTAssertEqual(CueText.identifier(for: .ready), "ready")
+        XCTAssertEqual(CueText.identifier(for: .form(.arch)), "form_arch")
+        XCTAssertEqual(CueText.identifier(for: .form(.hollow)), "form_hollow")
+        XCTAssertEqual(CueText.identifier(for: .form(.bent)), "form_bent")
 
         // Every identifier is one greppable token — the sidecar is read with
         // `jq` as often as with this app.

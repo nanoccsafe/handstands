@@ -17,12 +17,14 @@ final class CueSchedulerTests: XCTestCase {
         _ scheduler: inout CueScheduler,
         tMs: Int,
         events: [LiveEvent] = [],
+        formEvents: [LiveFormEvent] = [],
         framing: FramingStatus? = nil,
         inverted: Bool = false,
         recording: Bool = false
     ) -> Cue? {
         scheduler.decide(
-            tMs: tMs, events: events, framing: framing, inverted: inverted, recording: recording)
+            tMs: tMs, events: events, formEvents: formEvents, framing: framing,
+            inverted: inverted, recording: recording)
     }
 
     // MARK: - The settings
@@ -30,9 +32,67 @@ final class CueSchedulerTests: XCTestCase {
     func testFreshInstallDefaults() {
         XCTAssertEqual(
             CueSettings(),
-            CueSettings(voiceCues: true, timeMarks: false, framingHints: true),
-            "voice on, time marks off, framing hints on"
+            CueSettings(voiceCues: true, timeMarks: false, framingHints: true, formCues: true),
+            "voice on, time marks off, framing hints on, form cues on"
         )
+    }
+
+    // MARK: - The form cue (chainlink #97)
+
+    func testAFormEventSpeaksThroughTheDebounce() {
+        var scheduler = CueScheduler()
+
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 0, events: [.lineAchieved(tMs: 0)], inverted: true), .lineHold)
+        XCTAssertNil(
+            tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)], inverted: true),
+            "the global debounce is not spent yet")
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 4000, inverted: true), .form(.arch),
+            "the form cue waited its turn rather than being dropped")
+    }
+
+    func testEachFaultSpeaksItsOwnCue() {
+        for (event, fault) in [
+            (LiveFormEvent.arch(tMs: 0), FormFault.arch),
+            (LiveFormEvent.hollow(tMs: 0), FormFault.hollow),
+            (LiveFormEvent.bent(tMs: 0), FormFault.bent),
+        ] {
+            var scheduler = CueScheduler()
+            XCTAssertEqual(
+                tick(&scheduler, tMs: 1000, formEvents: [event], inverted: true), .form(fault))
+            XCTAssertEqual(scheduler.lastCue, .form(fault))
+        }
+    }
+
+    func testNoFormCueWhenItsToggleIsOff() {
+        var scheduler = CueScheduler()
+        scheduler.settings.formCues = false
+
+        XCTAssertNil(tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)], inverted: true))
+    }
+
+    func testNoFormCueWhenVoiceIsOff() {
+        var scheduler = CueScheduler()
+        scheduler.settings.voiceCues = false
+
+        XCTAssertNil(tick(&scheduler, tMs: 1000, formEvents: [.bent(tMs: 1000)], inverted: true))
+    }
+
+    func testAFramingHintOutranksAWaitingFormCue() {
+        var scheduler = CueScheduler()
+
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 0, framing: .tooSmall), .framing(.comeCloser))
+        // The form cue arrives while the debounce is unspent…
+        XCTAssertNil(
+            tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)], framing: .tooSmall))
+        // …and at the first tick both are due, the hint is spoken and the form
+        // cue stays pending for the next one.
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 5000, framing: .multiplePeople), .framing(.onlyYou),
+            "a framing hint outranks the form cue")
+        XCTAssertEqual(tick(&scheduler, tMs: 9000), .form(.arch))
     }
 
     // MARK: - The line cue

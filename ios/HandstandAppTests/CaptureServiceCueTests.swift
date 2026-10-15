@@ -28,6 +28,7 @@ final class CaptureServiceCueTests: XCTestCase {
     private func frame(
         tMs: Int,
         events: [LiveEvent] = [],
+        formEvents: [LiveFormEvent] = [],
         inverted: Bool = false,
         inferenceMs: Double = 40,
         fpsTarget: Double = 10
@@ -35,6 +36,7 @@ final class CaptureServiceCueTests: XCTestCase {
         LiveFrame(
             tMs: tMs,
             events: events,
+            formEvents: formEvents,
             inverted: inverted,
             inferenceMs: inferenceMs,
             fpsTarget: fpsTarget
@@ -147,6 +149,34 @@ final class CaptureServiceCueTests: XCTestCase {
             recording: true
         )
         XCTAssertEqual(speaker.spoken, [.timeMark(10)])
+    }
+
+    func testAFormEventReachesTheSpeakerAndTheSidecar() {
+        let (service, speaker) = makeService()
+
+        service.liveUpdate(
+            frame(tMs: 2_000, formEvents: [.arch(tMs: 2_000)], inverted: true),
+            framing: nil,
+            recording: true
+        )
+
+        XCTAssertEqual(speaker.spoken, [.form(.arch)])
+        XCTAssertEqual(service.cueBanner, .form(.arch))
+        XCTAssertEqual(service.liveStats.cues.map(\.cue), ["form_arch"])
+    }
+
+    func testFormCuesOffMeansNoFormCue() {
+        let (service, speaker) = makeService()
+        service.cueSettings = CueSettings(
+            voiceCues: true, timeMarks: false, framingHints: true, formCues: false)
+
+        service.liveUpdate(
+            frame(tMs: 2_000, formEvents: [.hollow(tMs: 2_000)], inverted: true),
+            framing: nil,
+            recording: true
+        )
+
+        XCTAssertTrue(speaker.spoken.isEmpty, "form cues off: nothing is said")
     }
 
     // MARK: - What the take keeps

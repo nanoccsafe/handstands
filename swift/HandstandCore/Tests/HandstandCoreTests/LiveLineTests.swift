@@ -82,6 +82,30 @@ final class LiveLineTests: XCTestCase {
             ]
         }
 
+        /// A frame that passes every *line* gate but is a red banana: the two
+        /// sides' midpoints bend (the right hip is far to the right, so the
+        /// hip midpoint sits off the shoulder→ankle line) while the left side
+        /// stays straight and confident, which is the side `hipAngleDeg`
+        /// picks. Chainlink #97: this must never be a line however straight
+        /// the wrist→ankle vector and the left side look.
+        static func bananaRedLine() -> [Joint: Keypoint] {
+            [
+                .leftWrist: Keypoint(x: 500, y: 1850, visibility: 0.9),
+                .rightWrist: Keypoint(x: 580, y: 1850, visibility: 0.6),
+                .leftShoulder: Keypoint(x: 500, y: 1550, visibility: 0.9),
+                .rightShoulder: Keypoint(x: 580, y: 1550, visibility: 0.6),
+                .leftHip: Keypoint(x: 500, y: 1000, visibility: 0.9),
+                .rightHip: Keypoint(x: 920, y: 1000, visibility: 0.6),
+                .leftKnee: Keypoint(x: 500, y: 725, visibility: 0.9),
+                .rightKnee: Keypoint(x: 920, y: 725, visibility: 0.6),
+                .leftAnkle: Keypoint(x: 500, y: 450, visibility: 0.9),
+                .rightAnkle: Keypoint(x: 580, y: 450, visibility: 0.6),
+                .leftFootIndex: Keypoint(x: 500, y: 380, visibility: 0.9),
+                .rightFootIndex: Keypoint(x: 580, y: 380, visibility: 0.6),
+                .nose: Keypoint(x: 500, y: 1600, visibility: 0.9),
+            ]
+        }
+
         /// Every joint turned around `origin` by `degrees` — a rigid turn, so
         /// the hip angle survives it and only the body angle changes.
         private static func rotate(
@@ -225,6 +249,20 @@ final class LiveLineTests: XCTestCase {
         _ = detector.update(tMs: 2100, joints: Synthetic.frame())
         XCTAssertTrue(detector.isInverted, "the hips are still there to judge by")
         XCTAssertFalse(detector.isInLine)
+    }
+
+    /// Chainlink #97: a red banana is not a line, even when the wrist→ankle
+    /// vector is vertical and the visible side's hip is straight — the very
+    /// case the app used to cheer with "Line. Hold it.".
+    func testARedBananaIsNeverALine() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 2000, by: 100) { _ in
+            Synthetic.bananaRedLine()
+        }
+
+        XCTAssertEqual(events, [], "a banana the report will call red is never a line")
+        XCTAssertFalse(detector.isInLine)
+        XCTAssertTrue(detector.isInverted, "it is still upside down — just not a line")
     }
 
     // MARK: - Time

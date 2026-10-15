@@ -54,8 +54,11 @@ struct LiveFrame: Equatable, Sendable {
     /// The capture timestamp of the frame, milliseconds — the same monotonic
     /// clock `LiveLineDetector` measures its hysteresis in.
     let tMs: Int
-    /// What the detector noticed about this frame (possibly nothing).
+    /// What the line detector noticed about this frame (possibly nothing).
     let events: [LiveEvent]
+    /// What the form detector noticed about this frame (chainlink #97,
+    /// possibly nothing).
+    let formEvents: [LiveFormEvent]
     /// Was the athlete upside down in this frame?
     let inverted: Bool
     /// How long this frame's inference took, milliseconds — the guard's input
@@ -63,6 +66,22 @@ struct LiveFrame: Equatable, Sendable {
     let inferenceMs: Double
     /// The live rate in force when this frame was offered, fps.
     let fpsTarget: Double
+
+    init(
+        tMs: Int,
+        events: [LiveEvent],
+        formEvents: [LiveFormEvent] = [],
+        inverted: Bool,
+        inferenceMs: Double,
+        fpsTarget: Double
+    ) {
+        self.tMs = tMs
+        self.events = events
+        self.formEvents = formEvents
+        self.inverted = inverted
+        self.inferenceMs = inferenceMs
+        self.fpsTarget = fpsTarget
+    }
 }
 
 /// How often live frames are offered to MediaPipe — and the lever the
@@ -199,6 +218,7 @@ final class LivePosePipeline: @unchecked Sendable {
     private let downscaler = FramingAnalyzer()
     private var landmarker: MediaPipeLandmarker?
     private var detector: LiveLineDetector
+    private var formDetector: LiveFormDetector
     private var inferenceGuard: InferenceGuard
     private var rotateNextFrame = false
 
@@ -214,6 +234,7 @@ final class LivePosePipeline: @unchecked Sendable {
         self.onFrame = onFrame
         self.detector = LiveLineDetector(
             config: .init(), timeMarksEverySeconds: Self.timeMarkEverySeconds)
+        self.formDetector = LiveFormDetector()
         self.inferenceGuard = InferenceGuard(
             windowS: LiveRateController.inferenceWindowS,
             budgetMs: LiveRateController.inferenceBudgetMs
@@ -299,6 +320,7 @@ final class LivePosePipeline: @unchecked Sendable {
         )
         rotateNextFrame = Self.rotateRule(joints, keeping: rotateNextFrame)
         let events = detector.update(tMs: tMs, joints: joints)
+        let formEvents = formDetector.update(tMs: tMs, joints: joints)
 
         if let overBudget = inferenceGuard.record(tMs: tMs, ms: inferenceMs) {
             rate.halve(
@@ -310,6 +332,7 @@ final class LivePosePipeline: @unchecked Sendable {
             LiveFrame(
                 tMs: tMs,
                 events: events,
+                formEvents: formEvents,
                 inverted: detector.isInverted,
                 inferenceMs: inferenceMs,
                 fpsTarget: rate.targetFps
