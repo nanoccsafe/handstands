@@ -7,11 +7,11 @@ values, z-scores and worst faults it was made of.
 
 Two other issues own the parts this one deliberately does not decide:
 
-- **#28 builds the real reference** from the labelled good clips of #27.
-  Nothing here ships a reference: `--reference` is a required argument, there
-  is no bundled default, and no reference number is committed to this public
-  repository before it comes out of the labelled set. The tests build theirs
-  inline.
+- **#28 builds the real reference** from the reviewed line holds; see
+  [Building the reference](#building-the-reference). Nothing here ships one:
+  `--reference` is a required argument, there is no bundled default, and no
+  reference number is committed to this public repository before it comes out
+  of the labelled set. The tests build theirs inline.
 - **#30 tunes the weights.** The groups and their starting weights live at the
   top of `pipeline/handstand/score.py`, each with a comment saying what it is
   for, and they are the only thing that is expected to change.
@@ -162,6 +162,40 @@ JSON, schema v1 — this is the whole format:
 - `signs: "athlete"` is what makes the numbers comparable with the hold
   values above; a reference in image coordinates would score mirrored clips
   backwards.
+
+## Building the reference
+
+The real reference is built from the user's own reviewed data — **never
+committed** to this public repository, and no reference number appears before it
+comes out of the labelled set:
+
+```sh
+cd pipeline
+uv run python -m handstand.reference build [--data DIR] [--source SRC]
+    [--out PATH] [--min-holds N] [--install]
+```
+
+`handstand.reference` reads:
+
+- `data/labels/reference_review.csv` (#27) for the holds the user marked
+  reference-worthy and not against a wall;
+- `data/features/<source>/<clip_id>.parquet` (#22/#23) for one value per hold —
+  the same athlete-signed `score.hold_values` medians and spreads a hold is
+  scored on.
+
+Each **hold** contributes one value per feature, so every hold weighs the same
+and no long hold outvotes a short one; frames are never pooled. Per feature it
+writes the mean, the **sample** SD (`ddof = 1`) and `n` over the finite hold
+values, and a feature finite in fewer than `MIN_FEATURE_HOLDS` (5) holds is left
+out — missing features are allowed by the format. It writes
+`<data_dir>/references/reference-line.json` by default, prints `n_holds` and the
+features written, and writes a sanity report to
+`<data_dir>/reports/reference/<YYYY-MM-DD_HHMMSS>.txt`: the per-feature table, a
+leave-one-out of the reference holds, and every other line hold scored against
+the full reference (the reference holds' median should come out higher).
+`--min-holds` (default 10) refuses a reference built from too few holds, and
+`--install` copies the file to `ios/LocalResources/reference-line.json`, the
+name the app's `ReferenceLoader` looks for.
 
 ## CLI
 
