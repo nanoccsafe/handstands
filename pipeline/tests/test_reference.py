@@ -56,6 +56,20 @@ def write_shapes(data: pathlib.Path, rows: list[tuple[str, int, str]]) -> pathli
     return path
 
 
+def write_catalogue(data: pathlib.Path, angles: dict[str, str]) -> pathlib.Path:
+    """A ``catalogue.csv`` carrying ``clip_id`` and ``camera_angle`` only."""
+    path = reference_review.catalogue_path(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=("clip_id", "camera_angle"), lineterminator="\n"
+        )
+        writer.writeheader()
+        for clip_id, angle in angles.items():
+            writer.writerow({"clip_id": clip_id, "camera_angle": angle})
+    return path
+
+
 def good_clips(data: pathlib.Path, clip_ids: list[str]) -> None:
     """One ten-frame, at-the-means clip per id, so a hold scores."""
     for clip_id in clip_ids:
@@ -169,11 +183,38 @@ def test_collect_hold_values_reads_good_holds_and_notes_the_rest(
 
 
 # --------------------------------------------------------------------------- #
+# Side view
+# --------------------------------------------------------------------------- #
+
+
+def test_camera_angles_normalises_and_filter_keeps_side(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    write_catalogue(data, {"clipSide01": "  Side ", "clipFront1": "front", "clipEmpty1": ""})
+
+    angles = reference.camera_angles(data)
+    assert angles == {"clipSide01": "side", "clipFront1": "front", "clipEmpty1": ""}
+
+    holds = {("clipSide01", 0), ("clipFront1", 1), ("clipEmpty1", 2), ("clipAbsent1", 3)}
+    kept, notes = reference.filter_side_view(holds, angles)
+
+    assert kept == {("clipSide01", 0)}  # case and spaces do not matter
+    assert "clipFront1 h1: not side view (camera_angle=front)" in notes
+    assert "clipEmpty1 h2: not side view (camera_angle=empty)" in notes
+    assert "clipAbsent1 h3: not side view (camera_angle=empty)" in notes
+    assert len(notes) == 3
+
+
+def test_camera_angles_raises_without_a_catalogue(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        reference.camera_angles(tmp_path / "data")
+
+
+# --------------------------------------------------------------------------- #
 # built_from
 # --------------------------------------------------------------------------- #
 
 
-def test_built_from_text_names_no_clip(tmp_path: pathlib.Path) -> None:
+def test_built_from_text_names_no_clip_and_says_side_view(tmp_path: pathlib.Path) -> None:
     data = tmp_path / "data"
     write_labels(data, [("0123456789ab", 0, "yes")])
     rows = [{"clip_id": "0123456789ab", "hold_id": 0} for _ in range(3)]
@@ -183,8 +224,19 @@ def test_built_from_text_names_no_clip(tmp_path: pathlib.Path) -> None:
 
     assert "0123456789ab" not in text
     assert "ffffffffff" not in text
-    assert "3 reviewed line holds from 2 clips" in text
+    assert "3 reviewed side-view line holds from 2 clips" in text
     assert "reference review" in text
+
+
+def test_built_from_text_omits_side_view_for_any_view(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    write_labels(data, [("0123456789ab", 0, "yes")])
+    rows = [{"clip_id": "0123456789ab", "hold_id": 0}]
+
+    text = reference.built_from_text(rows, data, side_only=False)
+
+    assert "1 reviewed line holds from 1 clips" in text
+    assert "side-view" not in text
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +249,10 @@ def test_the_cli_refuses_fewer_than_min_holds(tmp_path: pathlib.Path, capsys) ->
     good_clips(data, ["clipA", "clipB"])
     write_labels(data, [("clipA", 0, "yes"), ("clipB", 0, "yes")])
 
-    assert reference.main(["build", "--data", str(data), "--min-holds", "5"]) == 2
+    # --any-view keeps this about the count, not the camera.
+    assert (
+        reference.main(["build", "--data", str(data), "--min-holds", "5", "--any-view"]) == 2
+    )
     assert not reference.default_output(data).is_file()
     assert "only 2 usable hold(s)" in capsys.readouterr().err
 
@@ -208,6 +263,7 @@ def test_the_cli_builds_and_installs(tmp_path: pathlib.Path, capsys) -> None:
     clip_ids = [f"clip{i:08d}" for i in range(6)]
     good_clips(data, clip_ids)
     write_labels(data, [(clip_id, 0, "yes") for clip_id in clip_ids])
+    write_catalogue(data, {clip_id: "side" for clip_id in clip_ids})
 
     assert (
         reference.main(
@@ -221,6 +277,7 @@ def test_the_cli_builds_and_installs(tmp_path: pathlib.Path, capsys) -> None:
     loaded = score.load_reference(out)
     assert loaded.n_holds == 6
     assert loaded.features  # features written
+    assert "side-view" in loaded.built_from
     assert json.loads(out.read_text(encoding="utf-8"))["signs"] == "athlete"
 
     installed = reference.install_path(repo)
@@ -234,6 +291,7 @@ def test_the_cli_builds_and_installs(tmp_path: pathlib.Path, capsys) -> None:
     printed = capsys.readouterr().out
     assert f"reference {out}" in printed
     assert "n_holds=6" in printed
+    assert "6 hold(s) used, 0 skipped as not side view" in printed
     assert f"installed {installed}" in printed
 
 
@@ -242,6 +300,7 @@ def test_the_cli_built_from_leaks_no_clip_id(tmp_path: pathlib.Path) -> None:
     clip_ids = ["abc000000001", "def000000002"]
     good_clips(data, clip_ids)
     write_labels(data, [(clip_id, 0, "yes") for clip_id in clip_ids])
+    write_catalogue(data, {clip_id: "side" for clip_id in clip_ids})
 
     assert reference.main(["build", "--data", str(data), "--min-holds", "2"]) == 0
 
@@ -250,6 +309,57 @@ def test_the_cli_built_from_leaks_no_clip_id(tmp_path: pathlib.Path) -> None:
     ]
     for clip_id in clip_ids:
         assert clip_id not in built_from
+
+
+def test_the_cli_skips_non_side_holds_by_default(tmp_path: pathlib.Path, capsys) -> None:
+    data = tmp_path / "data"
+    side = [f"side{i:08d}" for i in range(5)]
+    front = "front0000000"
+    good_clips(data, side + [front])
+    write_labels(data, [(clip_id, 0, "yes") for clip_id in [*side, front]])
+    write_catalogue(data, {**{clip_id: "side" for clip_id in side}, front: "front"})
+
+    assert reference.main(["build", "--data", str(data), "--min-holds", "5"]) == 0
+
+    printed = capsys.readouterr().out
+    assert f"skip {front} h0: not side view (camera_angle=front)" in printed
+    assert "5 hold(s) used, 1 skipped as not side view" in printed
+    assert score.load_reference(reference.default_output(data)).n_holds == 5
+
+
+def test_the_cli_needs_the_catalogue_unless_any_view(tmp_path: pathlib.Path, capsys) -> None:
+    data = tmp_path / "data"
+    clip_ids = ["clipA", "clipB"]
+    good_clips(data, clip_ids)
+    write_labels(data, [(clip_id, 0, "yes") for clip_id in clip_ids])
+
+    assert reference.main(["build", "--data", str(data), "--min-holds", "2"]) == 2
+    assert not reference.default_output(data).is_file()
+    assert "no catalogue" in capsys.readouterr().err
+
+    # --any-view never reads the catalogue, so the same data builds.
+    assert (
+        reference.main(["build", "--data", str(data), "--min-holds", "2", "--any-view"]) == 0
+    )
+    loaded = score.load_reference(reference.default_output(data))
+    assert loaded.n_holds == 2
+    assert "side-view" not in loaded.built_from
+
+
+def test_the_cli_any_view_keeps_non_side_holds(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    clip_ids = ["clip00000001", "clip00000002"]
+    good_clips(data, clip_ids)
+    write_labels(data, [(clip_id, 0, "yes") for clip_id in clip_ids])
+    write_catalogue(data, {clip_ids[0]: "side", clip_ids[1]: "front"})
+
+    # Default drops the front clip: one side hold, under --min-holds 2.
+    assert reference.main(["build", "--data", str(data), "--min-holds", "2"]) == 2
+    # --any-view keeps both.
+    assert (
+        reference.main(["build", "--data", str(data), "--min-holds", "2", "--any-view"]) == 0
+    )
+    assert score.load_reference(reference.default_output(data)).n_holds == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -280,3 +390,38 @@ def test_evaluate_scores_reference_holds_and_other_lines(tmp_path: pathlib.Path)
     assert "other line holds against the full reference:" in report
     assert "n=1" in report
     assert "reference holds LOO median" in report
+
+
+def test_evaluate_reports_the_side_view_subset(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    ref_clips = [f"ref{i:09d}" for i in range(5)]
+    other_side = "otherside001"
+    other_front = "otherfront01"
+    good_clips(data, ref_clips + [other_side, other_front])
+    write_shapes(
+        data,
+        [(clip_id, 0, "line") for clip_id in ref_clips + [other_side, other_front]],
+    )
+    rows = [
+        {
+            "clip_id": clip_id,
+            "hold_id": 0,
+            **score.hold_values(
+                ft.read_clip_features(ft.output_dir(data) / f"{clip_id}.parquet"), 0
+            ),
+        }
+        for clip_id in ref_clips
+    ]
+    ref = reference.build_reference(rows, "the tests' inline reference")
+    angles = {
+        **{clip_id: "side" for clip_id in ref_clips},
+        other_side: "side",
+        other_front: "front",
+    }
+
+    report = reference.evaluate(rows, ref, data, side_angles=angles, skipped_not_side=3)
+
+    assert "5 hold(s) used, 3 skipped as not side view" in report
+    # The two other line holds are scored; only the side-view one is in the subset.
+    assert "other line holds against the full reference: median=" in report
+    assert "other line holds in side-view clips: median=" in report

@@ -155,10 +155,11 @@ TRAINER_NOTE = "trainer"
 WALL_NOTE = "wall"
 
 #: The catalogue annotation columns ``fill`` owns, in the order the summary prints.
+#: ``camera_angle`` is deliberately not here: it is a person's answer until view
+#: detection (#74) exists, so ``fill`` leaves the column untouched.
 ANNOTATION_FILL_COLUMNS: tuple[str, ...] = (
     "hold_s",
     "outcome",
-    "camera_angle",
     "skill",
     "notes",
 )
@@ -487,10 +488,6 @@ def fill(
         if not (row.get("outcome") or "").strip():
             row["outcome"] = "hold" if clip_id in longest else "no_hold"
             counts["outcome"] += 1
-        if not (row.get("camera_angle") or "").strip():
-            # Every clip so far is a side view; the user confirmed it.
-            row["camera_angle"] = "side"
-            counts["camera_angle"] += 1
         if not (row.get("skill") or "").strip() and clip_id in skills:
             row["skill"] = skills[clip_id]
             counts["skill"] += 1

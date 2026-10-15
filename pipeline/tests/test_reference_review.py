@@ -208,7 +208,7 @@ def test_fill_fills_only_empty_cells_and_leaves_non_empty_ones(
     catalogue = write_catalogue(
         data / "catalogue.csv",
         [
-            # Non-empty outcome/camera_angle must survive; empty skill/notes filled.
+            # Non-empty outcome must survive; empty skill/notes filled.
             {
                 "clip_id": CLIP,
                 "filename": VIDEO_NAME,
@@ -238,7 +238,6 @@ def test_fill_fills_only_empty_cells_and_leaves_non_empty_ones(
     assert report.counts == {
         "hold_s": 2,  # CLIP (0.6) and GONE_CLIP (0.4); OTHER_CLIP already had 9.9
         "outcome": 2,  # OTHER_CLIP and GONE_CLIP; CLIP already had "hold"
-        "camera_angle": 2,  # OTHER_CLIP and GONE_CLIP; CLIP already had "side"
         "skill": 2,  # CLIP (line) and GONE_CLIP (line); OTHER_CLIP already "tuck"
         "notes": 1,  # CLIP got "trainer"
     }
@@ -253,7 +252,9 @@ def test_fill_fills_only_empty_cells_and_leaves_non_empty_ones(
     assert rows[OTHER_CLIP]["hold_s"] == "9.9"  # untouched
     assert rows[OTHER_CLIP]["skill"] == "tuck"  # untouched
     assert rows[OTHER_CLIP]["outcome"] == "hold"
-    assert rows[OTHER_CLIP]["camera_angle"] == "side"
+    # fill never writes camera_angle: it is a person's answer until #74.
+    assert rows[OTHER_CLIP]["camera_angle"] == ""
+    assert rows[GONE_CLIP]["camera_angle"] == ""
 
     assert rows[GONE_CLIP]["hold_s"] == "0.4"
     assert rows[GONE_CLIP]["skill"] == "line"

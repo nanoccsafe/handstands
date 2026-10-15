@@ -13,6 +13,7 @@ Input and output
 Everything is read from the shared data directory, nothing is spelled out here::
 
     <data_dir>/labels/reference_review.csv          # #27: reference-worthy holds
+    <data_dir>/catalogue.csv                        # camera_angle: which view
     <data_dir>/features/<source>/<clip_id>.parquet  # #22/#23: per-frame features
     <data_dir>/labels/hold_shapes.csv               # #86: which holds are lines
 
@@ -21,6 +22,18 @@ athlete-signed medians (and the two spreads) a score is made of, so the referenc
 and the score cannot disagree about what a number means. A hold with fewer than
 :data:`handstand.score.MIN_SCORE_FRAMES` valid frames is skipped and reported,
 never averaged in: no honest median comes out of four frames.
+
+Side views only
+---------------
+
+The side-view features (hip angle, leg separation, knee) are only honest from the
+side, so by default the reference is built from holds whose clip's catalogue
+``camera_angle`` is :data:`SIDE_VIEW` (``"side"``, stripped and lower-cased): a
+``front`` or angled clip, or one whose cell is empty, is skipped with a note.
+``camera_angle`` is a person's answer until view detection (#74) exists, and the
+review (:mod:`handstand.reference_review`) says nothing about the camera.
+``--any-view`` builds from every reviewed hold regardless of the camera, and a
+missing catalogue is an error unless that flag is given.
 
 The reference file is ``docs/scoring.md``'s ``handstand-reference`` schema v1::
 
@@ -46,13 +59,14 @@ CLI::
 
     cd pipeline
     uv run python -m handstand.reference build [--data DIR] [--source SRC]
-        [--out PATH] [--min-holds N] [--install]
+        [--out PATH] [--min-holds N] [--install] [--any-view]
 
 The build also writes a sanity report to
 ``<data_dir>/reports/reference/<YYYY-MM-DD_HHMMSS>.txt`` and prints it: the
-per-feature table, a leave-one-out of the reference holds, and every other line
-hold scored against the full reference — so a person can see that the reference
-holds score better than the rest before anybody trusts the numbers.
+per-feature table, a leave-one-out of the reference holds, every other line hold
+scored against the full reference, and the subset of those in side-view clips —
+so a person can see that the reference holds score better than the rest before
+anybody trusts the numbers.
 """
 
 from __future__ import annotations
@@ -70,7 +84,7 @@ from typing import Any
 
 import pandas as pd
 
-from handstand import features, hold_shapes, reference_review, score
+from handstand import catalogue, features, hold_shapes, reference_review, score
 from handstand.paths import data_dir
 from handstand.postprocess import DEFAULT_SOURCE, SOURCES
 
@@ -82,12 +96,15 @@ __all__ = [
     "REFERENCE_DIRNAME",
     "REPORT_DIRNAME",
     "REPORTS_DIRNAME",
+    "SIDE_VIEW",
     "build_arg_parser",
     "build_reference",
     "built_from_text",
+    "camera_angles",
     "collect_hold_values",
     "default_output",
     "evaluate",
+    "filter_side_view",
     "install_path",
     "main",
     "repo_root",
@@ -122,6 +139,11 @@ MIN_FEATURE_HOLDS = 5
 #: The fewest usable holds a build will accept before it refuses: below this the
 #: whole reference is a handful of holds dressed up as a scale.
 DEFAULT_MIN_HOLDS = 10
+
+#: The catalogue ``camera_angle`` a hold must carry to build the reference: the
+#: side-view features (hip angle, leg separation, knee) are only honest from the
+#: side, and the review says nothing about the camera. Other views are skipped.
+SIDE_VIEW = "side"
 
 #: How many decimal places a reference mean and SD are rounded to.
 _REFERENCE_DIGITS = 6
@@ -166,6 +188,56 @@ def _report_path(root: pathlib.Path, when: dt.datetime | None = None) -> pathlib
 def _hold_number(value: object) -> int:
     """A reviewed hold id as an ``int``; the CSV writes strings and numbers alike."""
     return int(float(str(value).strip()))
+
+
+def camera_angles(data: str | pathlib.Path) -> dict[str, str]:
+    """Each clip's catalogue ``camera_angle``, stripped and lower-cased.
+
+    The reference is built from **side-view** holds only: the side-view features
+    are garbage from the front or at an angle, and the review records the camera
+    nowhere. ``camera_angle`` is a person's answer until view detection (#74)
+    exists, so an empty cell reads ``""`` here. A missing catalogue cannot be
+    filtered at all, so this raises rather than letting a build quietly use every
+    hold; ``--any-view`` skips the call on purpose.
+    """
+    path = reference_review.catalogue_path(data)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"no catalogue to read camera_angle from: {path} "
+            "(build with --any-view to ignore the view)"
+        )
+    return {
+        clip_id: (row.get("camera_angle") or "").strip().lower()
+        for row in catalogue.read_rows(path)
+        if (clip_id := (row.get("clip_id") or "").strip())
+    }
+
+
+def filter_side_view(
+    holds: Iterable[tuple[str, int | str]],
+    angles: Mapping[str, str],
+) -> tuple[set[tuple[str, int | str]], list[str]]:
+    """Split reviewed holds into the side-view ones and a note per skip.
+
+    A hold is kept only when its clip's ``camera_angle`` is :data:`SIDE_VIEW`
+    after stripping and lower-casing, so ``"Side"`` and ``" side "`` count. Every
+    other hold — ``front``, angled, or a clip with an empty or absent cell, which
+    the note calls ``empty`` — is left out with the note the build prints, since
+    only side-view holds are comparable when the side-view features are measured.
+    """
+    kept: set[tuple[str, int | str]] = set()
+    notes: list[str] = []
+    for clip_id, hold_id in sorted(holds, key=lambda item: (str(item[0]), _hold_number(item[1]))):
+        clip = str(clip_id)
+        angle = angles.get(clip, "")
+        if angle == SIDE_VIEW:
+            kept.add((clip_id, hold_id))
+            continue
+        notes.append(
+            f"{clip} h{_hold_number(hold_id)}: not side view "
+            f"(camera_angle={angle or 'empty'})"
+        )
+    return kept, notes
 
 
 def collect_hold_values(
@@ -220,14 +292,21 @@ def collect_hold_values(
     return rows, notes
 
 
-def built_from_text(rows: Sequence[Mapping[str, Any]], data: str | pathlib.Path) -> str:
+def built_from_text(
+    rows: Sequence[Mapping[str, Any]],
+    data: str | pathlib.Path,
+    *,
+    side_only: bool = True,
+) -> str:
     """The file's provenance line: how many holds, from how many clips, dated when.
 
-    ``n`` and ``m`` are the holds and distinct clips actually used, and the date
-    is the modification date of ``data/labels/reference_review.csv`` — when the
-    review was last touched, which is the honest date of the labels. **No clip id,
-    name or path appears here**: the file is built from the user's own data and
-    the free text must not leak which recordings it came from.
+    ``n`` and ``m`` are the holds and distinct clips actually used, the date is
+    the modification date of ``data/labels/reference_review.csv`` — when the
+    review was last touched, which is the honest date of the labels — and
+    ``side_only`` says whether the side-view filter was on, so the text says
+    which set the numbers came from. **No clip id, name or path appears here**:
+    the file is built from the user's own data and the free text must not leak
+    which recordings it came from.
     """
     path = reference_review.labels_path(data)
     try:
@@ -235,8 +314,9 @@ def built_from_text(rows: Sequence[Mapping[str, Any]], data: str | pathlib.Path)
     except OSError:
         date = "unknown"
     clips = len({str(row["clip_id"]) for row in rows})
+    view = "side-view " if side_only else ""
     return (
-        f"{len(rows)} reviewed line holds from {clips} clips "
+        f"{len(rows)} reviewed {view}line holds from {clips} clips "
         f"(reference review, labels updated {date})"
     )
 
@@ -368,10 +448,13 @@ def evaluate(
     reference: Mapping[str, Any],
     data: str | pathlib.Path,
     source: str = DEFAULT_SOURCE,
+    *,
+    side_angles: Mapping[str, str] | None = None,
+    skipped_not_side: int = 0,
 ) -> str:
     """The build's sanity report: what the reference says and how it reads holds.
 
-    Four sections, in order:
+    Sections, in order:
 
     1. per feature of :data:`handstand.score.SCORE_FEATURES`, the mean, SD and n
        the reference carries (or that it was left out and in how many holds it
@@ -381,9 +464,14 @@ def evaluate(
        :func:`build_reference`), reported as median/min/max;
     3. every other **line** hold of ``data/labels/hold_shapes.csv`` (the reference
        holds themselves excluded) scored against the full reference, same
-       statistics plus how many were skipped;
+       statistics plus how many were skipped — and, when ``side_angles`` is given,
+       the subset of those in side-view clips, the only comparable ones;
     4. one line comparing the two medians — the check that the reference holds do
        score better than the rest.
+
+    ``side_angles`` is :func:`camera_angles` when the build filtered to side
+    views: it adds the subset line in 3 and puts ``skipped_not_side`` in the
+    header. ``None`` means every view was used and the report reads as before.
 
     Nothing here changes the reference; it only says whether the numbers deserve
     to be trusted.
@@ -392,7 +480,15 @@ def evaluate(
     cache: dict[str, pd.DataFrame | None] = {}
     reference_object = _as_reference(reference)
 
-    lines = [f"reference report ({len(rows_ref)} hold(s), source {source})", "", "features:"]
+    used = len(rows_ref)
+    if side_angles is None:
+        header = f"reference report ({used} hold(s), source {source})"
+    else:
+        header = (
+            f"reference report ({used} hold(s) used, {skipped_not_side} skipped as not "
+            f"side view, source {source})"
+        )
+    lines = [header, "", "features:"]
     lines.append("  feature          mean            sd              n")
     for name in score.SCORE_FEATURES:
         entry = reference["features"].get(name)
@@ -428,6 +524,7 @@ def evaluate(
         if shape == "line" and (str(clip_id), int(hold_id)) not in reference_keys
     )
     other_scores: list[float] = []
+    side_scores: list[float] = []
     skipped = 0
     for clip_id, hold_id in other:
         table = _clip_table(clip_id, root, source, cache)
@@ -439,12 +536,16 @@ def evaluate(
             skipped += 1
             continue
         other_scores.append(result.score)
+        if side_angles is not None and side_angles.get(clip_id) == SIDE_VIEW:
+            side_scores.append(result.score)
 
     lines += ["", f"leave-one-out of the reference holds: {_score_text(loo_scores)}"]
     lines.append(
         f"other line holds against the full reference: {_score_text(other_scores)}"
         + (f" (skipped {skipped})" if skipped else "")
     )
+    if side_angles is not None:
+        lines.append(f"other line holds in side-view clips: {_score_text(side_scores)}")
     lines.append(
         f"reference holds LOO median {_median_text(loo_scores)} vs other line holds median "
         f"{_median_text(other_scores)}"
@@ -517,16 +618,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
             + " for the app"
         ),
     )
+    build.add_argument(
+        "--any-view",
+        action="store_true",
+        help=(
+            "build from every reviewed hold, not only those whose catalogue "
+            "camera_angle is 'side' (the default); also skips reading the catalogue"
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None, *, repo_dir: str | pathlib.Path | None = None) -> int:
     """Build the reference, write the report, optionally install it.
 
-    Exit codes: **2** when there are fewer than ``--min-holds`` usable holds or
-    the reference cannot be written, **0** otherwise. ``repo_dir`` is the
-    directory ``--install`` copies into and defaults to this checkout; tests pass
-    their own so a build never touches a real tree.
+    Exit codes: **2** when the catalogue is missing without ``--any-view``, when
+    there are fewer than ``--min-holds`` usable holds, or when the reference
+    cannot be written; **0** otherwise. ``repo_dir`` is the directory
+    ``--install`` copies into and defaults to this checkout; tests pass their own
+    so a build never touches a real tree.
     """
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -535,8 +645,15 @@ def main(argv: Sequence[str] | None = None, *, repo_dir: str | pathlib.Path | No
 
     try:
         holds = reference_review.load_reference_holds(root)
+        side_angles: dict[str, str] | None = None
+        skipped_not_side = 0
+        view_notes: list[str] = []
+        if not args.any_view:
+            side_angles = camera_angles(root)
+            holds, view_notes = filter_side_view(holds, side_angles)
+            skipped_not_side = len(view_notes)
         rows, notes = collect_hold_values(holds, root, args.source)
-        for note in notes:
+        for note in view_notes + notes:
             print(f"skip {note}")
 
         if len(rows) < args.min_holds:
@@ -547,11 +664,18 @@ def main(argv: Sequence[str] | None = None, *, repo_dir: str | pathlib.Path | No
             )
             return 2
 
-        built_from = built_from_text(rows, root)
+        built_from = built_from_text(rows, root, side_only=side_angles is not None)
         reference = build_reference(rows, built_from)
         out = pathlib.Path(args.out) if args.out is not None else default_output(root)
         write_reference(reference, out)
-        report = evaluate(rows, reference, root, args.source)
+        report = evaluate(
+            rows,
+            reference,
+            root,
+            args.source,
+            side_angles=side_angles,
+            skipped_not_side=skipped_not_side,
+        )
         report_path = _write_report(root, report)
         print(report)
         print(

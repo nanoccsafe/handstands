@@ -7,7 +7,7 @@ values, z-scores and worst faults it was made of.
 
 Two other issues own the parts this one deliberately does not decide:
 
-- **#28 builds the real reference** from the reviewed line holds; see
+- **#28 builds the real reference** from the reviewed side-view line holds; see
   [Building the reference](#building-the-reference). Nothing here ships one:
   `--reference` is a required argument, there is no bundled default, and no
   reference number is committed to this public repository before it comes out
@@ -172,13 +172,22 @@ comes out of the labelled set:
 ```sh
 cd pipeline
 uv run python -m handstand.reference build [--data DIR] [--source SRC]
-    [--out PATH] [--min-holds N] [--install]
+    [--out PATH] [--min-holds N] [--install] [--any-view]
 ```
 
 `handstand.reference` reads:
 
 - `data/labels/reference_review.csv` (#27) for the holds the user marked
   reference-worthy and not against a wall;
+- `data/catalogue.csv`'s `camera_angle` to keep **side-view holds only** by
+  default: the side-view features (hip angle, leg separation, knee) are only
+  honest from the side, and the review records the camera nowhere. `camera_angle`
+  is a person's answer until view detection (#74) exists; a clip counts as side
+  view when the cell is `"side"` after stripping and lower-casing. A hold in a
+  `front` or angled clip, or in a clip whose cell is empty, is skipped with a
+  note and counted in the report header. `--any-view` builds from every reviewed
+  hold regardless of the camera, and a missing catalogue is an error unless it is
+  given;
 - `data/features/<source>/<clip_id>.parquet` (#22/#23) for one value per hold —
   the same athlete-signed `score.hold_values` medians and spreads a hold is
   scored on.
@@ -191,10 +200,10 @@ out — missing features are allowed by the format. It writes
 `<data_dir>/references/reference-line.json` by default, prints `n_holds` and the
 features written, and writes a sanity report to
 `<data_dir>/reports/reference/<YYYY-MM-DD_HHMMSS>.txt`: the per-feature table, a
-leave-one-out of the reference holds, and every other line hold scored against
-the full reference (the reference holds' median should come out higher).
-`--min-holds` (default 10) refuses a reference built from too few holds, and
-`--install` copies the file to `ios/LocalResources/reference-line.json`, the
+leave-one-out of the reference holds, every other line hold scored against the
+full reference, and the subset of those in side-view clips (the only comparable
+ones). `--min-holds` (default 10) refuses a reference built from too few holds,
+and `--install` copies the file to `ios/LocalResources/reference-line.json`, the
 name the app's `ReferenceLoader` looks for.
 
 ## CLI
