@@ -21,11 +21,12 @@ import Foundation
 //   red there.
 //
 // The earlier rule (user, 2026-10-06) was "live mode never corrects mid-hold".
-// The user changed it at the gym, keeping the spirit: **sparse, one short
-// phrase, only for a sustained red fault, and optional in Settings.** So this
-// detector fires at most once per fault direction per hold attempt, waits out
-// a red that merely flickers, and re-arms only once the fault has actually
-// gone.
+// The user changed it at the gym, keeping the spirit: **one short phrase, only
+// for a sustained red fault, and optional in Settings.** The pacing is now
+// 'coach mode' (user, 2026-10-15, chainlink #100): while a fault stays red the
+// phrase repeats every couple of seconds rather than firing once, so the
+// athlete is guided back to the line instead of corrected a single time. A red
+// that merely flickers is still waited out.
 // --------------------------------------------------------------------------- #
 
 /// When the live form detector speaks, and about what — chainlink #97.
@@ -43,13 +44,15 @@ public struct LiveFormConfig: Sendable, Equatable {
     /// continues across it. Longer than this, and the red run restarts.
     public var gapS = 0.3
 
-    /// After an event, the fault must be clear for this long before the same
-    /// direction can be spoken again.
-    public var rearmS = 2.0
+    /// Coach-mode pacing: while a fault stays red, an event fires every this
+    /// many seconds — measured from the previous form event of the attempt —
+    /// the first one after ``redHoldS`` of red.
+    public var repeatS = 2.0
 
     /// At least this long between any two form phrases, whatever the attempt
-    /// and whatever the direction.
-    public var minSpacingS = 5.0
+    /// and whatever the direction. The same two seconds as ``repeatS``: a
+    /// correction about the same fault comes at coach pace.
+    public var minSpacingS = 2.0
 
     /// How long the hold gate must have been true before a phrase may fire.
     public var gateS = 0.5
@@ -82,19 +85,24 @@ public enum LiveFormEvent: Equatable, Sendable {
     /// *"Straighten."*.
     case bent(tMs: Int)
 
+    /// The hips are piked — the shoulder–hip–ankle angle is red — say
+    /// *"Hips over shoulders."* (chainlink #100).
+    case hips(tMs: Int)
+
     /// The direction this event corrects.
     public var fault: FormFault {
         switch self {
         case .arch: return .arch
         case .hollow: return .hollow
         case .bent: return .bent
+        case .hips: return .hips
         }
     }
 
     /// When the frame that earned this event was captured, milliseconds.
     public var tMs: Int {
         switch self {
-        case .arch(let tMs), .hollow(let tMs), .bent(let tMs): return tMs
+        case .arch(let tMs), .hollow(let tMs), .bent(let tMs), .hips(let tMs): return tMs
         }
     }
 }
@@ -115,8 +123,8 @@ struct LiveBanana: Equatable {
 /// Feed one frame per call with its capture timestamp and the joints in
 /// **display pixels, display orientation**; the events come back in the order
 /// they happened. The detector keeps only what the next frame needs: whether
-/// a hold is in progress, when the current red run began, and which
-/// directions have already spoken.
+/// a hold is in progress, when the current red run began, and when the last
+/// phrase was said.
 public struct LiveFormDetector: Sendable {
     /// The rules this detector applies.
     public var config: LiveFormConfig
@@ -142,16 +150,10 @@ public struct LiveFormDetector: Sendable {
     /// When the current clear gap inside a red run began, `nil` while red.
     private var redGapSinceTMs: Int?
 
-    /// When the fault first went clear since the last event, `nil` while red —
-    /// what ``LiveFormConfig/rearmS`` times.
-    private var clearSinceTMs: Int?
-
-    /// The directions already spoken about in this attempt.
-    private var fired: Set<FormFault> = []
-
     /// When the last form phrase was earned — the global
-    /// ``LiveFormConfig/minSpacingS`` spacing. Survives the attempt, so two
-    /// holds close together do not both get a phrase.
+    /// ``LiveFormConfig/minSpacingS`` and ``LiveFormConfig/repeatS`` spacings.
+    /// Survives the attempt, so two holds close together do not both get a
+    /// phrase.
     private var lastEventTMs: Int?
 
     public init(config: LiveFormConfig = .init()) {
@@ -176,40 +178,37 @@ public struct LiveFormDetector: Sendable {
         guard let attemptStart = attemptStartTMs, inShape else { return [] }
 
         let banana = Self.banana(joints: joints, config: config)
-        let red = banana.map { Self.isRed($0.magnitude) } ?? false
+        let hipAngle = LiveLineDetector.hipAngleDeg(
+            joints: joints, minVisibility: config.minVisibility)
+        let fault = Self.chosenFault(banana: banana, hipAngleDeg: hipAngle)
 
-        if red, let banana {
+        if let fault {
             redGapSinceTMs = nil
-            clearSinceTMs = nil
             if redSinceTMs == nil { redSinceTMs = tMs }
             guard let since = redSinceTMs else { return [] }
-            let fault = Self.fault(forSignedBanana: banana.signed)
             let heldLongEnough = Double(tMs - since) >= config.redHoldS * 1000
             let gatedLongEnough = Double(tMs - attemptStart) >= config.gateS * 1000
+            let repeated = lastEventTMs.map {
+                Double(tMs - $0) >= config.repeatS * 1000
+            } ?? true
             let spacedOut = lastEventTMs.map {
                 Double(tMs - $0) >= config.minSpacingS * 1000
             } ?? true
-            guard heldLongEnough, gatedLongEnough, !fired.contains(fault), spacedOut else {
+            guard heldLongEnough, gatedLongEnough, repeated, spacedOut else {
                 return []
             }
-            fired.insert(fault)
             lastEventTMs = tMs
             return [Self.event(fault, tMs: tMs)]
         }
 
-        // Not red: time the gap that keeps a red run alive, and the clear
-        // stretch that re-arms a direction.
+        // Not red: time the gap that keeps a red run alive. Once it outlasts
+        // `gapS` the red run is over, so the next red earns a fresh hold.
         if redSinceTMs != nil {
             if redGapSinceTMs == nil { redGapSinceTMs = tMs }
             if let gap = redGapSinceTMs, Double(tMs - gap) >= config.gapS * 1000 {
                 redSinceTMs = nil
                 redGapSinceTMs = nil
             }
-        }
-        if let clear = clearSinceTMs {
-            if Double(tMs - clear) >= config.rearmS * 1000 { fired.removeAll() }
-        } else {
-            clearSinceTMs = tMs
         }
         return []
     }
@@ -236,12 +235,10 @@ public struct LiveFormDetector: Sendable {
         }
     }
 
-    /// A fresh attempt: no red run yet, nothing spoken, nothing to re-arm.
+    /// A fresh attempt: no red run yet, and nothing already spoken.
     private mutating func beginAttempt() {
         redSinceTMs = nil
         redGapSinceTMs = nil
-        clearSinceTMs = nil
-        fired.removeAll()
     }
 
     /// The attempt is over (the gate has been false for a second): drop the
@@ -319,11 +316,62 @@ public struct LiveFormDetector: Sendable {
     /// Is `magnitude` a red banana? — the severity the stress diagram uses for
     /// "no reference", then `Severity.colourBand`.
     static func isRed(_ magnitude: Double) -> Bool {
-        guard magnitude.isFinite else { return false }
-        guard let severity = StressDiagram.valueSeverity(
-            magnitude, feature: "banana", reference: nil)
-        else { return false }
+        guard let severity = bananaSeverity(magnitude) else { return false }
         return Severity.colourBand(severity) == .bad
+    }
+
+    /// Is `deg` a red hip (a pike), by the very severity the stress diagram
+    /// colours `hip_angle` with (chainlink #100)? No copied threshold: the
+    /// tolerance and the band are `StressDiagram`'s.
+    static func isHipRed(_ deg: Double) -> Bool {
+        guard let severity = hipSeverity(deg) else { return false }
+        return Severity.colourBand(severity) == .bad
+    }
+
+    /// The stress diagram's severity for a banana magnitude, `nil` when it has
+    /// no opinion (an unmeasured value).
+    static func bananaSeverity(_ magnitude: Double) -> Double? {
+        guard magnitude.isFinite else { return nil }
+        return StressDiagram.valueSeverity(magnitude, feature: "banana", reference: nil)
+    }
+
+    /// The stress diagram's severity for a hip angle, `nil` when it has no
+    /// opinion (an unmeasured value).
+    static func hipSeverity(_ deg: Double) -> Double? {
+        guard deg.isFinite else { return nil }
+        return StressDiagram.valueSeverity(deg, feature: "hip_angle", reference: nil)
+    }
+
+    /// The fault to say on a frame where something is red — the "biggest fault
+    /// first" choice (chainlink #100). `nil` when neither the banana nor the
+    /// hip is red.
+    ///
+    /// The two faults overlap: an arch lowers the unsigned hip angle, so its
+    /// severity is a floor under the hip's. The banana's *sign* is what tells
+    /// them apart: an arch (positive banana) is preferred only when its
+    /// severity is at least the hip's; any other red shape is a hip, which is
+    /// the correction that opens the line. A negative or unknown (hollow /
+    /// bent) banana keeps its own #97 fault only while the hip is not red.
+    static func chosenFault(banana: LiveBanana?, hipAngleDeg: Double?) -> FormFault? {
+        let bananaRed = banana.map { isRed($0.magnitude) } ?? false
+        let hipRed = hipAngleDeg.map(isHipRed) ?? false
+        guard bananaRed || hipRed else { return nil }
+
+        if bananaRed, hipRed {
+            if let banana, banana.signed > 0,
+                let hipDeg = hipAngleDeg,
+                let bananaSev = bananaSeverity(banana.magnitude),
+                let hipSev = hipSeverity(hipDeg),
+                bananaSev >= hipSev
+            {
+                return .arch
+            }
+            return .hips
+        }
+        if bananaRed, let banana {
+            return fault(forSignedBanana: banana.signed)
+        }
+        return .hips
     }
 
     /// The direction a signed banana corrects: positive is the belly side
@@ -341,6 +389,7 @@ public struct LiveFormDetector: Sendable {
         case .arch: return .arch(tMs: tMs)
         case .hollow: return .hollow(tMs: tMs)
         case .bent: return .bent(tMs: tMs)
+        case .hips: return .hips(tMs: tMs)
         }
     }
 

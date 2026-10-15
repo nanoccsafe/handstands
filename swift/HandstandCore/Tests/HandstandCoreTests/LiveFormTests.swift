@@ -13,10 +13,17 @@ final class LiveFormTests: XCTestCase {
     // MARK: - Synthetic frames
 
     /// A hold-like body, built from its own numbers: wrists on the floor at
-    /// the bottom, ankles straight above them, and the hip midpoint slid
-    /// sideways by `hipOffsetX` — with the nose on the right, a positive
-    /// offset is the belly side (an arch) and a negative one the back (a
-    /// hollow). `nose` off drops the nose so the sign is unknown.
+    /// the bottom, ankles straight above them, and the **right** hip (and its
+    /// knee and foot) slid sideways by `hipOffsetX` — with the nose on the
+    /// right, a positive offset is the belly side (an arch) and a negative one
+    /// the back (a hollow).
+    ///
+    /// Only one side moves on purpose: `hipAngleDeg` measures the *left* side
+    /// (both sides are equally confident, so it keeps the first), which stays
+    /// straight — this is a red *banana* with a fine hip, the shape the
+    /// "biggest fault first" rule must still call `.arch` / `.hollow`.
+    /// `Synthetic.pike` is the hip fault instead. `nose` off drops the nose so
+    /// the sign is unknown.
     private enum Synthetic {
         static func hold(
             hipOffsetX: Double = 0,
@@ -29,9 +36,9 @@ final class LiveFormTests: XCTestCase {
                 .rightWrist: Keypoint(x: 580, y: 1850, visibility: visibility),
                 .leftShoulder: Keypoint(x: 510, y: 1550, visibility: visibility),
                 .rightShoulder: Keypoint(x: 570, y: 1550, visibility: visibility),
-                .leftHip: Keypoint(x: 520 + hipOffsetX, y: 1000, visibility: visibility),
+                .leftHip: Keypoint(x: 520, y: 1000, visibility: visibility),
                 .rightHip: Keypoint(x: 560 + hipOffsetX, y: 1000, visibility: visibility),
-                .leftKnee: Keypoint(x: 525 + hipOffsetX, y: 725, visibility: visibility),
+                .leftKnee: Keypoint(x: 525, y: 725, visibility: visibility),
                 .rightKnee: Keypoint(x: 555 + hipOffsetX, y: 725, visibility: visibility),
                 .leftAnkle: Keypoint(x: 520, y: 450, visibility: visibility),
                 .rightAnkle: Keypoint(x: 560, y: 450, visibility: visibility),
@@ -44,19 +51,42 @@ final class LiveFormTests: XCTestCase {
             return joints
         }
 
-        /// A red arch: the hip slid towards the nose's side.
+        /// A red arch: the hip slid towards the nose's side, the measured hip
+        /// still fine.
         static func arch(visibility: Double = 0.9) -> [Joint: Keypoint] {
-            hold(hipOffsetX: 200, visibility: visibility)
+            hold(hipOffsetX: 400, visibility: visibility)
         }
 
         /// A red hollow: the hip slid away from the nose's side.
         static func hollow(visibility: Double = 0.9) -> [Joint: Keypoint] {
-            hold(hipOffsetX: -200, visibility: visibility)
+            hold(hipOffsetX: -400, visibility: visibility)
         }
 
         /// A red arch with no nose: the sign is unknown.
         static func bent(visibility: Double = 0.9) -> [Joint: Keypoint] {
-            hold(hipOffsetX: 200, nose: false, visibility: visibility)
+            hold(hipOffsetX: 400, nose: false, visibility: visibility)
+        }
+
+        /// A piked hold: the shoulders swung to `hipDeg` from the hip→ankle
+        /// direction, symmetric about the body's axis — a real pike whose
+        /// banana stays below red (`pike(hipDeg: 150)` is red at the hip and
+        /// amber at the banana, the hip fault alone).
+        static func pike(hipDeg: Double, visibility: Double = 0.9) -> [Joint: Keypoint] {
+            let hipMid = (x: 540.0, y: 1000.0)
+            let reach = 550.0
+            let radians = hipDeg * Double.pi / 180.0
+            let shoulderMid = (
+                x: hipMid.x + reach * sin(radians),
+                y: hipMid.y - reach * cos(radians)
+            )
+            var joints = hold(visibility: visibility)
+            joints[.leftShoulder] = Keypoint(
+                x: shoulderMid.x - 30, y: shoulderMid.y, visibility: visibility)
+            joints[.rightShoulder] = Keypoint(
+                x: shoulderMid.x + 30, y: shoulderMid.y, visibility: visibility)
+            joints[.nose] = Keypoint(
+                x: shoulderMid.x, y: shoulderMid.y + 60, visibility: visibility)
+            return joints
         }
 
         /// The same body standing on its feet: nothing is inverted, so the
@@ -103,8 +133,8 @@ final class LiveFormTests: XCTestCase {
         let config = LiveFormConfig()
         XCTAssertEqual(config.redHoldS, 1.0)
         XCTAssertEqual(config.gapS, 0.3)
-        XCTAssertEqual(config.rearmS, 2.0)
-        XCTAssertEqual(config.minSpacingS, 5.0)
+        XCTAssertEqual(config.repeatS, 2.0, "coach pace: a phrase every two seconds")
+        XCTAssertEqual(config.minSpacingS, 2.0)
         XCTAssertEqual(config.gateS, 0.5)
         XCTAssertEqual(config.gateMaxAngleDeg, 35.0)
         XCTAssertEqual(config.minVisibility, 0.5)
@@ -121,11 +151,11 @@ final class LiveFormTests: XCTestCase {
         XCTAssertTrue(detector.isInAttempt, "the gate was open the whole time")
     }
 
-    func testARedArchHeldLongEnoughSaysItOnce() {
+    func testARedArchHeldLongEnoughSaysIt() {
         var detector = LiveFormDetector()
         let events = feed(&detector, from: 0, through: 1200, by: 100) { _ in Synthetic.arch() }
 
-        XCTAssertEqual(events, [.arch(tMs: 1000)], "1.2 s of red earns one phrase, at 1.0 s")
+        XCTAssertEqual(events, [.arch(tMs: 1000)], "1.2 s of red earns a phrase, at 1.0 s")
     }
 
     func testARedArchHeldTooBrieflySaysNothing() {
@@ -146,28 +176,29 @@ final class LiveFormTests: XCTestCase {
         XCTAssertEqual(events, [.arch(tMs: 1000)], "a blink is not a recovery")
     }
 
-    // MARK: - Once per attempt, and the re-arm
+    // MARK: - Coach-mode repeats (chainlink #100)
 
-    func testASecondArchInTheSameAttemptSaysNothing() {
+    func testARedFaultRepeatsEveryTwoSecondsWhileRed() {
         var detector = LiveFormDetector()
         let events = feed(&detector, from: 0, through: 8000, by: 100) { _ in Synthetic.arch() }
 
-        XCTAssertEqual(events, [.arch(tMs: 1000)], "one phrase per direction per attempt")
+        XCTAssertEqual(
+            events,
+            [.arch(tMs: 1000), .arch(tMs: 3000), .arch(tMs: 5000), .arch(tMs: 7000)],
+            "coach pace: a phrase every two seconds while the fault stays red")
     }
 
-    func testAClearedFaultReArmsAfterTwoSecondsAndFiveSecondsSpacing() {
+    func testAClearedFaultStartsAFreshHold() {
         var detector = LiveFormDetector()
         var events = feed(&detector, from: 0, through: 1000, by: 100) { _ in Synthetic.arch() }
-        // The fault is clear for ~2.9 s: long enough to re-arm at 3.1 s.
+        // Clear for ~3 s: the red run is over, so the next red earns a fresh
+        // 1.0 s hold before it speaks.
         events += feed(&detector, from: 1100, through: 4000, by: 100) { _ in Synthetic.hold() }
-        // Red again: the 1.0 s hold is met at 5.1 s, but the global 5 s spacing
-        // (last phrase 1.0 s) is only met at 6.0 s — so the second phrase is
-        // 6.0 s, not 5.1 s.
         events += feed(&detector, from: 4100, through: 6200, by: 100) { _ in Synthetic.arch() }
 
         XCTAssertEqual(
-            events, [.arch(tMs: 1000), .arch(tMs: 6000)],
-            "re-armed after the clear, but spaced five seconds from the first phrase")
+            events, [.arch(tMs: 1000), .arch(tMs: 5100)],
+            "after the clear, the next phrase waits out the fresh 1 s hold")
     }
 
     func testAHoldAttemptEndsAfterOneSecondWithoutTheGate() {
@@ -214,6 +245,72 @@ final class LiveFormTests: XCTestCase {
         XCTAssertTrue(LiveFormDetector.isRed(0.14), "the band flips to red at exactly 0.14 L")
         XCTAssertTrue(LiveFormDetector.isRed(0.5))
         XCTAssertFalse(LiveFormDetector.isRed(.nan), "an unmeasured banana is not a fault")
+    }
+
+    // MARK: - The hip fault (chainlink #100)
+
+    func testHipRedIsTheStressDiagramBand() {
+        for deg in [150.0, 160.0, 162.0, 170.0] {
+            let severity = StressDiagram.valueSeverity(deg, feature: "hip_angle", reference: nil)
+            XCTAssertEqual(
+                LiveFormDetector.isHipRed(deg),
+                severity.map { Severity.colourBand($0) == .bad } ?? false,
+                "\(deg)° follows the stress diagram, not a copied threshold")
+        }
+        XCTAssertTrue(LiveFormDetector.isHipRed(150))
+        XCTAssertTrue(LiveFormDetector.isHipRed(160), "160° is still in the red band")
+        XCTAssertFalse(LiveFormDetector.isHipRed(162), "162° is above the red band")
+        XCTAssertFalse(LiveFormDetector.isHipRed(170), "an open hip is no fault")
+        XCTAssertFalse(LiveFormDetector.isHipRed(.nan), "an unmeasured hip is not a fault")
+    }
+
+    func testAPikedHipHeldLongEnoughSaysHipsOverShoulders() {
+        var detector = LiveFormDetector()
+        let events = feed(&detector, from: 0, through: 1200, by: 100) { _ in
+            Synthetic.pike(hipDeg: 150)
+        }
+        XCTAssertEqual(events, [.hips(tMs: 1000)], "a red hip earns the pike phrase at 1.0 s")
+    }
+
+    func testAPikedHipRepeatsEveryTwoSecondsWhileRed() {
+        var detector = LiveFormDetector()
+        let events = feed(&detector, from: 0, through: 3300, by: 100) { _ in
+            Synthetic.pike(hipDeg: 150)
+        }
+        XCTAssertEqual(
+            events, [.hips(tMs: 1000), .hips(tMs: 3000)],
+            "the hip phrase repeats at coach pace while the hips stay piked")
+    }
+
+    func testAnOpenHipSaysNothing() {
+        var detector = LiveFormDetector()
+        let events = feed(&detector, from: 0, through: 2000, by: 100) { _ in
+            Synthetic.pike(hipDeg: 170)
+        }
+        XCTAssertEqual(events, [], "170° at the hip is no fault")
+    }
+
+    func testTheBiggestFaultWinsOnAFrame() {
+        // 0.2 L is a banana severity of 0.8; 160° is a hip severity of 0.55.
+        let arch = LiveBanana(magnitude: 0.2, signed: 0.2)
+        XCTAssertEqual(
+            LiveFormDetector.chosenFault(banana: arch, hipAngleDeg: 160), .arch,
+            "an arch at least as severe as the hip keeps 'Ribs in.'")
+        XCTAssertEqual(
+            LiveFormDetector.chosenFault(banana: arch, hipAngleDeg: 140), .hips,
+            "a much worse hip wins over the arch")
+        XCTAssertEqual(
+            LiveFormDetector.chosenFault(
+                banana: LiveBanana(magnitude: 0.2, signed: -0.2), hipAngleDeg: 150), .hips,
+            "a hollow banana loses to a red hip")
+        XCTAssertEqual(
+            LiveFormDetector.chosenFault(
+                banana: LiveBanana(magnitude: 0.2, signed: -0.2), hipAngleDeg: 170), .hollow,
+            "a hollow banana with a fine hip keeps its own fault")
+        XCTAssertNil(
+            LiveFormDetector.chosenFault(
+                banana: LiveBanana(magnitude: 0.05, signed: 0.05), hipAngleDeg: 175),
+            "nothing red is no fault")
     }
 
     // MARK: - The offline agreement

@@ -152,8 +152,11 @@ final class LiveLineTests: XCTestCase {
         var detector = LiveLineDetector()
         let events = feed(&detector, from: 0, through: 2000, by: 100) { _ in Synthetic.frame() }
 
-        XCTAssertEqual(events, [.lineAchieved(tMs: 500)], "one line, one cue, at 0.5 s")
+        XCTAssertEqual(
+            events, [.up(tMs: 500), .lineAchieved(tMs: 500)],
+            "up is acknowledged first, then one line cue, both at 0.5 s")
         XCTAssertTrue(detector.isInLine)
+        XCTAssertTrue(detector.isUpNow)
         XCTAssertTrue(detector.isInverted)
     }
 
@@ -180,7 +183,7 @@ final class LiveLineTests: XCTestCase {
 
         XCTAssertEqual(
             events,
-            [.lineAchieved(tMs: 500), .lineLost(tMs: 2000, heldS: 1.5)],
+            [.up(tMs: 500), .lineAchieved(tMs: 500), .lineLost(tMs: 2000, heldS: 1.5)],
             "the loss is reported once, 0.4 s after the line's last frame"
         )
         XCTAssertFalse(detector.isInLine)
@@ -194,7 +197,10 @@ final class LiveLineTests: XCTestCase {
 
         XCTAssertEqual(
             events,
-            [.lineAchieved(tMs: 500), .lineLost(tMs: 1500, heldS: 1.0), .lineAchieved(tMs: 2600)]
+            [
+                .up(tMs: 500), .lineAchieved(tMs: 500),
+                .lineLost(tMs: 1500, heldS: 1.0), .lineAchieved(tMs: 2600),
+            ]
         )
     }
 
@@ -207,8 +213,9 @@ final class LiveLineTests: XCTestCase {
             Synthetic.frame(hipDeg: 140)
         }
 
-        XCTAssertEqual(events, [], "140° at the hip is a pike, not a line")
+        XCTAssertEqual(events, [.up(tMs: 500)], "140° at the hip is a pike, not a line — but still up")
         XCTAssertFalse(detector.isInLine)
+        XCTAssertTrue(detector.isUpNow, "a pike is still up — it earns the acknowledgement")
         XCTAssertTrue(detector.isInverted, "a pike is still upside down — just not a line")
     }
 
@@ -220,7 +227,7 @@ final class LiveLineTests: XCTestCase {
             Synthetic.frame(leanDeg: 25)
         }
 
-        XCTAssertEqual(events, [], "25° of lean is a handstand walk, not a held line")
+        XCTAssertEqual(events, [.up(tMs: 500)], "25° of lean is a handstand walk, not a held line — but still up")
         XCTAssertFalse(detector.isInLine)
     }
 
@@ -260,9 +267,67 @@ final class LiveLineTests: XCTestCase {
             Synthetic.bananaRedLine()
         }
 
-        XCTAssertEqual(events, [], "a banana the report will call red is never a line")
+        XCTAssertEqual(events, [.up(tMs: 500)], "a banana the report will call red is never a line — but still up")
         XCTAssertFalse(detector.isInLine)
         XCTAssertTrue(detector.isInverted, "it is still upside down — just not a line")
+    }
+
+    // MARK: - The "Up." acknowledgement (chainlink #100)
+
+    /// A piked hold: 140° at the hip is a pike, so the *line* gates fail and
+    /// only `.up` can fire — which keeps these assertions about the
+    /// acknowledgement alone.
+    private func upFrame() -> [Joint: Keypoint] { Synthetic.frame(hipDeg: 140) }
+
+    func testAnUpOffTheGroundIsAcknowledgedOnceAfterTheOnset() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 1200, by: 100) { _ in upFrame() }
+
+        XCTAssertEqual(events, [.up(tMs: 500)], "0.6 s up earns exactly one acknowledgement")
+        XCTAssertTrue(detector.isUpNow)
+    }
+
+    func testAShortUpSaysNothing() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 400, by: 100) { _ in upFrame() }
+
+        XCTAssertEqual(events, [], "0.4 s up is below the 0.5 s onset")
+        XCTAssertFalse(detector.isUpNow)
+    }
+
+    func testStandingIsNeverUp() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 2000, by: 100) { _ in Synthetic.standing() }
+
+        XCTAssertEqual(events, [], "wrists below the hips is never up")
+        XCTAssertFalse(detector.isUpNow)
+    }
+
+    func testAShortDipDoesNotReFireUpButALongOneEarnsASecond() {
+        var detector = LiveLineDetector()
+        // Up, then a 0.5 s dip — inside upEndS (1 s), so the stretch survives.
+        var events = feed(&detector, from: 0, through: 600, by: 100) { _ in upFrame() }
+        events += feed(&detector, from: 700, through: 1100, by: 100) { _ in Synthetic.standing() }
+        events += feed(&detector, from: 1200, through: 1800, by: 100) { _ in upFrame() }
+        XCTAssertEqual(events, [.up(tMs: 500)], "a dip shorter than upEndS does not re-fire")
+        XCTAssertTrue(detector.isUpNow)
+
+        // A full 1.2 s down ends the stretch, so coming back up is a new one.
+        var again = LiveLineDetector()
+        var more = feed(&again, from: 0, through: 600, by: 100) { _ in upFrame() }
+        more += feed(&again, from: 700, through: 1900, by: 100) { _ in Synthetic.standing() }
+        XCTAssertFalse(again.isUpNow, "1.2 s down ends the stretch")
+        more += feed(&again, from: 2000, through: 2600, by: 100) { _ in upFrame() }
+        XCTAssertEqual(more, [.up(tMs: 500), .up(tMs: 2500)])
+    }
+
+    func testUpPrecedesLineAchievedOnTheSameFrame() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 800, by: 100) { _ in Synthetic.frame() }
+
+        XCTAssertEqual(
+            events, [.up(tMs: 500), .lineAchieved(tMs: 500)],
+            "the acknowledgement is spoken before the line cue")
     }
 
     // MARK: - Time
@@ -276,7 +341,7 @@ final class LiveLineTests: XCTestCase {
         for tMs in [0, 40, 90, 160, 260, 420, 610, 780] {
             events += vfr.update(tMs: tMs, joints: Synthetic.frame())
         }
-        XCTAssertEqual(events, [.lineAchieved(tMs: 610)])
+        XCTAssertEqual(events, [.up(tMs: 610), .lineAchieved(tMs: 610)])
 
         // Forty-one frames of the same shape in 0.4 s: plenty of frames, not
         // enough time, no cue.
@@ -292,6 +357,7 @@ final class LiveLineTests: XCTestCase {
         XCTAssertEqual(
             events,
             [
+                .up(tMs: 500),
                 .lineAchieved(tMs: 500),
                 .timeMark(tMs: 5000, seconds: 5),
                 .timeMark(tMs: 10_000, seconds: 10),
@@ -304,7 +370,7 @@ final class LiveLineTests: XCTestCase {
         var detector = LiveLineDetector(timeMarksEverySeconds: nil)
         let events = feed(&detector, from: 0, through: 11_000, by: 100) { _ in Synthetic.frame() }
 
-        XCTAssertEqual(events, [.lineAchieved(tMs: 500)])
+        XCTAssertEqual(events, [.up(tMs: 500), .lineAchieved(tMs: 500)])
     }
 
     // MARK: - The offline agreement

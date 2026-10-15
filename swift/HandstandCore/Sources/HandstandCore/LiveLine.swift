@@ -47,6 +47,15 @@ public struct LiveLineConfig: Sendable, Equatable {
     /// a line.
     public var lossS = 0.4
 
+    /// How long `isUp` must hold before the `.up` acknowledgement fires — the
+    /// hysteresis that keeps a kick-through flicker from being cheered.
+    public var upOnsetS = 0.5
+
+    /// An "up" stretch ends after `isUp` has been false this long; a shorter
+    /// dip does not end it, and a new stretch (after a longer one) may fire
+    /// `.up` again.
+    public var upEndS = 1.0
+
     /// The confidence a joint needs to count (`Keypoint.visibility`); below it a
     /// joint is treated exactly as one nobody reported.
     public var minVisibility = 0.5
@@ -59,6 +68,12 @@ public struct LiveLineConfig: Sendable, Equatable {
 /// Timestamps come from the frame's own `tMs` — the capture clock, variable
 /// frame rate, never a fixed fps.
 public enum LiveEvent: Equatable, Sendable {
+    /// The athlete is *up* — palms on the floor with the legs above the hips —
+    /// and it has now held for ``LiveLineConfig/upOnsetS``. Once per up
+    /// stretch, the moment to say *"Up."*. It comes before any `.lineAchieved`
+    /// of the same frame.
+    case up(tMs: Int)
+
     /// The shape became a line and has now held for
     /// ``LiveLineConfig/onsetS`` — once per line, the moment to speak
     /// *"Line. Hold it."*
@@ -116,6 +131,16 @@ public struct LiveLineDetector: Sendable {
     /// window keeps it true.
     private var inLineNow = false
 
+    /// When the current run of *up* frames began, `nil` outside one.
+    private var upSinceTMs: Int?
+
+    /// Has `.up` already fired for the current up stretch?
+    private var upAnnounced = false
+
+    /// When the current run of *non-up* frames began, `nil` while up — the
+    /// gap the `upEndS` hysteresis times.
+    private var upBreakSinceTMs: Int?
+
     public init(config: LiveLineConfig = .init(), timeMarksEverySeconds: Int? = nil) {
         self.config = config
         self.timeMarksEverySeconds = timeMarksEverySeconds.flatMap { $0 > 0 ? $0 : nil }
@@ -123,6 +148,11 @@ public struct LiveLineDetector: Sendable {
 
     /// Is a confirmed line in progress (announced, not yet lost)?
     public var isInLine: Bool { inLineNow }
+
+    /// Is the athlete up and acknowledged? True from the `.up` event until the
+    /// stretch ends (the shape has been not-up for ``LiveLineConfig/upEndS``),
+    /// like ``isInLine``.
+    public var isUpNow: Bool { upAnnounced }
 
     /// Was the athlete upside down in the frame just fed? Confident joints
     /// only — wrists below ankles, or below hips when the ankles are missing.
@@ -138,6 +168,10 @@ public struct LiveLineDetector: Sendable {
         invertedNow = Self.isInverted(joints: joints, minVisibility: config.minVisibility)
         var events = [LiveEvent]()
 
+        // The "Up." acknowledgement comes first: a frame can be both up and a
+        // line, and "Up." precedes the line cue of the same frame.
+        events.append(contentsOf: upFrame(joints: joints, at: tMs))
+
         if Self.isLine(joints: joints, config: config) {
             events.append(contentsOf: lineFrame(at: tMs))
         } else {
@@ -145,6 +179,39 @@ public struct LiveLineDetector: Sendable {
         }
         inLineNow = announced
         return events
+    }
+
+    /// One frame's contribution to the "up" acknowledgement — chainlink #100.
+    ///
+    /// Track the up stretch: open one on the first `isUp` frame, fire `.up`
+    /// once after ``LiveLineConfig/upOnsetS``, and end it (so a later stretch
+    /// can fire again) once the rule has been false for
+    /// ``LiveLineConfig/upEndS``. A dip shorter than that keeps the stretch —
+    /// and the one cue already spoken for it — alive.
+    private mutating func upFrame(joints: [Joint: Keypoint], at tMs: Int) -> [LiveEvent] {
+        if Self.isUp(joints: joints, minVisibility: config.minVisibility) {
+            upBreakSinceTMs = nil
+            if upSinceTMs == nil {
+                upSinceTMs = tMs
+                upAnnounced = false
+            }
+            guard !upAnnounced, let since = upSinceTMs,
+                Double(tMs - since) >= config.upOnsetS * 1000
+            else { return [] }
+            upAnnounced = true
+            return [.up(tMs: tMs)]
+        }
+
+        // Not up: time the gap that ends the stretch, and end it once it
+        // outlasts `upEndS`.
+        guard upSinceTMs != nil else { return [] }
+        if upBreakSinceTMs == nil { upBreakSinceTMs = tMs }
+        guard let broken = upBreakSinceTMs, Double(tMs - broken) >= config.upEndS * 1000
+        else { return [] }
+        upSinceTMs = nil
+        upAnnounced = false
+        upBreakSinceTMs = nil
+        return []
     }
 
     /// A frame that is a line: open a run if there was none, then check the
@@ -224,6 +291,24 @@ public struct LiveLineDetector: Sendable {
             return hipMid.y < wristMid.y
         }
         return false
+    }
+
+    /// Is the athlete up — palms on the floor with the legs above the hips
+    /// (chainlink #100)?
+    ///
+    /// Confident wrist, hip and ankle midpoints (both members of each pair, the
+    /// same rule ``isLine(joints:config:)`` uses), with the hips above the
+    /// hands and the ankles above the hips in display pixels (y grows down).
+    /// No angle limits: a piked or arched attempt is still "up" — the point is
+    /// to acknowledge the athlete the moment they are off the ground.
+    static func isUp(joints: [Joint: Keypoint], minVisibility: Double) -> Bool {
+        guard let wrists = confident(joints, [.leftWrist, .rightWrist], minVisibility),
+            let hips = confident(joints, [.leftHip, .rightHip], minVisibility),
+            let ankles = confident(joints, [.leftAnkle, .rightAnkle], minVisibility),
+            let wristMid = midpoint(wrists), let hipMid = midpoint(hips),
+            let ankleMid = midpoint(ankles)
+        else { return false }
+        return hipMid.y < wristMid.y && ankleMid.y < hipMid.y
     }
 
     /// Is this frame a line? Inverted, straight wrist→ankle, open at the hip,

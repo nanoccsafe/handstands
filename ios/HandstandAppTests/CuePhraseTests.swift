@@ -11,6 +11,7 @@ final class CuePhraseTests: XCTestCase {
     /// switch behind `phrase(for:)` cannot either — and if a case is added
     /// without words, this list is what fails.
     private let everyCue: [Cue] = [
+        .up,
         .lineHold,
         .timeMark(5),
         .timeMark(10),
@@ -23,9 +24,11 @@ final class CuePhraseTests: XCTestCase {
         .form(.arch),
         .form(.hollow),
         .form(.bent),
+        .form(.hips),
     ]
 
     func testThePhraseTable() {
+        XCTAssertEqual(CueText.phrase(for: .up), "Up.")
         XCTAssertEqual(CueText.phrase(for: .lineHold), "Line. Hold it.")
         XCTAssertEqual(CueText.phrase(for: .timeMark(5)), "Five")
         XCTAssertEqual(CueText.phrase(for: .timeMark(10)), "Ten")
@@ -38,6 +41,7 @@ final class CuePhraseTests: XCTestCase {
         XCTAssertEqual(CueText.phrase(for: .form(.arch)), "Ribs in.")
         XCTAssertEqual(CueText.phrase(for: .form(.hollow)), "Open the hips.")
         XCTAssertEqual(CueText.phrase(for: .form(.bent)), "Straighten.")
+        XCTAssertEqual(CueText.phrase(for: .form(.hips)), "Hips over shoulders.")
     }
 
     func testEveryCueHasNonEmptyWords() {
@@ -57,6 +61,7 @@ final class CuePhraseTests: XCTestCase {
     }
 
     func testIdentifiersAreStableSnakeCase() {
+        XCTAssertEqual(CueText.identifier(for: .up), "up")
         XCTAssertEqual(CueText.identifier(for: .lineHold), "line_hold")
         XCTAssertEqual(CueText.identifier(for: .timeMark(5)), "time_mark_5")
         XCTAssertEqual(CueText.identifier(for: .framing(.stepBack)), "step_back")
@@ -68,6 +73,7 @@ final class CuePhraseTests: XCTestCase {
         XCTAssertEqual(CueText.identifier(for: .form(.arch)), "form_arch")
         XCTAssertEqual(CueText.identifier(for: .form(.hollow)), "form_hollow")
         XCTAssertEqual(CueText.identifier(for: .form(.bent)), "form_bent")
+        XCTAssertEqual(CueText.identifier(for: .form(.hips)), "form_hips")
 
         // Every identifier is one greppable token — the sidecar is read with
         // `jq` as often as with this app.

@@ -16,9 +16,10 @@ import Foundation
 // **no corrections during a hold** — the critique belongs to the analysis that
 // runs after the recording, which stays authoritative. The user changed that
 // last rule at the gym (2026-10-14, chainlink #97): a *sustained red fault*
-// mid-hold now earns one short form cue. It is still sparse — one phrase, one
-// direction, one attempt — and it has its own toggle, on by default because
-// the user asked for it.
+// mid-hold now earns a short form cue. It now has two shapes — the #97 banana
+// faults and the #100 piked hip — and repeats at *coach pace* (every couple of
+// seconds while the fault stays red) rather than firing once. It still has its
+// own toggle, on by default because the user asked for it.
 // --------------------------------------------------------------------------- #
 
 /// The toggles behind the gear on the home screen (chainlink #91, extended by
@@ -61,6 +62,9 @@ public enum FormFault: String, Sendable, CaseIterable {
     /// The line is red but the nose cannot say which way it curves —
     /// "Straighten.".
     case bent
+    /// The hips are piked — the shoulder–hip–ankle angle is red — "Hips over
+    /// shoulders." (chainlink #100).
+    case hips
 }
 
 /// What a framing hint tells the user to do about the picture.
@@ -80,6 +84,9 @@ public enum FramingHint: String, Sendable {
 
 /// One thing worth saying (and showing as a banner) — chainlink #91, #97.
 public enum Cue: Equatable, Sendable {
+    /// "Up." — the athlete is up (palms down, legs above the hips) and it has
+    /// held for the onset (chainlink #100).
+    case up
     /// "Line. Hold it." — a line has been achieved, once per line.
     case lineHold
     /// "Five." / "Ten." — `seconds` of line time have passed.
@@ -88,8 +95,8 @@ public enum Cue: Equatable, Sendable {
     case framing(FramingHint)
     /// "Ready." — the framing went from wrong to right while upright.
     case ready
-    /// "Ribs in." / "Open the hips." / "Straighten." — the line broke during
-    /// a hold (chainlink #97).
+    /// "Ribs in." / "Open the hips." / "Straighten." / "Hips over shoulders."
+    /// — the line broke during a hold (chainlink #97, #100).
     case form(FormFault)
 }
 
@@ -98,6 +105,8 @@ public enum Cue: Equatable, Sendable {
 /// One `decide` call per tick: the live frame's events in, at most one cue out.
 /// The rules, as constants below:
 ///
+/// * `up` once per up stretch (on ``LiveEvent/up``), superseded by a pending
+///   `lineHold`;
 /// * `lineHold` once per line (on ``LiveEvent/lineAchieved``);
 /// * `timeMark` only when ``CueSettings/timeMarks`` is on;
 /// * framing hints only while upright and not in line, never within
@@ -105,10 +114,12 @@ public enum Cue: Equatable, Sendable {
 /// * at most one framing hint every ``hintGapS``, never the same hint twice in
 ///   a row within ``hintRepeatGapS``;
 /// * `ready` once per non-ok → ok transition while upright;
+/// * form cues at coach pace — every ``formGapS`` while a fault stays red;
 /// * nothing at all when ``CueSettings/voiceCues`` is off, except framing hints,
 ///   which have their own toggle;
 /// * globally at least ``debounceGapS`` between any two cues — except
-///   `lineHold`, which may follow anything after ``lineHoldGapS``.
+///   `lineHold` and `up`, which may follow anything after ``lineHoldGapS``, and
+///   form cues, which follow anything after ``formGapS``.
 public struct CueScheduler: Sendable {
     /// The toggles in force. Assignable, so the gear's changes apply to the
     /// scheduler already running (state such as the last hint is kept).
@@ -119,9 +130,14 @@ public struct CueScheduler: Sendable {
     /// The global debounce: at least this many seconds between any two cues.
     public static let debounceGapS = 3.0
 
-    /// What `lineHold` may follow anything by — the cue that matters most must
-    /// never be delayed a whole debounce by a hint the user barely noticed.
+    /// What `lineHold` and `up` may follow anything by — the cues that matter
+    /// most must never be delayed a whole debounce by a hint the user barely
+    /// noticed.
     public static let lineHoldGapS = 1.0
+
+    /// What form cues may follow anything by — coach-mode pacing (chainlink
+    /// #100): roughly a phrase every two seconds while a fault stays red.
+    public static let formGapS = 2.0
 
     /// No framing hint within this many seconds of the athlete coming down out
     /// of inversion (the picture is still "upside-down business" for a moment).
@@ -143,6 +159,11 @@ public struct CueScheduler: Sendable {
     /// A `lineAchieved` waiting for its turn to be spoken (it is never dropped:
     /// the line cue is the point of the whole feature).
     private var pendingLineHold = false
+
+    /// An `.up` waiting for its turn (chainlink #100). Queued like the line cue
+    /// — never dropped — but discarded the moment a line cue is pending, since
+    /// "Line. Hold it." supersedes the acknowledgement.
+    private var pendingUp = false
 
     /// A `timeMark` waiting for its turn; the newest mark replaces an older one.
     private var pendingTimeMark: Int?
@@ -203,6 +224,7 @@ public struct CueScheduler: Sendable {
         // cue behind to fire after the user asked for silence.
         if !settings.voiceCues {
             pendingLineHold = false
+            pendingUp = false
             pendingTimeMark = nil
         }
         if !settings.voiceCues || !settings.formCues {
@@ -220,9 +242,16 @@ public struct CueScheduler: Sendable {
         // What this frame's detector said.
         for event in events {
             switch event {
+            case .up:
+                if settings.voiceCues { pendingUp = true }
             case .lineAchieved:
                 inLine = true
-                if settings.voiceCues { pendingLineHold = true }
+                if settings.voiceCues {
+                    pendingLineHold = true
+                    // The line cue supersedes the acknowledgement: if a line
+                    // is pending, "Up." is not worth saying any more.
+                    pendingUp = false
+                }
             case .lineLost:
                 inLine = false
             case .timeMark(_, let seconds):
@@ -237,7 +266,16 @@ public struct CueScheduler: Sendable {
         if pendingLineHold {
             guard allowed(tMs: tMs, gapS: Self.lineHoldGapS) else { return nil }
             pendingLineHold = false
+            pendingUp = false
             return spoken(.lineHold, tMs: tMs)
+        }
+
+        // 1b. The "Up." acknowledgement — right after the line cue, on the
+        //     same short gap, queued (never dropped) but superseded above.
+        if pendingUp {
+            guard allowed(tMs: tMs, gapS: Self.lineHoldGapS) else { return nil }
+            pendingUp = false
+            return spoken(.up, tMs: tMs)
         }
 
         // 2. A waiting time mark.
@@ -317,16 +355,16 @@ public struct CueScheduler: Sendable {
     }
 
     /// A form cue (chainlink #97) waiting for its turn: queued (the correction
-    /// is the point, not a stale edge), held back by the global debounce,
-    /// dropped the moment its toggle goes off. It is checked after the framing
-    /// hints, so a hint always outranks it.
+    /// is the point, not a stale edge), held back by the coach-mode
+    /// ``formGapS``, dropped the moment its toggle goes off. It is checked
+    /// after the framing hints, so a hint always outranks it.
     private mutating func formCue(tMs: Int) -> Cue? {
         guard let fault = pendingForm else { return nil }
         guard settings.voiceCues, settings.formCues else {
             pendingForm = nil
             return nil
         }
-        guard allowed(tMs: tMs, gapS: Self.debounceGapS) else { return nil }
+        guard allowed(tMs: tMs, gapS: Self.formGapS) else { return nil }
         pendingForm = nil
         return spoken(.form(fault), tMs: tMs)
     }

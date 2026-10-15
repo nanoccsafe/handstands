@@ -39,17 +39,29 @@ final class CueSchedulerTests: XCTestCase {
 
     // MARK: - The form cue (chainlink #97)
 
-    func testAFormEventSpeaksThroughTheDebounce() {
+    func testAFormEventSpeaksThroughTheCoachGap() {
         var scheduler = CueScheduler()
 
         XCTAssertEqual(
             tick(&scheduler, tMs: 0, events: [.lineAchieved(tMs: 0)], inverted: true), .lineHold)
         XCTAssertNil(
             tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)], inverted: true),
-            "the global debounce is not spent yet")
+            "the coach gap is 2 s")
         XCTAssertEqual(
-            tick(&scheduler, tMs: 4000, inverted: true), .form(.arch),
+            tick(&scheduler, tMs: 2000, inverted: true), .form(.arch),
             "the form cue waited its turn rather than being dropped")
+    }
+
+    func testFormCuesAreTwoSecondsApartAtCoachPace() {
+        var scheduler = CueScheduler()
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 0, formEvents: [.hips(tMs: 0)], inverted: true), .form(.hips))
+        XCTAssertNil(
+            tick(&scheduler, tMs: 1000, formEvents: [.hips(tMs: 1000)], inverted: true),
+            "1 s after the last form cue is too soon")
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 2000, formEvents: [.hips(tMs: 2000)], inverted: true),
+            .form(.hips))
     }
 
     func testEachFaultSpeaksItsOwnCue() {
@@ -57,6 +69,7 @@ final class CueSchedulerTests: XCTestCase {
             (LiveFormEvent.arch(tMs: 0), FormFault.arch),
             (LiveFormEvent.hollow(tMs: 0), FormFault.hollow),
             (LiveFormEvent.bent(tMs: 0), FormFault.bent),
+            (LiveFormEvent.hips(tMs: 0), FormFault.hips),
         ] {
             var scheduler = CueScheduler()
             XCTAssertEqual(
@@ -124,6 +137,38 @@ final class CueSchedulerTests: XCTestCase {
             "the line cue may follow anything after 1 s, not before")
         // …and spoken at the first tick past it.
         XCTAssertEqual(tick(&scheduler, tMs: 2100, inverted: true), .lineHold)
+    }
+
+    // MARK: - The "Up." acknowledgement (chainlink #100)
+
+    func testUpSpeaksThenLineHoldASecondLater() {
+        var scheduler = CueScheduler()
+
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 0, events: [.up(tMs: 0)], inverted: true), .up)
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 1000, events: [.lineAchieved(tMs: 1000)], inverted: true),
+            .lineHold)
+    }
+
+    func testAPendingUpIsDroppedWhenALineIsPending() {
+        var scheduler = CueScheduler()
+
+        // A hint first, so the next cue must wait.
+        XCTAssertEqual(tick(&scheduler, tMs: 0, framing: .tooSmall), .framing(.comeCloser))
+        // The acknowledgement is queued…
+        XCTAssertNil(tick(&scheduler, tMs: 500, events: [.up(tMs: 500)], inverted: true))
+        // …then a line arrives: the line cue supersedes the acknowledgement.
+        XCTAssertNil(tick(&scheduler, tMs: 800, events: [.lineAchieved(tMs: 800)], inverted: true))
+        XCTAssertEqual(tick(&scheduler, tMs: 1500, inverted: true), .lineHold)
+        XCTAssertNil(tick(&scheduler, tMs: 2000, inverted: true), "the dropped Up. never speaks")
+    }
+
+    func testNoUpWhenVoiceIsOff() {
+        var scheduler = CueScheduler()
+        scheduler.settings.voiceCues = false
+
+        XCTAssertNil(tick(&scheduler, tMs: 1000, events: [.up(tMs: 1000)], inverted: true))
     }
 
     // MARK: - Time marks
