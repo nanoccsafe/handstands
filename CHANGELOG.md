@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Live form cue: speak when the line goes red during a hold (arch/banana first) (#97)
 - Live form cue: one short phrase when the line goes red during a hold —
   "Ribs in." (arch), "Open the hips." (hollow) or "Straighten." (sign unknown)
   (#97). A deliberate banana no longer passes the live "Line. Hold it." check
