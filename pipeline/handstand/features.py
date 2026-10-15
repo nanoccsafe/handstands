@@ -74,10 +74,12 @@ The recording protocol (``docs/recording_protocol.md``) asks for a **side view**
 for straight handstands, and that is what every angle here assumes: the joint
 angles are 2D projections, so a straight arm pointed at the camera reads as bent,
 and the stacking offsets are the horizontal error a judge would see from the
-side. The features are computed for every frame regardless, and the ``side_view``
-column is where a later stage filters that assumption out — camera-angle
-detection is #74, and until it lands this column is :func:`side_view_assumed`, a
-column that is true everywhere and says so.
+side. The features are computed for every frame regardless, and the per-frame
+``side_view`` column is where a later stage filters that assumption out — it is
+:func:`side_view_assumed`, a column that is true everywhere and says so. Which
+holds actually were filmed from the side is measured **per hold** by
+:mod:`handstand.view`, which writes ``hold_views.csv`` beside this stage's
+parquet; the reference build reads that table for the clips nobody hand-labelled.
 
 Units, and the body frame
 -------------------------

@@ -30,10 +30,14 @@ The side-view features (hip angle, leg separation, knee) are only honest from th
 side, so by default the reference is built from holds whose clip's catalogue
 ``camera_angle`` is :data:`SIDE_VIEW` (``"side"``, stripped and lower-cased): a
 ``front`` or angled clip, or one whose cell is empty, is skipped with a note.
-``camera_angle`` is a person's answer until view detection (#74) exists, and the
-review (:mod:`handstand.reference_review`) says nothing about the camera.
-``--any-view`` builds from every reviewed hold regardless of the camera, and a
-missing catalogue is an error unless that flag is given.
+The hand label always wins; only for a clip whose cell is **empty** does the
+detected view of :mod:`handstand.view` decide — the hold is kept when
+``hold_views.csv`` found it side, and skipped with a note naming the detection
+when it did not. The review (:mod:`handstand.reference_review`) says nothing
+about the camera. ``--any-view`` builds from every reviewed hold regardless of
+the camera and skips reading the catalogue; ``--labels-only`` reads the
+catalogue but ignores the detected views, so only hand-labelled side clips
+count. A missing catalogue is an error unless ``--any-view`` is given.
 
 The reference file is ``docs/scoring.md``'s ``handstand-reference`` schema v1::
 
@@ -59,7 +63,7 @@ CLI::
 
     cd pipeline
     uv run python -m handstand.reference build [--data DIR] [--source SRC]
-        [--out PATH] [--min-holds N] [--install] [--any-view]
+        [--out PATH] [--min-holds N] [--install] [--any-view] [--labels-only]
 
 The build also writes a sanity report to
 ``<data_dir>/reports/reference/<YYYY-MM-DD_HHMMSS>.txt`` and prints it: the
@@ -84,7 +88,7 @@ from typing import Any
 
 import pandas as pd
 
-from handstand import catalogue, features, hold_shapes, reference_review, score
+from handstand import catalogue, features, hold_shapes, reference_review, score, view
 from handstand.paths import data_dir
 from handstand.postprocess import DEFAULT_SOURCE, SOURCES
 
@@ -216,14 +220,21 @@ def camera_angles(data: str | pathlib.Path) -> dict[str, str]:
 def filter_side_view(
     holds: Iterable[tuple[str, int | str]],
     angles: Mapping[str, str],
+    detected: Mapping[tuple[str, int], str] | None = None,
 ) -> tuple[set[tuple[str, int | str]], list[str]]:
     """Split reviewed holds into the side-view ones and a note per skip.
 
-    A hold is kept only when its clip's ``camera_angle`` is :data:`SIDE_VIEW`
-    after stripping and lower-casing, so ``"Side"`` and ``" side "`` count. Every
-    other hold — ``front``, angled, or a clip with an empty or absent cell, which
-    the note calls ``empty`` — is left out with the note the build prints, since
-    only side-view holds are comparable when the side-view features are measured.
+    A hold is kept when its clip's ``camera_angle`` is :data:`SIDE_VIEW` after
+    stripping and lower-casing, so ``"Side"`` and ``" side "`` count. Every other
+    hold — ``front``, angled, or a clip with an empty or absent cell, which the
+    note calls ``empty`` — is left out with the note the build prints, since only
+    side-view holds are comparable when the side-view features are measured.
+
+    The hand label always wins. When the clip's label is empty **and** ``detected``
+    is given, the hold is instead kept when the detector of
+    :mod:`handstand.view` called it side; otherwise it is skipped with a note
+    that names the detected view (``none`` when there is no row for it). With no
+    ``detected`` map the empty cell is skipped as before.
     """
     kept: set[tuple[str, int | str]] = set()
     notes: list[str] = []
@@ -233,11 +244,41 @@ def filter_side_view(
         if angle == SIDE_VIEW:
             kept.add((clip_id, hold_id))
             continue
+        if not angle and detected is not None:
+            view = detected.get((clip, _hold_number(hold_id)))
+            if view == SIDE_VIEW:
+                kept.add((clip_id, hold_id))
+                continue
+            notes.append(
+                f"{clip} h{_hold_number(hold_id)}: not side view "
+                f"(camera_angle=empty, detected={view or 'none'})"
+            )
+            continue
         notes.append(
             f"{clip} h{_hold_number(hold_id)}: not side view "
             f"(camera_angle={angle or 'empty'})"
         )
     return kept, notes
+
+
+def _is_side_view_hold(
+    clip_id: str,
+    hold_id: int,
+    angles: Mapping[str, str],
+    detected: Mapping[tuple[str, int], str] | None,
+) -> bool:
+    """Whether one hold is comparable with the reference, by the same rule.
+
+    The hand label wins: a non-empty ``camera_angle`` is side view only when it
+    is :data:`SIDE_VIEW`. Only an empty cell falls back to the detected view of
+    :mod:`handstand.view`, and only when a ``detected`` map was given.
+    """
+    angle = angles.get(clip_id, "")
+    if angle:
+        return angle == SIDE_VIEW
+    if detected is None:
+        return False
+    return detected.get((clip_id, int(hold_id))) == SIDE_VIEW
 
 
 def collect_hold_values(
@@ -451,6 +492,7 @@ def evaluate(
     *,
     side_angles: Mapping[str, str] | None = None,
     skipped_not_side: int = 0,
+    detected: Mapping[tuple[str, int], str] | None = None,
 ) -> str:
     """The build's sanity report: what the reference says and how it reads holds.
 
@@ -471,7 +513,11 @@ def evaluate(
 
     ``side_angles`` is :func:`camera_angles` when the build filtered to side
     views: it adds the subset line in 3 and puts ``skipped_not_side`` in the
-    header. ``None`` means every view was used and the report reads as before.
+    header. The subset uses the same rule the build filtered with — the hand
+    label wins, and an empty cell falls back to ``detected``
+    (:func:`handstand.view.read_hold_views`) — so the report compares side views
+    with side views. ``None`` for ``side_angles`` means every view was used and
+    the report reads as before.
 
     Nothing here changes the reference; it only says whether the numbers deserve
     to be trusted.
@@ -536,7 +582,9 @@ def evaluate(
             skipped += 1
             continue
         other_scores.append(result.score)
-        if side_angles is not None and side_angles.get(clip_id) == SIDE_VIEW:
+        if side_angles is not None and _is_side_view_hold(
+            clip_id, hold_id, side_angles, detected
+        ):
             side_scores.append(result.score)
 
     lines += ["", f"leave-one-out of the reference holds: {_score_text(loo_scores)}"]
@@ -626,6 +674,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "camera_angle is 'side' (the default); also skips reading the catalogue"
         ),
     )
+    build.add_argument(
+        "--labels-only",
+        action="store_true",
+        help=(
+            "keep only hand-labelled side clips; do not fall back to the detected "
+            "views of handstand.view for clips whose camera_angle is empty"
+        ),
+    )
     return parser
 
 
@@ -646,11 +702,19 @@ def main(argv: Sequence[str] | None = None, *, repo_dir: str | pathlib.Path | No
     try:
         holds = reference_review.load_reference_holds(root)
         side_angles: dict[str, str] | None = None
+        detected: dict[tuple[str, int], str] | None = None
         skipped_not_side = 0
         view_notes: list[str] = []
         if not args.any_view:
             side_angles = camera_angles(root)
-            holds, view_notes = filter_side_view(holds, side_angles)
+            if not args.labels_only:
+                detected = view.read_hold_views(root, args.source)
+                if not detected:
+                    print(
+                        "note: no hold_views.csv, only hand-labelled side clips count "
+                        "(run python -m handstand.view build)"
+                    )
+            holds, view_notes = filter_side_view(holds, side_angles, detected)
             skipped_not_side = len(view_notes)
         rows, notes = collect_hold_values(holds, root, args.source)
         for note in view_notes + notes:
@@ -675,6 +739,7 @@ def main(argv: Sequence[str] | None = None, *, repo_dir: str | pathlib.Path | No
             args.source,
             side_angles=side_angles,
             skipped_not_side=skipped_not_side,
+            detected=detected,
         )
         report_path = _write_report(root, report)
         print(report)
