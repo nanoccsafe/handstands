@@ -147,6 +147,7 @@ final class CaptureService {
             formEvents: frame.formEvents,
             framing: framing,
             inverted: frame.inverted,
+            up: frame.isUp,
             recording: recording
         ) else { return }
 

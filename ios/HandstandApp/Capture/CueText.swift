@@ -16,6 +16,8 @@ enum CueText {
     /// rewords. Every `Cue` case has exactly one.
     static func phrase(for cue: Cue) -> String {
         switch cue {
+        case .up:
+            return "Up."
         case .lineHold:
             return "Line. Hold it."
         case .timeMark(let seconds):
@@ -33,6 +35,8 @@ enum CueText {
     /// snake_case, so the tuning numbers can be grepped and grouped.
     static func identifier(for cue: Cue) -> String {
         switch cue {
+        case .up:
+            return "up"
         case .lineHold:
             return "line_hold"
         case .timeMark(let seconds):
@@ -68,14 +72,16 @@ enum CueText {
         }
     }
 
-    /// The three mid-hold form phrases (chainlink #97): the user's short,
-    /// imperative words — ribs in for the arch, hips open for the hollow, and
-    /// a plain "straighten" when the nose could not say which way it curved.
+    /// The mid-hold form phrases (chainlink #97, #100): the user's short,
+    /// imperative words — ribs in for the arch, hips open for the hollow,
+    /// a plain "straighten" when the nose could not say which way it curved,
+    /// and "hips over shoulders" for the piked hip.
     private static func formPhrase(_ fault: FormFault) -> String {
         switch fault {
         case .arch: return "Ribs in."
         case .hollow: return "Open the hips."
         case .bent: return "Straighten."
+        case .hips: return "Hips over shoulders."
         }
     }
 
@@ -84,6 +90,7 @@ enum CueText {
         case .arch: return "form_arch"
         case .hollow: return "form_hollow"
         case .bent: return "form_bent"
+        case .hips: return "form_hips"
         }
     }
 

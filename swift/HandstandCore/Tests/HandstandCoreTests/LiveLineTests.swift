@@ -1,6 +1,6 @@
 import XCTest
 
-import HandstandCore
+@testable import HandstandCore
 
 /// What the live line detector does with one frame at a time (chainlink #91):
 /// the hysteresis, the geometry gates, the timestamps — and the one check that
@@ -106,6 +106,34 @@ final class LiveLineTests: XCTestCase {
             ]
         }
 
+        /// A frame that passes every *line* gate except a controlled hip: the
+        /// wrists, hips and ankles of `frame()`, and a single confident
+        /// shoulder placed so `hipAngleDeg` measures **exactly** `hipDeg`.
+        /// The line gate's 160° and the hip-red band just above it overlap
+        /// (chainlink #100 review), so the measured value has to be exact
+        /// rather than `frame()`'s ±30 px shoulder fudge — both shoulders sit
+        /// on the same point, so the left side is the one measured.
+        static func hipExactly(_ hipDeg: Double) -> [Joint: Keypoint] {
+            let leftHip = (x: 520.0, y: 1150.0)
+            let reach = 500.0
+            let radians = hipDeg * Double.pi / 180.0
+            let shoulder = (
+                x: leftHip.x + reach * sin(radians),
+                y: leftHip.y - reach * cos(radians)
+            )
+            return [
+                .leftWrist: Keypoint(x: 500, y: 1850, visibility: 0.9),
+                .rightWrist: Keypoint(x: 580, y: 1850, visibility: 0.9),
+                .leftShoulder: Keypoint(x: shoulder.x, y: shoulder.y, visibility: 0.9),
+                .rightShoulder: Keypoint(x: shoulder.x, y: shoulder.y, visibility: 0.9),
+                .leftHip: Keypoint(x: 520, y: 1150, visibility: 0.9),
+                .rightHip: Keypoint(x: 560, y: 1150, visibility: 0.9),
+                .leftAnkle: Keypoint(x: 520, y: 450, visibility: 0.9),
+                .rightAnkle: Keypoint(x: 560, y: 450, visibility: 0.9),
+                .nose: Keypoint(x: shoulder.x, y: shoulder.y + 60, visibility: 0.9),
+            ]
+        }
+
         /// Every joint turned around `origin` by `degrees` — a rigid turn, so
         /// the hip angle survives it and only the body angle changes.
         private static func rotate(
@@ -152,8 +180,11 @@ final class LiveLineTests: XCTestCase {
         var detector = LiveLineDetector()
         let events = feed(&detector, from: 0, through: 2000, by: 100) { _ in Synthetic.frame() }
 
-        XCTAssertEqual(events, [.lineAchieved(tMs: 500)], "one line, one cue, at 0.5 s")
+        XCTAssertEqual(
+            events, [.up(tMs: 500), .lineAchieved(tMs: 500)],
+            "up is acknowledged first, then one line cue, both at 0.5 s")
         XCTAssertTrue(detector.isInLine)
+        XCTAssertTrue(detector.isUpNow)
         XCTAssertTrue(detector.isInverted)
     }
 
@@ -180,7 +211,7 @@ final class LiveLineTests: XCTestCase {
 
         XCTAssertEqual(
             events,
-            [.lineAchieved(tMs: 500), .lineLost(tMs: 2000, heldS: 1.5)],
+            [.up(tMs: 500), .lineAchieved(tMs: 500), .lineLost(tMs: 2000, heldS: 1.5)],
             "the loss is reported once, 0.4 s after the line's last frame"
         )
         XCTAssertFalse(detector.isInLine)
@@ -194,7 +225,10 @@ final class LiveLineTests: XCTestCase {
 
         XCTAssertEqual(
             events,
-            [.lineAchieved(tMs: 500), .lineLost(tMs: 1500, heldS: 1.0), .lineAchieved(tMs: 2600)]
+            [
+                .up(tMs: 500), .lineAchieved(tMs: 500),
+                .lineLost(tMs: 1500, heldS: 1.0), .lineAchieved(tMs: 2600),
+            ]
         )
     }
 
@@ -207,8 +241,9 @@ final class LiveLineTests: XCTestCase {
             Synthetic.frame(hipDeg: 140)
         }
 
-        XCTAssertEqual(events, [], "140° at the hip is a pike, not a line")
+        XCTAssertEqual(events, [.up(tMs: 500)], "140° at the hip is a pike, not a line — but still up")
         XCTAssertFalse(detector.isInLine)
+        XCTAssertTrue(detector.isUpNow, "a pike is still up — it earns the acknowledgement")
         XCTAssertTrue(detector.isInverted, "a pike is still upside down — just not a line")
     }
 
@@ -220,7 +255,7 @@ final class LiveLineTests: XCTestCase {
             Synthetic.frame(leanDeg: 25)
         }
 
-        XCTAssertEqual(events, [], "25° of lean is a handstand walk, not a held line")
+        XCTAssertEqual(events, [.up(tMs: 500)], "25° of lean is a handstand walk, not a held line — but still up")
         XCTAssertFalse(detector.isInLine)
     }
 
@@ -260,9 +295,100 @@ final class LiveLineTests: XCTestCase {
             Synthetic.bananaRedLine()
         }
 
-        XCTAssertEqual(events, [], "a banana the report will call red is never a line")
+        XCTAssertEqual(events, [.up(tMs: 500)], "a banana the report will call red is never a line — but still up")
         XCTAssertFalse(detector.isInLine)
         XCTAssertTrue(detector.isInverted, "it is still upside down — just not a line")
+    }
+
+    /// Chainlink #100 review: the line gate (hip ≥ 160°) and the hip-red band
+    /// (red at about 161° and below) overlap, so a 160.5° frame used to be both
+    /// a line *and* a piked-hip fault. `isLine` now rejects a red hip, exactly
+    /// as it already rejected a red banana; an open hip is still a line.
+    func testARedHipIsNotALineButAnOpenHipStillIs() {
+        // The isolation is the hip alone: 160.5° is red, its banana is not, so
+        // without the hip check this exact frame is a line.
+        let pikedFrame = Synthetic.hipExactly(160.5)
+        XCTAssertTrue(LiveFormDetector.isHipRed(160.5), "160.5° is a red hip")
+        XCTAssertFalse(
+            LiveFormDetector.isBananaRed(
+                joints: pikedFrame, minVisibility: LiveLineConfig().minVisibility),
+            "…and its banana is not red, so only the hip can reject it")
+
+        var piked = LiveLineDetector()
+        let pikedEvents = feed(&piked, from: 0, through: 2000, by: 100) { _ in
+            Synthetic.hipExactly(160.5)
+        }
+        XCTAssertEqual(
+            pikedEvents, [.up(tMs: 500)],
+            "160.5° is a red hip — not a line, but still up")
+        XCTAssertFalse(piked.isInLine)
+
+        var open = LiveLineDetector()
+        let openEvents = feed(&open, from: 0, through: 2000, by: 100) { _ in
+            Synthetic.hipExactly(170)
+        }
+        XCTAssertEqual(
+            openEvents, [.up(tMs: 500), .lineAchieved(tMs: 500)],
+            "170° at the hip is open — still a line")
+        XCTAssertTrue(open.isInLine)
+    }
+
+    // MARK: - The "Up." acknowledgement (chainlink #100)
+
+    /// A piked hold: 140° at the hip is a pike, so the *line* gates fail and
+    /// only `.up` can fire — which keeps these assertions about the
+    /// acknowledgement alone.
+    private func upFrame() -> [Joint: Keypoint] { Synthetic.frame(hipDeg: 140) }
+
+    func testAnUpOffTheGroundIsAcknowledgedOnceAfterTheOnset() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 1200, by: 100) { _ in upFrame() }
+
+        XCTAssertEqual(events, [.up(tMs: 500)], "0.6 s up earns exactly one acknowledgement")
+        XCTAssertTrue(detector.isUpNow)
+    }
+
+    func testAShortUpSaysNothing() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 400, by: 100) { _ in upFrame() }
+
+        XCTAssertEqual(events, [], "0.4 s up is below the 0.5 s onset")
+        XCTAssertFalse(detector.isUpNow)
+    }
+
+    func testStandingIsNeverUp() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 2000, by: 100) { _ in Synthetic.standing() }
+
+        XCTAssertEqual(events, [], "wrists below the hips is never up")
+        XCTAssertFalse(detector.isUpNow)
+    }
+
+    func testAShortDipDoesNotReFireUpButALongOneEarnsASecond() {
+        var detector = LiveLineDetector()
+        // Up, then a 0.5 s dip — inside upEndS (1 s), so the stretch survives.
+        var events = feed(&detector, from: 0, through: 600, by: 100) { _ in upFrame() }
+        events += feed(&detector, from: 700, through: 1100, by: 100) { _ in Synthetic.standing() }
+        events += feed(&detector, from: 1200, through: 1800, by: 100) { _ in upFrame() }
+        XCTAssertEqual(events, [.up(tMs: 500)], "a dip shorter than upEndS does not re-fire")
+        XCTAssertTrue(detector.isUpNow)
+
+        // A full 1.2 s down ends the stretch, so coming back up is a new one.
+        var again = LiveLineDetector()
+        var more = feed(&again, from: 0, through: 600, by: 100) { _ in upFrame() }
+        more += feed(&again, from: 700, through: 1900, by: 100) { _ in Synthetic.standing() }
+        XCTAssertFalse(again.isUpNow, "1.2 s down ends the stretch")
+        more += feed(&again, from: 2000, through: 2600, by: 100) { _ in upFrame() }
+        XCTAssertEqual(more, [.up(tMs: 500), .up(tMs: 2500)])
+    }
+
+    func testUpPrecedesLineAchievedOnTheSameFrame() {
+        var detector = LiveLineDetector()
+        let events = feed(&detector, from: 0, through: 800, by: 100) { _ in Synthetic.frame() }
+
+        XCTAssertEqual(
+            events, [.up(tMs: 500), .lineAchieved(tMs: 500)],
+            "the acknowledgement is spoken before the line cue")
     }
 
     // MARK: - Time
@@ -276,7 +402,7 @@ final class LiveLineTests: XCTestCase {
         for tMs in [0, 40, 90, 160, 260, 420, 610, 780] {
             events += vfr.update(tMs: tMs, joints: Synthetic.frame())
         }
-        XCTAssertEqual(events, [.lineAchieved(tMs: 610)])
+        XCTAssertEqual(events, [.up(tMs: 610), .lineAchieved(tMs: 610)])
 
         // Forty-one frames of the same shape in 0.4 s: plenty of frames, not
         // enough time, no cue.
@@ -292,6 +418,7 @@ final class LiveLineTests: XCTestCase {
         XCTAssertEqual(
             events,
             [
+                .up(tMs: 500),
                 .lineAchieved(tMs: 500),
                 .timeMark(tMs: 5000, seconds: 5),
                 .timeMark(tMs: 10_000, seconds: 10),
@@ -304,7 +431,7 @@ final class LiveLineTests: XCTestCase {
         var detector = LiveLineDetector(timeMarksEverySeconds: nil)
         let events = feed(&detector, from: 0, through: 11_000, by: 100) { _ in Synthetic.frame() }
 
-        XCTAssertEqual(events, [.lineAchieved(tMs: 500)])
+        XCTAssertEqual(events, [.up(tMs: 500), .lineAchieved(tMs: 500)])
     }
 
     // MARK: - The offline agreement
