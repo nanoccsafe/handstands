@@ -17,7 +17,9 @@ import SwiftData
 /// The analysis columns (`analyzedAt` … `analysisVersion`, plus
 /// `analysisNote` for a clip that could not be measured) are filled in by
 /// chainlink #47 once scoring runs on the device; until then they are `nil`,
-/// which the History screens read as "Not analysed yet".
+/// which the History screens read as "Not analysed yet" — while an analysed
+/// take that produced no score reads "Analysed · no score" (`analysisStatus`,
+/// chainlink #96).
 @Model
 final class Session {
     /// The movie's name inside the Recordings folder, e.g.

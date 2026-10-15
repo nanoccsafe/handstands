@@ -155,12 +155,16 @@ struct HistoryView: View {
                 Text(VideoInfoFormatter.duration(session.durationS))
                     .font(.subheadline.monospacedDigit())
                 Text(
-                    // An unmeasurable take is neither a score nor "not
-                    // analysed yet": it was analysed, and the app could
-                    // not measure it.
-                    session.analysisNote != nil
-                        ? "Couldn't measure"
-                        : session.clipScore.map { SessionFormatter.score($0) } ?? "Not analysed yet"
+                    // One shared function so this row and the detail
+                    // screen's Recording section always agree (#96): an
+                    // analysed but scoreless take reads "Analysed · no
+                    // score", never "Not analysed yet".
+                    SessionFormatter.analysisStatus(
+                        analyzedAt: session.analyzedAt,
+                        clipScore: session.clipScore,
+                        analysisNote: session.analysisNote,
+                        holdCount: session.holdCount
+                    )
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
