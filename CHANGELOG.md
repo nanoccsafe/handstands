@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Record screen: switch between front and back camera (see the feed while setting up) (#95)
 - History row says 'Not analysed yet' for analysed takes without a score (#96)
 - Catalogue auto-fill + reference review project (line holds) (#94)
 - Left/right side correction from nose direction + inversion (side views) (#88)
