@@ -77,11 +77,12 @@ final class RecordingMetadataTests: XCTestCase {
         let object = try sidecarJSON()
         XCTAssertEqual(
             Set(object.keys),
-            ["schema", "hold_type", "recorded_at", "app_version"]
+            ["schema", "hold_type", "recorded_at", "app_version", "camera"]
         )
         XCTAssertEqual(object["schema"] as? Int, 1)
         XCTAssertEqual(object["hold_type"] as? String, "line")
         XCTAssertEqual(object["app_version"] as? String, "0.1.0")
+        XCTAssertEqual(object["camera"] as? String, "back", "the default camera")
     }
 
     func testTheDateIsISO8601InUTC() throws {
@@ -104,6 +105,37 @@ final class RecordingMetadataTests: XCTestCase {
         let line = #"{"schema":1,"hold_type":"line","recorded_at":"2026-09-28T14:30:59Z","app_version":"0.1.0"}"#
         try Data(line.utf8).write(to: RecordingMetadata.sidecarURL(for: movie))
         XCTAssertEqual(try RecordingMetadata.read(for: movie)?.holdType, .line)
+    }
+
+    // MARK: - The camera (chainlink #95)
+
+    /// The camera the take used, in the sidecar: `front` stays `front`.
+    func testTheCameraRoundTrips() throws {
+        var metadata = sample()
+        metadata.camera = .front
+        try metadata.write(for: movie)
+
+        XCTAssertEqual(try XCTUnwrap(RecordingMetadata.read(for: movie)).camera, .front)
+        XCTAssertEqual(try sidecarJSON()["camera"] as? String, "front")
+    }
+
+    /// A sidecar written before this issue has no `camera` key: it reads as
+    /// the back camera rather than failing the document.
+    func testAnOldSidecarWithoutACameraReadsBack() throws {
+        let json = """
+        {"schema":1,"hold_type":"line","recorded_at":"2026-09-28T14:30:59Z","app_version":"0.1.0"}
+        """
+        try Data(json.utf8).write(to: RecordingMetadata.sidecarURL(for: movie))
+        XCTAssertEqual(try XCTUnwrap(RecordingMetadata.read(for: movie)).camera, .back)
+    }
+
+    /// An unknown camera value reads as the default, like an unknown hold.
+    func testAnUnknownCameraReadsBack() throws {
+        let json = """
+        {"schema":1,"hold_type":"line","recorded_at":"2026-09-28T14:30:59Z","app_version":"0.1.0","camera":"upside_down"}
+        """
+        try Data(json.utf8).write(to: RecordingMetadata.sidecarURL(for: movie))
+        XCTAssertEqual(try RecordingMetadata.read(for: movie)?.camera, .back)
     }
 
     // MARK: - The live stats (chainlink #91)
@@ -138,6 +170,7 @@ final class RecordingMetadataTests: XCTestCase {
             Set(object.keys),
             [
                 "schema", "hold_type", "recorded_at", "app_version",
+                "camera",
                 "live_fps_target", "live_fps_achieved", "avg_inference_ms",
                 "recording_frames_dropped", "cues_spoken",
             ]

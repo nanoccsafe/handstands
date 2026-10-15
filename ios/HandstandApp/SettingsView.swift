@@ -44,6 +44,32 @@ enum CueSettingsStorage {
     }
 }
 
+/// The `@AppStorage` key behind the camera choice (chainlink #95), placed
+/// next to the cue keys and read the same way: one spelling shared by the
+/// flip button, `CaptureService` and the tests.
+///
+/// The stored value is `CameraPosition`'s raw value (`"back"`/`"front"`); a
+/// fresh install — and any value this build does not know — means the back
+/// camera.
+enum CameraSettingsStorage {
+    static let positionKey = "cameraPosition"
+
+    /// What a fresh install records with, and what an unknown stored value
+    /// falls back to.
+    static let defaultPosition: CameraPosition = .default
+
+    /// The stored choice out of a defaults store.
+    static func read(_ defaults: UserDefaults) -> CameraPosition {
+        resolved(defaults.string(forKey: positionKey))
+    }
+
+    /// The choice a raw stored string means: a known value stays itself,
+    /// anything else (including `nil`) is the default.
+    static func resolved(_ raw: String?) -> CameraPosition {
+        raw.flatMap(CameraPosition.init(rawValue:)) ?? defaultPosition
+    }
+}
+
 /// The settings screen: the three live-cue toggles and the philosophy line
 /// under them (chainlink #91).
 struct SettingsView: View {

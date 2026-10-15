@@ -37,7 +37,17 @@ struct RecordView: View {
     @AppStorage(CueSettingsStorage.framingHintsKey)
     private var framingHints = CueSettingsStorage.defaults.framingHints
 
+    /// Which wide-angle camera the flip button selects (chainlink #95). The
+    /// stored raw value is read through `CameraSettingsStorage.resolved`, so
+    /// a fresh install — and any unknown stored value — uses the back camera.
+    @AppStorage(CameraSettingsStorage.positionKey)
+    private var cameraPositionRaw: String = CameraSettingsStorage.defaultPosition.rawValue
+
     private var holdType: HoldType { HoldType.resolved(holdTypeRaw) }
+
+    private var cameraPosition: CameraPosition {
+        CameraSettingsStorage.resolved(cameraPositionRaw)
+    }
 
     /// The toggles as the scheduler wants them.
     private var cueSettings: CueSettings {
@@ -67,6 +77,7 @@ struct RecordView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             model.holdType = holdType
+            model.cameraPosition = cameraPosition
             model.cueSettings = cueSettings
             // History (chainlink #51): the store a finished take is
             // recorded into. Without a folder there is no store — the video
@@ -86,6 +97,12 @@ struct RecordView: View {
             // Keep the model in step with `@AppStorage`, so the take that
             // starts next records what the picker shows.
             model.holdType = selected
+        }
+        .onChange(of: cameraPosition) { _, _ in
+            // The flip button wrote the key (chainlink #95); swap the running
+            // engine to the other camera. A no-op mid-take, which the button
+            // also prevents.
+            model.switchCamera()
         }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
@@ -181,8 +198,19 @@ struct RecordView: View {
                         .background(.black.opacity(0.4), in: Capsule())
                 }
 
-                recordButton
-                    .padding(.bottom, 8)
+                ZStack {
+                    recordButton
+
+                    // The camera flip, beside the record button (chainlink
+                    // #95): the athlete alone can switch to the selfie view
+                    // to check the framing, then record.
+                    HStack {
+                        Spacer()
+                        flipButton
+                            .padding(.trailing, 28)
+                    }
+                }
+                .padding(.bottom, 8)
             }
             .padding(.vertical, 24)
         }
@@ -223,6 +251,28 @@ struct RecordView: View {
         }
         .disabled(model.isRecording)
         .accessibilityLabel("Hold type: \(holdType.displayName)")
+    }
+
+    /// The camera flip (chainlink #95), beside the record button: a tap
+    /// switches the preview, framing guide and live mode between the back
+    /// and front wide-angle cameras, and remembers the choice in
+    /// `@AppStorage("cameraPosition")`. Frozen while the red light is on —
+    /// no switching mid-take — and while a flip is already in flight, so a
+    /// second tap cannot start an overlapping switch.
+    private var flipButton: some View {
+        Button {
+            cameraPositionRaw = cameraPosition.opposite.rawValue
+        } label: {
+            Image(systemName: "arrow.triangle.2.circlepath.camera")
+                .font(.title2)
+                .foregroundStyle(.white)
+                .frame(width: 52, height: 52)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(model.isRecording || model.isSwitching)
+        .opacity(model.isRecording || model.isSwitching ? 0.5 : 1)
+        .accessibilityLabel("Switch camera")
     }
 
     private var recordButton: some View {

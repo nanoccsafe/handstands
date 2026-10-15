@@ -12,14 +12,17 @@ import HandstandCore
 ///
 /// ```json
 /// {"schema": 1, "hold_type": "line", "recorded_at": "2026-09-28T14:30:59Z",
-///  "app_version": "0.1.0", "live_fps_target": 10.0, "live_fps_achieved": 9.7,
-///  "avg_inference_ms": 41.2, "recording_frames_dropped": 0,
+///  "app_version": "0.1.0", "camera": "back", "live_fps_target": 10.0,
+///  "live_fps_achieved": 9.7, "avg_inference_ms": 41.2,
+///  "recording_frames_dropped": 0,
 ///  "cues_spoken": [{"t_ms": 1240, "cue": "line_hold"}]}
 /// ```
 ///
 /// Keys are snake_case, dates are ISO-8601 in UTC and the hold is
 /// `HoldType`'s raw value — the same persisted strings the picker stores.
-/// The five live keys are **optional** (schema stays 1): a take from a build
+/// `camera` (chainlink #95) is `CameraPosition`'s raw value, `"back"` or
+/// `"front"`; an older sidecar without the key reads back as `"back"`. The
+/// five live keys are **optional** (schema stays 1): a take from a build
 /// without the pose model, or from before this issue, reads back exactly as
 /// it always did, with the live fields absent rather than zero.
 struct RecordingMetadata: Codable, Equatable, Sendable {
@@ -31,6 +34,9 @@ struct RecordingMetadata: Codable, Equatable, Sendable {
     var recordedAt: Date
     /// The app's marketing version, e.g. "0.1.0".
     var appVersion: String
+    /// The camera the take used (chainlink #95): back or front. An old
+    /// sidecar without the key decodes as `.back`.
+    var camera: CameraPosition = .default
     /// The live rate in force at the end of the take, fps — halved by the
     /// performance guard when it had to be (chainlink #91).
     var liveFpsTarget: Double?
@@ -49,6 +55,7 @@ struct RecordingMetadata: Codable, Equatable, Sendable {
         case holdType = "hold_type"
         case recordedAt = "recorded_at"
         case appVersion = "app_version"
+        case camera
         case liveFpsTarget = "live_fps_target"
         case liveFpsAchieved = "live_fps_achieved"
         case avgInferenceMs = "avg_inference_ms"
@@ -61,6 +68,7 @@ struct RecordingMetadata: Codable, Equatable, Sendable {
         holdType: HoldType,
         recordedAt: Date,
         appVersion: String,
+        camera: CameraPosition = .default,
         liveFpsTarget: Double? = nil,
         liveFpsAchieved: Double? = nil,
         avgInferenceMs: Double? = nil,
@@ -71,6 +79,7 @@ struct RecordingMetadata: Codable, Equatable, Sendable {
         self.holdType = holdType
         self.recordedAt = recordedAt
         self.appVersion = appVersion
+        self.camera = camera
         self.liveFpsTarget = liveFpsTarget
         self.liveFpsAchieved = liveFpsAchieved
         self.avgInferenceMs = avgInferenceMs
@@ -86,6 +95,12 @@ struct RecordingMetadata: Codable, Equatable, Sendable {
         holdType = HoldType.resolved(try? container.decode(String.self, forKey: .holdType))
         recordedAt = try container.decode(Date.self, forKey: .recordedAt)
         appVersion = try container.decodeIfPresent(String.self, forKey: .appVersion) ?? ""
+        // The camera (#95) is optional in one direction: absent from a
+        // sidecar written before it, and unknown values read as the default
+        // rather than failing the whole document.
+        camera =
+            (try? container.decode(String.self, forKey: .camera))
+            .flatMap(CameraPosition.init(rawValue:)) ?? .default
         // The live fields (#91) are optional in both directions: absent from a
         // sidecar written before them, and left out when a take never saw a
         // live frame.

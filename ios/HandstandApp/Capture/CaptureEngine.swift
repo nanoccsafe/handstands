@@ -91,12 +91,20 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     /// Stops the session, finishing any recording in progress first so a
     /// half-made file is either completed or cleaned up, never left open.
-    func stop() {
+    ///
+    /// The optional `completion` runs on `queue` *after* `stopRunning()` has
+    /// returned — the hand-off a camera flip waits for. `stopRunning()` is
+    /// asynchronous from the caller's point of view, so a fresh engine started
+    /// while this one is still tearing down would put two sessions on two
+    /// cameras up at once and interrupt both; the completion is what lets the
+    /// flip start the new session only once this one is really down.
+    func stop(completion: (@Sendable () -> Void)? = nil) {
         queue.async { [self] in
             endRecording()
             if session.isRunning {
                 session.stopRunning()
             }
+            completion?()
         }
     }
 
@@ -203,8 +211,22 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         // normalised coordinates the guide reasons in are the ones the user
         // sees. Falls back to unrotated (landscape) buffers on a device
         // whose data-output connection cannot rotate.
-        if let connection = output.connection(with: .video), connection.isVideoRotationAngleSupported(90) {
-            connection.videoRotationAngle = 90
+        //
+        // The front camera's *preview* is mirrored (the natural selfie view,
+        // which `AVCaptureVideoPreviewLayer` does by itself, chainlink #95),
+        // but the file and the frames the pose pipeline reads must not be:
+        // with the data output pinned unmirrored, every keypoint, left/right
+        // and facing means exactly what it does on the back camera, so
+        // analysis and export need no special case. `automaticallyAdjusts…`
+        // has to be off before `isVideoMirrored` can be set.
+        if let connection = output.connection(with: .video) {
+            if connection.isVideoRotationAngleSupported(90) {
+                connection.videoRotationAngle = 90
+            }
+            if connection.isVideoMirroringSupported {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = false
+            }
         }
 
         // The live cue pipeline (chainlink #91): built once, here, so it

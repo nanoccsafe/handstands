@@ -23,6 +23,16 @@ struct CameraPreview: UIViewRepresentable {
             super.layoutSubviews()
             previewLayer.frame = bounds
             previewLayer.videoGravity = .resizeAspectFill
+            applyPortrait()
+        }
+
+        /// Turn the preview portrait, to match the buffers the same session
+        /// rotates into the recording and the framing guide. Called from
+        /// `layoutSubviews` and, after a camera flip, from `updateUIView`:
+        /// swapping in a new session does not by itself schedule a layout
+        /// pass, so without this the flipped camera's connection could come
+        /// up sideways.
+        func applyPortrait() {
             if let connection = previewLayer.connection,
                connection.isVideoRotationAngleSupported(90) {
                 connection.videoRotationAngle = 90
@@ -40,6 +50,10 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ view: PreviewView, context: Context) {
         if view.previewLayer.session !== session {
             view.previewLayer.session = session
+            // The new session's connection is not rotated yet and no layout
+            // pass is guaranteed, so rotate it now and ask for the frame too.
+            view.applyPortrait()
+            view.setNeedsLayout()
         }
     }
 }
