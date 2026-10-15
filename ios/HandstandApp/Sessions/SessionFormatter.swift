@@ -19,11 +19,36 @@ enum SessionFormatter {
 
     /// A clip score to two decimals. Anything that is not a real number
     /// (and the `nil` of a take that has not been analysed) reads "—"
-    /// rather than "nan" or "-0.00"; the views say "Not analysed yet" for
-    /// the `nil` case themselves.
+    /// rather than "nan" or "-0.00"; `analysisStatus` is what turns the
+    /// `nil` case into words.
     static func score(_ value: Double?) -> String {
         guard let value, value.isFinite else { return "—" }
         return String(format: "%.2f", value)
+    }
+
+    /// What the History row and the detail screen's Recording section say
+    /// about a take's analysis — one function, so the two screens can never
+    /// disagree (chainlink #96). The order matters: a note means the run
+    /// could not measure the clip at all (chainlink #47), a score is the one
+    /// number worth showing, `analyzedAt == nil` is the only "not analysed
+    /// yet", and anything left was analysed but produced no score — a take
+    /// with no hold that could be scored, or a build with no reference
+    /// (chainlink #28). The hold count is the detail the row otherwise
+    /// loses: "Analysed · 2 holds · no score" says more than "no score".
+    static func analysisStatus(
+        analyzedAt: Date?,
+        clipScore: Double?,
+        analysisNote: String?,
+        holdCount: Int?
+    ) -> String {
+        if analysisNote != nil { return "Couldn't measure" }
+        if let clipScore { return score(clipScore) }
+        if analyzedAt == nil { return "Not analysed yet" }
+        if let holdCount, holdCount > 0 {
+            let noun = holdCount == 1 ? "hold" : "holds"
+            return "Analysed · \(holdCount) \(noun) · no score"
+        }
+        return "Analysed · no score"
     }
 
     /// A playback position in the clip's own milliseconds as `0:04.2` —

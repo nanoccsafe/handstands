@@ -190,23 +190,22 @@ struct SessionDetailView: View {
                     "Frame",
                     value: VideoInfoFormatter.pixelSize(width: session.width, height: session.height)
                 )
-                if session.analysisNote != nil {
-                    // Analysed but unmeasurable (no body length): say so
-                    // rather than showing a score that is not there or a
-                    // hold count of 0, which would read as "did not hold".
-                    Text("Couldn't measure")
-                        .foregroundStyle(.secondary)
-                } else if let score = session.clipScore {
-                    LabeledContent("Score", value: SessionFormatter.score(score))
-                } else if session.analyzedAt == nil {
-                    Text("Not analysed yet")
-                        .foregroundStyle(.secondary)
+                if session.analysisNote == nil, session.clipScore != nil {
+                    // A real score keeps its own row (the one number worth
+                    // reading); every other state is words, from the same
+                    // function the History row uses (#96) so the two
+                    // screens can never disagree.
+                    LabeledContent("Score", value: SessionFormatter.score(session.clipScore))
                 } else {
-                    // Analysed but scoreless (no reference in the build, or
-                    // no hold that could be scored): analysed, no number —
-                    // "Not analysed yet" would be wrong.
-                    Text("No score yet")
-                        .foregroundStyle(.secondary)
+                    Text(
+                        SessionFormatter.analysisStatus(
+                            analyzedAt: session.analyzedAt,
+                            clipScore: session.clipScore,
+                            analysisNote: session.analysisNote,
+                            holdCount: session.holdCount
+                        )
+                    )
+                    .foregroundStyle(.secondary)
                 }
             }
 
