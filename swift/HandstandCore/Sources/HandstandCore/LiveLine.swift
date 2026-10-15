@@ -243,6 +243,14 @@ public struct LiveLineDetector: Sendable {
         guard let hipAngle = Self.hipAngleDeg(joints: joints, minVisibility: config.minVisibility),
             hipAngle >= config.hipAngleMinDeg
         else { return false }
+        // A red banana (chainlink #97) is not a line however straight the
+        // wrist→ankle vector and the hip angle look: the post-analysis stress
+        // diagram will call this frame a fault, so "Line. Hold it." must not
+        // cheer it. The check is `LiveFormDetector`'s own maths, so live and
+        // offline can never disagree about what "red" means.
+        guard !LiveFormDetector.isBananaRed(
+            joints: joints, minVisibility: config.minVisibility)
+        else { return false }
         return true
     }
 

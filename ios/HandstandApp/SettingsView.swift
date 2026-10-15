@@ -18,9 +18,11 @@ enum CueSettingsStorage {
     static let voiceCuesKey = "cueVoiceCues"
     static let timeMarksKey = "cueTimeMarks"
     static let framingHintsKey = "cueFramingHints"
+    static let formCuesKey = "cueFormCues"
 
-    /// What a fresh install shows: voice on, time marks off, framing hints on
-    /// — `CueSettings()`'s own defaults, spelled once for the tests.
+    /// What a fresh install shows: voice on, time marks off, framing hints on,
+    /// form cues on (the user asked for them, 2026-10-14) — `CueSettings()`'s
+    /// own defaults, spelled once for the tests.
     static let defaults = CueSettings()
 
     /// The one line of philosophy the issue asks for under the toggles —
@@ -28,14 +30,15 @@ enum CueSettingsStorage {
     static let philosophy =
         "Live cues only confirm; the analysis afterwards gives the critique."
 
-    /// The three toggles out of a defaults store, each falling back to its
-    /// default when the key has never been written (a key written as `false`
-    /// must read as `false`, so presence is checked, not truthiness).
+    /// The toggles out of a defaults store, each falling back to its default
+    /// when the key has never been written (a key written as `false` must read
+    /// as `false`, so presence is checked, not truthiness).
     static func read(_ defaults: UserDefaults) -> CueSettings {
         CueSettings(
             voiceCues: bool(voiceCuesKey, fallback: Self.defaults.voiceCues, in: defaults),
             timeMarks: bool(timeMarksKey, fallback: Self.defaults.timeMarks, in: defaults),
-            framingHints: bool(framingHintsKey, fallback: Self.defaults.framingHints, in: defaults)
+            framingHints: bool(framingHintsKey, fallback: Self.defaults.framingHints, in: defaults),
+            formCues: bool(formCuesKey, fallback: Self.defaults.formCues, in: defaults)
         )
     }
 
@@ -70,8 +73,8 @@ enum CameraSettingsStorage {
     }
 }
 
-/// The settings screen: the three live-cue toggles and the philosophy line
-/// under them (chainlink #91).
+/// The settings screen: the live-cue toggles and the philosophy line under
+/// them (chainlink #91, #97).
 struct SettingsView: View {
     @AppStorage(CueSettingsStorage.voiceCuesKey)
     private var voiceCues = CueSettingsStorage.defaults.voiceCues
@@ -79,6 +82,8 @@ struct SettingsView: View {
     private var timeMarks = CueSettingsStorage.defaults.timeMarks
     @AppStorage(CueSettingsStorage.framingHintsKey)
     private var framingHints = CueSettingsStorage.defaults.framingHints
+    @AppStorage(CueSettingsStorage.formCuesKey)
+    private var formCues = CueSettingsStorage.defaults.formCues
 
     var body: some View {
         Form {
@@ -86,6 +91,7 @@ struct SettingsView: View {
                 Toggle("Voice cues", isOn: $voiceCues)
                 Toggle("Time marks", isOn: $timeMarks)
                 Toggle("Framing hints", isOn: $framingHints)
+                Toggle("Form cues (say when the line breaks)", isOn: $formCues)
             } footer: {
                 Text(CueSettingsStorage.philosophy)
             }

@@ -144,6 +144,7 @@ final class CaptureService {
         guard let cue = scheduler.decide(
             tMs: frame.tMs,
             events: frame.events,
+            formEvents: frame.formEvents,
             framing: framing,
             inverted: frame.inverted,
             recording: recording

@@ -217,6 +217,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Live form cue: one short phrase when the line goes red during a hold —
+  "Ribs in." (arch), "Open the hips." (hollow) or "Straighten." (sign unknown)
+  (#97). A deliberate banana no longer passes the live "Line. Hold it." check
+  (a red banana is not a line), so the cue stops cheering the fault the
+  post-analysis overlay colours red; the new `LiveFormDetector` uses
+  `Features.banana`'s own maths and the stress diagram's own severity, fires at
+  most once per direction per hold after a sustained (1 s) red, and has its own
+  **Form cues (say when the line breaks)** toggle, on by default per the user's
+  request (2026-10-14). This is the one deliberate change to the 2026-10-06
+  "live mode never corrects mid-hold" rule.
 - Record screen: switch between front and back camera (see the feed while setting up) (#95)
 - History row says 'Not analysed yet' for analysed takes without a score (#96)
 - Catalogue auto-fill + reference review project (line holds) (#94)
