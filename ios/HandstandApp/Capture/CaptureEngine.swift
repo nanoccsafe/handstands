@@ -91,12 +91,20 @@ final class CaptureEngine: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     /// Stops the session, finishing any recording in progress first so a
     /// half-made file is either completed or cleaned up, never left open.
-    func stop() {
+    ///
+    /// The optional `completion` runs on `queue` *after* `stopRunning()` has
+    /// returned — the hand-off a camera flip waits for. `stopRunning()` is
+    /// asynchronous from the caller's point of view, so a fresh engine started
+    /// while this one is still tearing down would put two sessions on two
+    /// cameras up at once and interrupt both; the completion is what lets the
+    /// flip start the new session only once this one is really down.
+    func stop(completion: (@Sendable () -> Void)? = nil) {
         queue.async { [self] in
             endRecording()
             if session.isRunning {
                 session.stopRunning()
             }
+            completion?()
         }
     }
 

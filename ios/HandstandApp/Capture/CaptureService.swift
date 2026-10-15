@@ -78,6 +78,11 @@ final class CaptureService {
     /// `start()`, and what the flip button takes the opposite of.
     private var activePosition: CameraPosition?
 
+    /// True while a flip is tearing the old engine down and bringing the new
+    /// one up (chainlink #95). The Record screen disables the flip button
+    /// while it is set, so a second tap cannot start an overlapping switch.
+    private(set) var isSwitching = false
+
     // MARK: - Live cues (chainlink #91): the state
 
     /// The cue toggles in force, pushed here from the Record screen's
@@ -243,9 +248,10 @@ final class CaptureService {
     /// stop the running engine, bring a fresh one up on the other device —
     /// same callbacks — and start it, so the preview, the framing guide and
     /// live mode carry on. Never mid-take; a device with only one camera has
-    /// nothing to switch to.
+    /// nothing to switch to, and a second tap while a flip is in flight is
+    /// ignored (the button is disabled on `isSwitching` too).
     func switchCamera() {
-        guard phase == .ready, !isRecording, !isShutdown else { return }
+        guard phase == .ready, !isRecording, !isShutdown, !isSwitching else { return }
 
         // The `@AppStorage` write that triggered this already moved
         // `cameraPosition`; when it matches what is open, take the opposite.
@@ -253,19 +259,37 @@ final class CaptureService {
         guard
             let position = Self.resolvedPosition(
                 preferred: target, available: Self.availablePositions()),
-            position != activePosition,
-            let device = AVCaptureDevice.default(
-                .builtInWideAngleCamera, for: .video, position: position.avPosition)
+            position != activePosition
         else { return }
 
+        isSwitching = true
         cameraPosition = position
         activePosition = position
 
-        engine?.stop()
-        let engine = makeEngine(device: device)
-        self.engine = engine
-        session = engine.session
-        engine.start()
+        // Stop the old engine and bring the new one up only in its completion:
+        // `stop()`'s work happens on the old engine's queue, so starting the
+        // new session immediately would queue its `startRunning()` on a
+        // different queue and could run two sessions at once. The completion
+        // hops back to the main actor to swap `engine`/`session`. The device is
+        // resolved there rather than captured, so the closure only carries the
+        // sendable `position`.
+        let old = engine
+        engine = nil
+        old?.stop { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                defer { self.isSwitching = false }
+                guard
+                    !self.isShutdown,
+                    let device = AVCaptureDevice.default(
+                        .builtInWideAngleCamera, for: .video, position: position.avPosition)
+                else { return }
+                let engine = self.makeEngine(device: device)
+                self.engine = engine
+                self.session = engine.session
+                engine.start()
+            }
+        }
     }
 
     /// The engine for one camera, with the callbacks every engine shares —

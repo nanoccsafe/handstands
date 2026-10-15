@@ -257,7 +257,8 @@ struct RecordView: View {
     /// switches the preview, framing guide and live mode between the back
     /// and front wide-angle cameras, and remembers the choice in
     /// `@AppStorage("cameraPosition")`. Frozen while the red light is on —
-    /// no switching mid-take.
+    /// no switching mid-take — and while a flip is already in flight, so a
+    /// second tap cannot start an overlapping switch.
     private var flipButton: some View {
         Button {
             cameraPositionRaw = cameraPosition.opposite.rawValue
@@ -269,8 +270,8 @@ struct RecordView: View {
                 .background(.ultraThinMaterial, in: Circle())
         }
         .buttonStyle(.plain)
-        .disabled(model.isRecording)
-        .opacity(model.isRecording ? 0.5 : 1)
+        .disabled(model.isRecording || model.isSwitching)
+        .opacity(model.isRecording || model.isSwitching ? 0.5 : 1)
         .accessibilityLabel("Switch camera")
     }
 
