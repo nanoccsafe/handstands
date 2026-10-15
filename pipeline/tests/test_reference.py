@@ -19,7 +19,7 @@ import pytest
 from test_score import GOOD, write_clip
 
 from handstand import features as ft
-from handstand import hold_shapes, reference, reference_review, score
+from handstand import hold_shapes, reference, reference_review, score, view
 
 # test_score builds a per-frame table with every column the scoring functions
 # read, and writes it through read_clip_features' own contract; reusing its
@@ -209,6 +209,54 @@ def test_camera_angles_raises_without_a_catalogue(tmp_path: pathlib.Path) -> Non
         reference.camera_angles(tmp_path / "data")
 
 
+def write_hold_views(data: pathlib.Path, rows: list[tuple[str, int, str]]) -> pathlib.Path:
+    """A ``hold_views.csv`` with ``(clip_id, hold_id, view)`` rows."""
+    path = view.hold_views_path(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(view.HOLD_VIEW_COLUMNS)
+        for clip_id, hold_id, choice in rows:
+            writer.writerow([clip_id, hold_id, 20, 0.02, choice])
+    return path
+
+
+def test_filter_side_view_falls_back_to_the_detected_view(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    write_catalogue(data, {"clipSide01": "side", "clipFront1": "front", "clipEmpty1": ""})
+    angles = reference.camera_angles(data)
+    detected = {
+        ("clipEmpty1", 2): "side",
+        ("clipEmpty2", 3): "not_side",
+        ("clipFront1", 1): "side",
+    }
+    holds = {("clipSide01", 0), ("clipFront1", 1), ("clipEmpty1", 2), ("clipEmpty2", 3)}
+
+    kept, notes = reference.filter_side_view(holds, angles, detected)
+
+    assert kept == {("clipSide01", 0), ("clipEmpty1", 2)}
+    # The hand label wins over the detector in both directions.
+    assert "clipFront1 h1: not side view (camera_angle=front)" in notes
+    assert "clipEmpty2 h3: not side view (camera_angle=empty, detected=not_side)" in notes
+    assert len(notes) == 2
+
+
+def test_filter_side_view_notes_a_missing_detection_as_none() -> None:
+    kept, notes = reference.filter_side_view({("clipEmpty1", 0)}, {"clipEmpty1": ""}, {})
+
+    assert kept == set()
+    assert "clipEmpty1 h0: not side view (camera_angle=empty, detected=none)" in notes
+
+
+def test_filter_side_view_trusts_a_side_label_over_the_detector() -> None:
+    kept, notes = reference.filter_side_view(
+        {("clipSide01", 0)}, {"clipSide01": "side"}, {("clipSide01", 0): "not_side"}
+    )
+
+    assert kept == {("clipSide01", 0)}
+    assert notes == []
+
+
 # --------------------------------------------------------------------------- #
 # built_from
 # --------------------------------------------------------------------------- #
@@ -360,6 +408,28 @@ def test_the_cli_any_view_keeps_non_side_holds(tmp_path: pathlib.Path) -> None:
         reference.main(["build", "--data", str(data), "--min-holds", "2", "--any-view"]) == 0
     )
     assert score.load_reference(reference.default_output(data)).n_holds == 2
+
+
+def test_the_cli_falls_back_to_detected_views_and_labels_only_skips_them(
+    tmp_path: pathlib.Path,
+) -> None:
+    data = tmp_path / "data"
+    side = [f"side{i:08d}" for i in range(5)]
+    empty = "empty0000000"
+    good_clips(data, [*side, empty])
+    write_labels(data, [(clip_id, 0, "yes") for clip_id in [*side, empty]])
+    write_catalogue(data, {**{clip_id: "side" for clip_id in side}, empty: ""})
+    # The detector calls the empty clip's hold side.
+    write_hold_views(data, [(empty, 0, "side")])
+
+    # The default keeps it through the fallback: six usable holds.
+    assert reference.main(["build", "--data", str(data), "--min-holds", "6"]) == 0
+    assert score.load_reference(reference.default_output(data)).n_holds == 6
+
+    # --labels-only ignores the table: five hand-labelled holds, under the floor.
+    assert (
+        reference.main(["build", "--data", str(data), "--min-holds", "6", "--labels-only"]) == 2
+    )
 
 
 # --------------------------------------------------------------------------- #

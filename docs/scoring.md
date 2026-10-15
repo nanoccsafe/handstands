@@ -172,7 +172,7 @@ comes out of the labelled set:
 ```sh
 cd pipeline
 uv run python -m handstand.reference build [--data DIR] [--source SRC]
-    [--out PATH] [--min-holds N] [--install] [--any-view]
+    [--out PATH] [--min-holds N] [--install] [--any-view] [--labels-only]
 ```
 
 `handstand.reference` reads:
@@ -191,6 +191,23 @@ uv run python -m handstand.reference build [--data DIR] [--source SRC]
 - `data/features/<source>/<clip_id>.parquet` (#22/#23) for one value per hold —
   the same athlete-signed `score.hold_values` medians and spreads a hold is
   scored on.
+
+For a clip whose `camera_angle` cell is **empty** the build falls back to the
+detected view: run
+
+```sh
+uv run python -m handstand.view build [--data DIR] [--source SRC]
+```
+
+first, which writes `data/features/<source>/hold_views.csv` (one row per hold)
+and prints a validation report at `data/reports/views/`. The hold is kept when
+that table calls it `side`; otherwise it is skipped with a note naming the
+detected view (`none` when there is no row). The hand label always wins, so a
+`front` clip is dropped however the detector reads it. With no `hold_views.csv`
+the build prints a note and only hand-labelled side clips count, and
+`--labels-only` asks for exactly that even when the table exists. The
+`other line holds in side-view clips` line of the sanity report uses the same
+rule per hold, so it compares side views with side views.
 
 Each **hold** contributes one value per feature, so every hold weighs the same
 and no long hold outvotes a short one; frames are never pooled. Per feature it
