@@ -181,11 +181,21 @@ held, and its own toggle.
 | Cue | Words | When |
 | --- | --- | --- |
 | Up | "Up." | the frame has been *up* — palms on the floor (confident wrists), hips above the hands and ankles above the hips (confident hips and ankles) — for **0.5 s**. **Once per up stretch**: a dip shorter than **1 s** does not end the stretch, a longer one earns a new "Up.". No angle limits — a piked or arched attempt is still "up". |
-| Line | "Line. Hold it." | the frame has been a *line* for 0.5 s — upside down, wrist→ankle within **15°** of vertical, hips open at **≥ 160°**, wrists/hips/ankles confident. **Once per line.** |
+| Line | "Line. Hold it." | the frame has been a *line* for 0.5 s — upside down, wrist→ankle within **15°** of vertical, hips open at **≥ 160°** and the hip **not red** (the hip-red band starts just above the gate, so a 160.5° pike is a form fault, not a line — see Form), wrists/hips/ankles confident. **Once per line.** |
 | Time marks | "Five." / "Ten." / "Fifteen." … | every 5 s of line time while the line holds — only with **Time marks** on. |
-| Form | "Hips over shoulders." · "Ribs in." · "Open the hips." · "Straighten." | a fault is **red** — the piked hip (the shoulder–hip–ankle angle red) or the banana (`\|banana\| ≥ 0.14 L`), both the same severity the stress diagram colours with — continuously for **1 s** during a hold, upside down and within **35°** of vertical. A red hip → "Hips over shoulders."; an arch (positive banana) → "Ribs in." only when its severity is at least the hip's, otherwise the piked hip wins; a negative banana → "Open the hips."; no nose (the sign unknown) → "Straighten.". **Repeats about every 2 s while the fault stays red** (coach mode). Only with **Form cues** on. |
+| Form | "Hips over shoulders." · "Ribs in." · "Open the hips." · "Straighten." | a fault is **red** — the piked hip (the shoulder–hip–ankle angle red) or the banana (`\|banana\| ≥ 0.14 L`), both the same severity the stress diagram colours with — continuously for **1 s** during a hold, upside down and within **35°** of vertical. A red hip → "Hips over shoulders."; an arch (positive banana) → "Ribs in." only when its severity is at least the hip's, otherwise the piked hip wins; a negative banana → "Open the hips."; no nose (the sign unknown) → "Straighten.". **Repeats about every 2 s while the fault stays red** (coach mode). Only with **Form cues** on, and only after the "Up." acknowledgement (see below). |
 | Framing hints | "Step back." · "Come closer." · "Move to the middle." · "Only you in the frame." · "Raise the phone." | **before the attempt**, upright and out of a line: at most one every 4 s, never the same one twice within 8 s, and never within 1.5 s of coming down out of inversion. Cut off at the top *only* while standing → "Raise the phone." (the phone is too low); any sideways edge → "Move to the middle."; too small → "Come closer."; two bodies → "Only you in the frame."; nobody → nothing (the border already says so). |
 | Ready | "Ready." | the framing goes from wrong back to right while you are upright, once per transition. |
+
+Two ordering rules keep the corrections from stepping on the acknowledgements
+(chainlink #100 review). A form cue is **never spoken before "Up."**: until the
+athlete's up stretch has been acknowledged the scheduler ignores form events,
+and a correction still waiting when they come back down is dropped — a
+correction must not arrive before the acknowledgement of the same attempt. And
+a form cue never **follows "Line. Hold it."**: an achieved line clears any
+waiting correction, and form events arriving while a line is held are ignored
+rather than queued, so a stale "Ribs in." cannot land two seconds after the
+athlete has already found the line.
 
 Nothing at all is said when **Voice cues** is off, except the framing hints —
 they have their own toggle. Every cue is also shown as a small **banner** under
@@ -231,7 +241,9 @@ Under the toggles, the philosophy in one line:
   and unit-tested — including the check that **every live cue on the golden
   fixtures falls inside a hold the offline `PhaseSegmenter` finds on the same
   input**, so the cue can never fire where the analysis will say "no hold". A
-  red banana is not a line, so "Line. Hold it." never cheers one, and the
+  red banana **or a red piked hip** is not a line, so "Line. Hold it." never
+  cheers one — the hip gate (160°) and the hip-red band just above it overlap,
+  and the line rejects the red side. The
   form detector's banana is `Features.banana`'s own maths in the live body
   length and the stress diagram's own severity — the hip red is
   `StressDiagram.valueSeverity` of `hip_angle`, with no copied threshold — so

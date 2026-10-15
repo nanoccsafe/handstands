@@ -61,6 +61,10 @@ struct LiveFrame: Equatable, Sendable {
     let formEvents: [LiveFormEvent]
     /// Was the athlete upside down in this frame?
     let inverted: Bool
+    /// Has the athlete been acknowledged as *up* for the current stretch
+    /// (``LiveLineDetector/isUpNow`` at this frame)? The scheduler uses it to
+    /// hold form cues until after "Up." (chainlink #100 review).
+    let isUp: Bool
     /// How long this frame's inference took, milliseconds — the guard's input
     /// and the sidecar's `avg_inference_ms`.
     let inferenceMs: Double
@@ -72,6 +76,7 @@ struct LiveFrame: Equatable, Sendable {
         events: [LiveEvent],
         formEvents: [LiveFormEvent] = [],
         inverted: Bool,
+        isUp: Bool = true,
         inferenceMs: Double,
         fpsTarget: Double
     ) {
@@ -79,6 +84,7 @@ struct LiveFrame: Equatable, Sendable {
         self.events = events
         self.formEvents = formEvents
         self.inverted = inverted
+        self.isUp = isUp
         self.inferenceMs = inferenceMs
         self.fpsTarget = fpsTarget
     }
@@ -334,6 +340,7 @@ final class LivePosePipeline: @unchecked Sendable {
                 events: events,
                 formEvents: formEvents,
                 inverted: detector.isInverted,
+                isUp: detector.isUpNow,
                 inferenceMs: inferenceMs,
                 fpsTarget: rate.targetFps
             ))

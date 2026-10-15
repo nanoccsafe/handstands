@@ -326,7 +326,13 @@ public struct LiveLineDetector: Sendable {
             abs(bodyAngle) <= config.bodyAngleMaxDeg
         else { return false }
         guard let hipAngle = Self.hipAngleDeg(joints: joints, minVisibility: config.minVisibility),
-            hipAngle >= config.hipAngleMinDeg
+            hipAngle >= config.hipAngleMinDeg,
+            // A red hip (chainlink #100) is not a line even at the line gate's
+            // own 160°: the hip-red band starts just above it, so a 160.5°
+            // frame would otherwise be both a line and a form fault. The same
+            // `LiveFormDetector` maths the form cue uses decides, so live and
+            // offline cannot disagree about what "red" means.
+            !LiveFormDetector.isHipRed(hipAngle)
         else { return false }
         // A red banana (chainlink #97) is not a line however straight the
         // wrist→ankle vector and the hip angle look: the post-analysis stress

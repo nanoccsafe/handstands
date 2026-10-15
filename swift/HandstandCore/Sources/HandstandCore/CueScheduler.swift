@@ -114,7 +114,8 @@ public enum Cue: Equatable, Sendable {
 /// * at most one framing hint every ``hintGapS``, never the same hint twice in
 ///   a row within ``hintRepeatGapS``;
 /// * `ready` once per non-ok → ok transition while upright;
-/// * form cues at coach pace — every ``formGapS`` while a fault stays red;
+/// * form cues at coach pace — every ``formGapS`` while a fault stays red,
+///   but only while the athlete is *up* and outside an achieved line;
 /// * nothing at all when ``CueSettings/voiceCues`` is off, except framing hints,
 ///   which have their own toggle;
 /// * globally at least ``debounceGapS`` between any two cues — except
@@ -171,8 +172,10 @@ public struct CueScheduler: Sendable {
     /// A form cue (chainlink #97) waiting for its turn; the newest fault
     /// replaces an older one. It is queued like the line cue and the marks —
     /// the fault is a real correction, not a stale edge — but it is only
-    /// spoken when framing hints have nothing to say (they outrank it), and
-    /// only with ``CueSettings/formCues`` on.
+    /// spoken when framing hints have nothing to say (they outrank it), only
+    /// with ``CueSettings/formCues`` on, only while the athlete is *up*
+    /// (``decide``'s `up`) and not inside an achieved line (chainlink #100
+    /// review).
     private var pendingForm: FormFault?
 
     /// When the last cue was spoken, and which — the global debounce reads it.
@@ -207,6 +210,14 @@ public struct CueScheduler: Sendable {
     /// out. Pure with respect to its inputs' *order*: call it once per live
     /// frame, in time order, with the framing verdict in force at that moment.
     ///
+    /// `up` is ``LiveLineDetector/isUpNow`` for this frame: form cues are only
+    /// for an athlete who has already been acknowledged ("Up."), so while it
+    /// is false incoming form events are ignored and a waiting one is dropped
+    /// — a correction must never arrive before the acknowledgement of the
+    /// same up stretch (chainlink #100 review). A `lineAchieved` clears any
+    /// waiting form cue too: "Line. Hold it." supersedes a stale correction,
+    /// and none is queued while the scheduler is in a line.
+    ///
     /// A cue that is *waiting* (a pending line hold or time mark, blocked only
     /// by the debounce) is held for a later tick rather than dropped; the
     /// edge-triggered cues (`ready`, framing hints) are dropped when the
@@ -218,16 +229,18 @@ public struct CueScheduler: Sendable {
         formEvents: [LiveFormEvent] = [],
         framing: FramingStatus?,
         inverted: Bool,
+        up: Bool = true,
         recording: Bool
     ) -> Cue? {
         // A toggle switched off while something was pending must not leave a
-        // cue behind to fire after the user asked for silence.
+        // cue behind to fire after the user asked for silence. `up` is the
+        // same: a form cue waiting while the athlete comes back down is stale.
         if !settings.voiceCues {
             pendingLineHold = false
             pendingUp = false
             pendingTimeMark = nil
         }
-        if !settings.voiceCues || !settings.formCues {
+        if !settings.voiceCues || !settings.formCues || !up {
             pendingForm = nil
         }
 
@@ -251,6 +264,10 @@ public struct CueScheduler: Sendable {
                     // The line cue supersedes the acknowledgement: if a line
                     // is pending, "Up." is not worth saying any more.
                     pendingUp = false
+                    // …and it supersedes a correction too: a form cue still
+                    // waiting is about a shape the athlete is no longer in
+                    // (chainlink #100 review).
+                    pendingForm = nil
                 }
             case .lineLost:
                 inLine = false
@@ -258,7 +275,10 @@ public struct CueScheduler: Sendable {
                 if settings.voiceCues, settings.timeMarks { pendingTimeMark = seconds }
             }
         }
-        for event in formEvents where settings.voiceCues && settings.formCues {
+        // Form events are ignored unless the athlete is *up* and outside a
+        // line: a correction before "Up." is out of order, and one inside an
+        // achieved line is stale the moment "Line. Hold it." is due.
+        for event in formEvents where settings.voiceCues && settings.formCues && up && !inLine {
             pendingForm = event.fault
         }
 
@@ -357,9 +377,11 @@ public struct CueScheduler: Sendable {
     /// A form cue (chainlink #97) waiting for its turn: queued (the correction
     /// is the point, not a stale edge), held back by the coach-mode
     /// ``formGapS``, dropped the moment its toggle goes off. It is checked
-    /// after the framing hints, so a hint always outranks it.
+    /// after the framing hints, so a hint always outranks it. A line in
+    /// progress outranks it too — "Line. Hold it." is not followed by a
+    /// correction to the shape the athlete has left (chainlink #100 review).
     private mutating func formCue(tMs: Int) -> Cue? {
-        guard let fault = pendingForm else { return nil }
+        guard let fault = pendingForm, !inLine else { return nil }
         guard settings.voiceCues, settings.formCues else {
             pendingForm = nil
             return nil

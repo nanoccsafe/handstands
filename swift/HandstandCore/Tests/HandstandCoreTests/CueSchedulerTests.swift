@@ -20,11 +20,12 @@ final class CueSchedulerTests: XCTestCase {
         formEvents: [LiveFormEvent] = [],
         framing: FramingStatus? = nil,
         inverted: Bool = false,
+        up: Bool = true,
         recording: Bool = false
     ) -> Cue? {
         scheduler.decide(
             tMs: tMs, events: events, formEvents: formEvents, framing: framing,
-            inverted: inverted, recording: recording)
+            inverted: inverted, up: up, recording: recording)
     }
 
     // MARK: - The settings
@@ -42,13 +43,14 @@ final class CueSchedulerTests: XCTestCase {
     func testAFormEventSpeaksThroughTheCoachGap() {
         var scheduler = CueScheduler()
 
-        XCTAssertEqual(
-            tick(&scheduler, tMs: 0, events: [.lineAchieved(tMs: 0)], inverted: true), .lineHold)
+        // A hint holds the clock; a form event 1 s later waits it out…
+        XCTAssertEqual(tick(&scheduler, tMs: 0, framing: .tooSmall), .framing(.comeCloser))
         XCTAssertNil(
-            tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)], inverted: true),
+            tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)]),
             "the coach gap is 2 s")
+        // …and speaks at the first tick past it.
         XCTAssertEqual(
-            tick(&scheduler, tMs: 2000, inverted: true), .form(.arch),
+            tick(&scheduler, tMs: 2000), .form(.arch),
             "the form cue waited its turn rather than being dropped")
     }
 
@@ -106,6 +108,89 @@ final class CueSchedulerTests: XCTestCase {
             tick(&scheduler, tMs: 5000, framing: .multiplePeople), .framing(.onlyYou),
             "a framing hint outranks the form cue")
         XCTAssertEqual(tick(&scheduler, tMs: 9000), .form(.arch))
+    }
+
+    // MARK: - Form cue ordering (chainlink #100 review)
+
+    /// A correction must never arrive before the acknowledgement of the same
+    /// up stretch: while the athlete is not (yet) *up*, form events are
+    /// ignored, not queued.
+    func testAFormEventBeforeUpIsNeverSpoken() {
+        var scheduler = CueScheduler()
+
+        // Up is not acknowledged yet (the 0.5 s onset has not elapsed): the
+        // correction is out of order…
+        XCTAssertNil(
+            tick(&scheduler, tMs: 1000, formEvents: [.hips(tMs: 1000)], inverted: true, up: false))
+        // …and it is still never spoken once the coach gap has passed.
+        XCTAssertNil(
+            tick(&scheduler, tMs: 4000, inverted: true, up: false),
+            "an event ignored while not up is not replayed later")
+        XCTAssertNil(scheduler.lastCue)
+    }
+
+    func testAFormEventAfterUpSpeaksAfterTheAcknowledgement() {
+        var scheduler = CueScheduler()
+
+        // "Up." first…
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 0, events: [.up(tMs: 0)], inverted: true, up: true), .up)
+        // …then the same correction, which waits out the coach gap behind it.
+        XCTAssertNil(
+            tick(&scheduler, tMs: 1000, formEvents: [.hips(tMs: 1000)], inverted: true, up: true),
+            "the form cue follows Up. by formGapS")
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 2000, inverted: true, up: true), .form(.hips),
+            "and speaks once the gap is spent")
+    }
+
+    func testAPendingFormCueIsDroppedWhenTheAthleteIsNotUp() {
+        var scheduler = CueScheduler()
+
+        // A hint holds the clock, then a form event arrives while up…
+        XCTAssertEqual(tick(&scheduler, tMs: 0, framing: .tooSmall), .framing(.comeCloser))
+        XCTAssertNil(tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)], up: true))
+        // …and the athlete comes back down before the coach gap is spent: the
+        // waiting correction is dropped, not spoken into an empty frame.
+        XCTAssertNil(tick(&scheduler, tMs: 2500, up: false))
+        XCTAssertNil(tick(&scheduler, tMs: 6000, up: true), "the dropped form cue never speaks")
+    }
+
+    /// A line achieved while a form cue waits clears it: "Line. Hold it." is
+    /// never followed by a stale correction to a shape the athlete has left.
+    func testALineAchievedDropsAWaitingFormCue() {
+        var scheduler = CueScheduler()
+
+        // A hint holds the clock; a form cue queues 1 s later…
+        XCTAssertEqual(tick(&scheduler, tMs: 0, framing: .tooSmall), .framing(.comeCloser))
+        XCTAssertNil(tick(&scheduler, tMs: 1000, formEvents: [.arch(tMs: 1000)], up: true))
+        // …and the line is achieved on the next tick: only the line cue speaks.
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 1100, events: [.lineAchieved(tMs: 1100)], up: true), .lineHold)
+        XCTAssertNil(
+            tick(&scheduler, tMs: 3000, up: true),
+            "the stale form cue does not follow Line. Hold it.")
+    }
+
+    /// Form events inside an achieved line are ignored, not queued — and a
+    /// fresh one after `lineLost` speaks again.
+    func testAFormEventInsideALineIsIgnoredAndANewOneAfterLineLostSpeaks() {
+        var scheduler = CueScheduler()
+
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 0, events: [.lineAchieved(tMs: 0)], inverted: true, up: true),
+            .lineHold)
+        // A fault arrives while the line is held: it is not spoken…
+        XCTAssertNil(
+            tick(&scheduler, tMs: 2000, formEvents: [.arch(tMs: 2000)], inverted: true, up: true))
+        // …and not queued, so it never surfaces after the line ends.
+        XCTAssertNil(
+            tick(&scheduler, tMs: 3000, events: [.lineLost(tMs: 3000, heldS: 3)], up: true))
+        XCTAssertNil(tick(&scheduler, tMs: 5000, up: true), "the in-line fault was not queued")
+        // A fresh fault after the line, with the coach gap spent, speaks.
+        XCTAssertEqual(
+            tick(&scheduler, tMs: 5500, formEvents: [.hips(tMs: 5500)], inverted: true, up: true),
+            .form(.hips))
     }
 
     // MARK: - The line cue

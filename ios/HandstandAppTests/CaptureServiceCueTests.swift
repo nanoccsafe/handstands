@@ -30,6 +30,7 @@ final class CaptureServiceCueTests: XCTestCase {
         events: [LiveEvent] = [],
         formEvents: [LiveFormEvent] = [],
         inverted: Bool = false,
+        isUp: Bool = true,
         inferenceMs: Double = 40,
         fpsTarget: Double = 10
     ) -> LiveFrame {
@@ -38,6 +39,7 @@ final class CaptureServiceCueTests: XCTestCase {
             events: events,
             formEvents: formEvents,
             inverted: inverted,
+            isUp: isUp,
             inferenceMs: inferenceMs,
             fpsTarget: fpsTarget
         )
@@ -177,6 +179,43 @@ final class CaptureServiceCueTests: XCTestCase {
         )
 
         XCTAssertTrue(speaker.spoken.isEmpty, "form cues off: nothing is said")
+    }
+
+    /// The wiring that carries `LiveFrame.isUp` into the scheduler (chainlink
+    /// #100 review): a correction is not spoken before the "Up."
+    /// acknowledgement, and is spoken after it.
+    func testAFormEventIsHeldUntilTheUpAcknowledgement() {
+        let (service, speaker) = makeService()
+
+        // Up is not acknowledged yet: the correction is ignored.
+        service.liveUpdate(
+            frame(tMs: 2_000, formEvents: [.hips(tMs: 2_000)], inverted: true, isUp: false),
+            framing: nil,
+            recording: true
+        )
+        XCTAssertTrue(speaker.spoken.isEmpty, "no form cue before Up.")
+
+        // "Up." speaks first…
+        service.liveUpdate(
+            frame(tMs: 3_000, events: [.up(tMs: 3_000)], inverted: true, isUp: true),
+            framing: nil,
+            recording: true
+        )
+        XCTAssertEqual(speaker.spoken, [.up])
+
+        // …then the fault, once the coach gap is spent behind it.
+        service.liveUpdate(
+            frame(tMs: 4_000, formEvents: [.hips(tMs: 4_000)], inverted: true, isUp: true),
+            framing: nil,
+            recording: true
+        )
+        XCTAssertEqual(speaker.spoken, [.up], "the form cue follows Up. by formGapS")
+        service.liveUpdate(
+            frame(tMs: 5_000, formEvents: [.hips(tMs: 5_000)], inverted: true, isUp: true),
+            framing: nil,
+            recording: true
+        )
+        XCTAssertEqual(speaker.spoken, [.up, .form(.hips)])
     }
 
     // MARK: - What the take keeps

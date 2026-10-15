@@ -1,6 +1,6 @@
 import XCTest
 
-import HandstandCore
+@testable import HandstandCore
 
 /// What the live line detector does with one frame at a time (chainlink #91):
 /// the hysteresis, the geometry gates, the timestamps — and the one check that
@@ -103,6 +103,34 @@ final class LiveLineTests: XCTestCase {
                 .leftFootIndex: Keypoint(x: 500, y: 380, visibility: 0.9),
                 .rightFootIndex: Keypoint(x: 580, y: 380, visibility: 0.6),
                 .nose: Keypoint(x: 500, y: 1600, visibility: 0.9),
+            ]
+        }
+
+        /// A frame that passes every *line* gate except a controlled hip: the
+        /// wrists, hips and ankles of `frame()`, and a single confident
+        /// shoulder placed so `hipAngleDeg` measures **exactly** `hipDeg`.
+        /// The line gate's 160° and the hip-red band just above it overlap
+        /// (chainlink #100 review), so the measured value has to be exact
+        /// rather than `frame()`'s ±30 px shoulder fudge — both shoulders sit
+        /// on the same point, so the left side is the one measured.
+        static func hipExactly(_ hipDeg: Double) -> [Joint: Keypoint] {
+            let leftHip = (x: 520.0, y: 1150.0)
+            let reach = 500.0
+            let radians = hipDeg * Double.pi / 180.0
+            let shoulder = (
+                x: leftHip.x + reach * sin(radians),
+                y: leftHip.y - reach * cos(radians)
+            )
+            return [
+                .leftWrist: Keypoint(x: 500, y: 1850, visibility: 0.9),
+                .rightWrist: Keypoint(x: 580, y: 1850, visibility: 0.9),
+                .leftShoulder: Keypoint(x: shoulder.x, y: shoulder.y, visibility: 0.9),
+                .rightShoulder: Keypoint(x: shoulder.x, y: shoulder.y, visibility: 0.9),
+                .leftHip: Keypoint(x: 520, y: 1150, visibility: 0.9),
+                .rightHip: Keypoint(x: 560, y: 1150, visibility: 0.9),
+                .leftAnkle: Keypoint(x: 520, y: 450, visibility: 0.9),
+                .rightAnkle: Keypoint(x: 560, y: 450, visibility: 0.9),
+                .nose: Keypoint(x: shoulder.x, y: shoulder.y + 60, visibility: 0.9),
             ]
         }
 
@@ -270,6 +298,39 @@ final class LiveLineTests: XCTestCase {
         XCTAssertEqual(events, [.up(tMs: 500)], "a banana the report will call red is never a line — but still up")
         XCTAssertFalse(detector.isInLine)
         XCTAssertTrue(detector.isInverted, "it is still upside down — just not a line")
+    }
+
+    /// Chainlink #100 review: the line gate (hip ≥ 160°) and the hip-red band
+    /// (red at about 161° and below) overlap, so a 160.5° frame used to be both
+    /// a line *and* a piked-hip fault. `isLine` now rejects a red hip, exactly
+    /// as it already rejected a red banana; an open hip is still a line.
+    func testARedHipIsNotALineButAnOpenHipStillIs() {
+        // The isolation is the hip alone: 160.5° is red, its banana is not, so
+        // without the hip check this exact frame is a line.
+        let pikedFrame = Synthetic.hipExactly(160.5)
+        XCTAssertTrue(LiveFormDetector.isHipRed(160.5), "160.5° is a red hip")
+        XCTAssertFalse(
+            LiveFormDetector.isBananaRed(
+                joints: pikedFrame, minVisibility: LiveLineConfig().minVisibility),
+            "…and its banana is not red, so only the hip can reject it")
+
+        var piked = LiveLineDetector()
+        let pikedEvents = feed(&piked, from: 0, through: 2000, by: 100) { _ in
+            Synthetic.hipExactly(160.5)
+        }
+        XCTAssertEqual(
+            pikedEvents, [.up(tMs: 500)],
+            "160.5° is a red hip — not a line, but still up")
+        XCTAssertFalse(piked.isInLine)
+
+        var open = LiveLineDetector()
+        let openEvents = feed(&open, from: 0, through: 2000, by: 100) { _ in
+            Synthetic.hipExactly(170)
+        }
+        XCTAssertEqual(
+            openEvents, [.up(tMs: 500), .lineAchieved(tMs: 500)],
+            "170° at the hip is open — still a line")
+        XCTAssertTrue(open.isInLine)
     }
 
     // MARK: - The "Up." acknowledgement (chainlink #100)
