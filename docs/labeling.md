@@ -703,10 +703,14 @@ uv run python -m handstand.reference_review fill
 
 `fill` writes only **empty** cells, so a value typed by hand is never touched:
 `hold_s` from the longest hold of the clip in `hold_summary.csv` (rounded to
-0.1), `outcome` (`hold` when the clip has a hold, else `no_hold`),
-`camera_angle` (`side`), and `skill` from the reviewed hold shapes (via the same
+0.1), `outcome` (`hold` when the clip has a hold, else `no_hold`), and `skill`
+from the reviewed hold shapes (via the same
 `s = build_summary(...).clip_skills` logic as `handstand.hold_shapes
 summary --write-catalogue`, so `mixed` and the `not_a_hold` exclusion match).
+`camera_angle` is **not** touched: it is a person's answer — until view detection
+(#74) exists — because the reference build keeps side-view holds only and the
+review says nothing about the camera, so an empty cell stays empty for the user
+to fill in.
 The one non-empty edit is `notes`: the word `trainer` is **appended** when
 `trainer_report.csv` says a second person is in the clip and the cell does not
 already carry the word. `full_body` and `good_clip` are left alone here —
