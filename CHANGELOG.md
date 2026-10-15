@@ -217,6 +217,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Label good clips (clean holds >= 5-10 s) (#27)
+- Hand-annotate clip catalogue (angle, skill, outcome, hold length, good_clip) (#64)
 - Live form cue: speak when the line goes red during a hold (arch/banana first) (#97)
 - Live form cue: one short phrase when the line goes red during a hold —
   "Ribs in." (arch), "Open the hips." (hollow) or "Straighten." (sign unknown)
