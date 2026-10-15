@@ -596,4 +596,66 @@ final class AnalysisDiagnosticsTests: XCTestCase {
             AnalysisDiagnostics.analysedFps([Self.standingFrame(tMs: 0)]), 0,
             "one frame has no span to measure")
     }
+
+    // MARK: - The detected view (chainlink #102)
+
+    /// Every hold's detected camera view is written under `hold_views` and
+    /// reads back exactly, keys and all.
+    func testTheHoldViewsRoundTripUnderTheirOwnKey() throws {
+        let movie = try makeMovie()
+        defer { remove(movie) }
+        let frames = (0..<Self.frameCount).map { index in
+            Self.holdingFrame(tMs: index * Self.stepMs)
+        }
+
+        let (written, analysis) = make(frames)
+        XCTAssertFalse(analysis.holdViews.isEmpty, "the held clip has a view")
+        XCTAssertEqual(written.holdViews.count, analysis.holdViews.count)
+        XCTAssertEqual(written.holdViews.map(\.holdId), analysis.holdViews.map(\.holdId))
+        XCTAssertEqual(written.holdViews.map(\.view), analysis.holdViews.map(\.view.rawValue))
+
+        try AnalysisDiagnostics.write(written, for: movie)
+
+        let data = try Data(contentsOf: AnalysisDiagnostics.url(for: movie))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let views = try XCTUnwrap(object["hold_views"] as? [[String: Any]])
+        XCTAssertEqual(views.count, written.holdViews.count)
+        let first = try XCTUnwrap(views.first)
+        XCTAssertNotNil(first["hold_id"], "the key is snake_case")
+        XCTAssertNotNil(first["view_frames"])
+        XCTAssertNotNil(first["view"])
+
+        XCTAssertEqual(try XCTUnwrap(AnalysisDiagnostics.read(for: movie)), written)
+    }
+
+    /// A width nobody could measure is absent, never a JSON `NaN` — the file
+    /// has to stay valid JSON whatever the detector found.
+    func testAHoldViewWithNoWidthEncodesWithoutNaN() throws {
+        let entry = AnalysisDiagnostics.HoldViewEntry(
+            holdId: 0, viewFrames: 0, viewWidth: nil, view: "unsure")
+
+        let data = try JSONEncoder().encode(entry)
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertFalse(text.lowercased().contains("nan"), "JSON has no NaN")
+        XCTAssertEqual(
+            try JSONDecoder().decode(AnalysisDiagnostics.HoldViewEntry.self, from: data), entry)
+    }
+
+    /// A diagnostics file written before the key existed still decodes: a
+    /// missing `hold_views` is "no views recorded", not a decode failure.
+    func testADocumentWithoutHoldViewsStillReads() throws {
+        let movie = try makeMovie()
+        defer { remove(movie) }
+        try AnalysisDiagnostics.write(make(Self.standingClip()).diagnostics, for: movie)
+
+        // Rewrite the file without the key, exactly as an older build wrote it.
+        let url = AnalysisDiagnostics.url(for: movie)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        object.removeValue(forKey: "hold_views")
+        try JSONSerialization.data(withJSONObject: object).write(to: url, options: .atomic)
+
+        let read = try XCTUnwrap(AnalysisDiagnostics.read(for: movie), "an old file still reads")
+        XCTAssertTrue(read.holdViews.isEmpty)
+    }
 }

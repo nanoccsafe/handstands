@@ -227,13 +227,19 @@ final class SessionStore {
     /// `note` is why the clip could not be measured (an unusable analysis:
     /// hold count 0, score `nil`), `nil` for one that was measured — it is
     /// written every time, so a later good run clears an earlier note.
+    ///
+    /// `view` is the camera view the run saw (chainlink #102): `"not_side"`
+    /// when every scored hold was filmed from the front or at an angle, else
+    /// the scored hold's view raw value, `nil` when it does not apply. Like
+    /// `note` it is written every time, so a later run clears an earlier one.
     func recordAnalysis(
         for session: Session,
         score: Double?,
         holdCount: Int,
         longestHoldS: Double,
         version: String,
-        note: String? = nil
+        note: String? = nil,
+        view: String? = nil
     ) throws {
         session.analyzedAt = Date()
         session.clipScore = score
@@ -241,6 +247,7 @@ final class SessionStore {
         session.longestHoldS = longestHoldS
         session.analysisVersion = version
         session.analysisNote = note
+        session.analysisView = view
         try context.save()
     }
 

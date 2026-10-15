@@ -31,19 +31,49 @@ public struct Analysis: Sendable, Equatable {
     /// The hold the clip is represented by: `Scorer.clipScore(holdScores)`,
     /// hence `nil` whenever `holdScores` is empty or none of them scored.
     public var clipScore: HoldScore?
+    /// One detected view per hold of the clip (chainlink #102,
+    /// `ViewDetector.holdViews`), in `hold_id` order. Empty when the clip has
+    /// no hold, and on any `Analysis` a caller built without views.
+    public var holdViews: [HoldView]
 
     public init(
         processed: ProcessedClip,
         phases: ClipPhases,
         features: ClipFeatures,
         holdScores: [HoldScore],
-        clipScore: HoldScore?
+        clipScore: HoldScore?,
+        holdViews: [HoldView] = []
     ) {
         self.processed = processed
         self.phases = phases
         self.features = features
         self.holdScores = holdScores
         self.clipScore = clipScore
+        self.holdViews = holdViews
+    }
+
+    /// The detected view of one hold, `nil` when the clip carries no
+    /// `HoldView` for it — which the callers below read as "allowed".
+    public func view(ofHold id: Int) -> CameraView? {
+        holdViews.first { $0.holdId == id }?.view
+    }
+
+    /// The clip's score over its **side-view** holds only: the longest scored
+    /// hold that was not filmed from the front or at an angle, exactly as
+    /// `Scorer.clipScore` picks a clip's hold. A hold with no detected view
+    /// counts as allowed, so a clip scored before chainlink #102 (no
+    /// `holdViews`) still answers with its `clipScore`.
+    public var sideClipScore: HoldScore? {
+        Scorer.clipScore(holdScores.filter { view(ofHold: $0.holdId) != .notSide })
+    }
+
+    /// Is every scored hold of this clip one that was filmed from the front or
+    /// at an angle? `false` when nothing was scored — "nothing to compare" is
+    /// not a camera verdict.
+    public var notSideOnly: Bool {
+        let scored = holdScores.filter { $0.score != nil }
+        guard !scored.isEmpty else { return false }
+        return scored.allSatisfy { view(ofHold: $0.holdId) == .notSide }
     }
 }
 
@@ -65,7 +95,9 @@ public enum Analyzer {
     /// 2. `PhaseSegmenter.classify(tMs:processed:trainerContact:)`;
     /// 3. `Features.extract(tMs:processed:phases:trainerContact:)`;
     /// 4. with a reference, `Scorer.scoreClip(features, reference:)` and
-    ///    `Scorer.clipScore(_:)` — without one, no scores at all.
+    ///    `Scorer.clipScore(_:)` — without one, no scores at all;
+    /// 5. `ViewDetector.holdViews(processed:features:)` — the detected camera
+    ///    view of every hold, always (chainlink #102).
     public static func analyze(
         _ frames: [PostProcessInputFrame],
         reference: ScoreReference?,
@@ -86,7 +118,8 @@ public enum Analyzer {
             phases: phases,
             features: features,
             holdScores: holdScores,
-            clipScore: Scorer.clipScore(holdScores)
+            clipScore: Scorer.clipScore(holdScores),
+            holdViews: ViewDetector.holdViews(processed: processed, features: features)
         )
     }
 }
