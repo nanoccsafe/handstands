@@ -3,8 +3,10 @@
 Nothing here touches the real handstand videos: the processed parquet and the
 sidecar are written from separations the test picks, and the features parquet
 comes out of :func:`test_score.write_clip`, so a hold's width is a number the
-test can work out by hand. The two widths that decide a view — shoulders and
-hips — are set directly, which is the whole measurement.
+test can work out by hand. The synthetic torso is vertical and the two pairs —
+shoulders and hips — are spread horizontally, so each pair's separation is
+exactly its separation *across* the body; the projection itself is pinned by
+the frame-level tests below.
 """
 
 from __future__ import annotations
@@ -48,8 +50,10 @@ def write_processed(
     """A synthetic processed parquet + sidecar, with the two widths per frame.
 
     ``shoulders`` and ``hips`` are the pixel separations of each pair on each
-    frame; a NaN hides both joints of that pair on that frame. The two joints of
-    a pair straddle x=200, so their distance is exactly the number given.
+    frame, across the vertical torso the helper builds; a NaN hides both joints
+    of that pair on that frame. The two joints of a pair straddle x=200, so
+    their distance — and its projection across the body, which is the measure —
+    is exactly the number given.
     """
     frames = len(shoulders)
     assert len(hips) == frames
@@ -108,51 +112,126 @@ def write_catalogue(data: pathlib.Path, angles: dict[str, str]) -> pathlib.Path:
 # --------------------------------------------------------------------------- #
 
 
-def test_view_width_is_the_mean_pair_over_the_body_length() -> None:
-    # Shoulders 10 px apart, hips 6: the mean width is 8, over L=200 that is 0.04.
-    x = np.array([[0.0, 10.0, 0.0, 6.0]])
-    y = np.zeros_like(x)
-    valid = np.ones_like(x, dtype=bool)
+def view_frame(
+    positions: dict[str, tuple[float, float]],
+    valid: dict[str, bool] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One frame's ``x``, ``y`` and ``valid`` arrays over :data:`JOINTS`.
+
+    A joint absent from ``positions`` is NaN and invalid; ``valid`` overrides
+    whether a joint that *is* present counts, so the two ways a frame can miss
+    a joint — not reported, and reported but not valid — are both expressible.
+    """
+    valid = valid or {}
+    x = np.array([[positions.get(name, (math.nan, math.nan))[0] for name in JOINTS]])
+    y = np.array([[positions.get(name, (math.nan, math.nan))[1] for name in JOINTS]])
+    flags = np.array([[bool(valid.get(name, name in positions)) for name in JOINTS]])
+    return x, y, flags
+
+
+#: The four joints of a vertical torso: shoulders 10 px apart, hips 6 px apart,
+#: both straddling the same x — the widths the across-the-body measure reads
+#: directly, because the torso axis is vertical.
+UPRIGHT = {
+    "left_shoulder": (195.0, 100.0),
+    "right_shoulder": (205.0, 100.0),
+    "left_hip": (197.0, 220.0),
+    "right_hip": (203.0, 220.0),
+}
+
+
+def test_view_width_projects_across_a_vertical_torso() -> None:
+    # Shoulders 10 px apart, hips 6: the across-the-body mean is 8 px, over
+    # L=200 that is 0.04.
+    x, y, valid = view_frame(UPRIGHT)
 
     widths = view.view_width(x, y, valid, JOINTS, 200.0)
 
     assert widths[0] == pytest.approx(0.04)
 
 
-def test_view_width_uses_one_pair_when_only_one_is_valid() -> None:
-    x = np.array([[0.0, 10.0, 0.0, 6.0]])
-    y = np.zeros_like(x)
-    # Only the shoulders are valid: the hips must not be read as a phantom 0.
-    valid = np.array([[True, True, False, False]])
+def test_view_width_ignores_a_pair_spread_along_the_torso() -> None:
+    # The phone sits low, so the shoulders straddle the vertical axis by 10 px
+    # *along* it and the hips coincide: nothing is across the body, the width
+    # is 0 — the case that made real side holds read front-like before the
+    # projection.
+    x, y, valid = view_frame(
+        {
+            "left_shoulder": (200.0, 95.0),
+            "right_shoulder": (200.0, 105.0),
+            "left_hip": (200.0, 220.0),
+            "right_hip": (200.0, 220.0),
+        }
+    )
 
     widths = view.view_width(x, y, valid, JOINTS, 200.0)
 
-    assert widths[0] == pytest.approx(10.0 / 200.0)
+    assert widths[0] == pytest.approx(0.0)
 
 
-def test_view_width_is_nan_without_a_pair_or_a_body_length() -> None:
-    x = np.array([[0.0, 10.0, 0.0, 6.0]])
-    y = np.zeros_like(x)
+def test_view_width_measures_across_a_tilted_torso() -> None:
+    # A torso axis at 45°: the across direction is (-1, 1)/√2, and each pair is
+    # offset 10 px along it. Both pairs contribute 10, so the mean is 10 over
+    # L=200, i.e. 0.05.
+    k = 5.0 / math.sqrt(2.0)
+    x, y, valid = view_frame(
+        {
+            "left_shoulder": (100.0 - k, 100.0 + k),
+            "right_shoulder": (100.0 + k, 100.0 - k),
+            "left_hip": (200.0 - k, 200.0 + k),
+            "right_hip": (200.0 + k, 200.0 - k),
+        }
+    )
 
-    neither = view.view_width(x, y, np.zeros_like(x, dtype=bool), JOINTS, 200.0)
-    assert math.isnan(neither[0])
-
-    one_shoulder = np.array([[True, False, False, True]])
-    half_pair = view.view_width(x, y, one_shoulder, JOINTS, 200.0)
-    assert math.isnan(half_pair[0])
-
-    no_length = view.view_width(x, y, np.ones_like(x, dtype=bool), JOINTS, math.nan)
-    assert math.isnan(no_length[0])
-
-
-def test_view_width_ignores_a_joint_the_clip_does_not_report() -> None:
-    x = np.array([[0.0, 10.0]])
-    y = np.zeros_like(x)
-    valid = np.ones_like(x, dtype=bool)
-
-    widths = view.view_width(x, y, valid, ("left_shoulder", "right_shoulder"), 200.0)
+    widths = view.view_width(x, y, valid, JOINTS, 200.0)
 
     assert widths[0] == pytest.approx(0.05)
+
+
+def test_view_width_is_nan_when_a_joint_of_the_four_is_missing() -> None:
+    # Every one of the four is needed: a frame missing a joint — not reported,
+    # or reported but not valid — has no across-the-body measure at all.
+    for missing in JOINTS:
+        present = {name: spot for name, spot in UPRIGHT.items() if name != missing}
+        x, y, valid = view_frame(present)
+        assert math.isnan(view.view_width(x, y, valid, JOINTS, 200.0)[0])
+
+        x, y, _ = view_frame(UPRIGHT)
+        invalid = np.array([[name != missing for name in JOINTS]])
+        assert math.isnan(view.view_width(x, y, invalid, JOINTS, 200.0)[0])
+
+
+def test_view_width_is_nan_when_the_torso_axis_has_no_length() -> None:
+    # Shoulder midpoint and hip midpoint coincide: the axis has no direction to
+    # project across.
+    x, y, valid = view_frame(
+        {
+            "left_shoulder": (195.0, 100.0),
+            "right_shoulder": (205.0, 100.0),
+            "left_hip": (193.0, 100.0),
+            "right_hip": (207.0, 100.0),
+        }
+    )
+
+    widths = view.view_width(x, y, valid, JOINTS, 200.0)
+
+    assert math.isnan(widths[0])
+
+
+def test_view_width_is_nan_without_a_body_length() -> None:
+    x, y, valid = view_frame(UPRIGHT)
+
+    assert math.isnan(view.view_width(x, y, valid, JOINTS, math.nan)[0])
+    assert math.isnan(view.view_width(x, y, valid, JOINTS, 0.0)[0])
+
+
+def test_view_width_is_nan_for_a_clip_that_does_not_report_the_four() -> None:
+    # A source without hip columns is unmeasurable, not measured against a
+    # phantom hip.
+    x, y, valid = view_frame(UPRIGHT)
+    no_hips = tuple(name for name in JOINTS if "hip" not in name)
+
+    assert math.isnan(view.view_width(x, y, valid, no_hips, 200.0)[0])
 
 
 # --------------------------------------------------------------------------- #
@@ -161,17 +240,19 @@ def test_view_width_ignores_a_joint_the_clip_does_not_report() -> None:
 
 
 def test_classify_reads_the_thresholds() -> None:
-    assert view.SIDE_MAX == 0.035
-    assert view.NOT_SIDE_MIN == 0.042
+    assert view.SIDE_MAX == 0.030
+    assert view.NOT_SIDE_MIN == 0.036
 
     assert view.classify(np.full(20, 0.02))[1] == "side"
     assert view.classify(np.full(20, 0.05))[1] == "not_side"
-    assert view.classify(np.full(20, 0.038))[1] == "unsure"
+    assert view.classify(np.full(20, 0.033))[1] == "unsure"
 
 
 def test_classify_leaves_the_boundaries_and_a_short_hold_unsure() -> None:
     assert view.classify(np.full(20, view.SIDE_MAX))[1] == "unsure"
+    assert view.classify(np.full(20, 0.0299))[1] == "side"
     assert view.classify(np.full(20, view.NOT_SIDE_MIN))[1] == "not_side"
+    assert view.classify(np.full(20, 0.0359))[1] == "unsure"
 
     short = view.classify(np.full(view.MIN_VIEW_FRAMES - 5, 0.02))
     assert short[1] == "unsure"

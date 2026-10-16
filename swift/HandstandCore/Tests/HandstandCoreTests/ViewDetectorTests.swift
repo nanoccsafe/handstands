@@ -15,31 +15,31 @@ final class ViewDetectorTests: XCTestCase {
     // MARK: - The synthetic clip
 
     /// One processed frame with the two joint pairs at the given pixel
-    /// separations. The pairs straddle `x = 200` and share a `y`, so a pair's
-    /// distance is exactly the number given. A `nil` width leaves the pair out
-    /// of the frame entirely; `isValid == false` leaves its joints in
-    /// `frame.joints` but out of `frame.valid`, which is the case the
-    /// detector has to skip.
-    private func frame(
-        shoulderWidth: Double?,
-        hipWidth: Double?,
-        shoulderValid: Bool = true,
-        hipValid: Bool = true
-    ) -> ProcessedFrame {
+    /// separations across the torso. The shoulders sit above the hips on the
+    /// same vertical axis and the pairs straddle `x = 200` horizontally, so
+    /// each pair is separated across the body by exactly the number given; a
+    /// `nil` width leaves the pair out of the frame entirely.
+    private func frame(shoulderWidth: Double?, hipWidth: Double?) -> ProcessedFrame {
         var joints: [Joint: Point2] = [:]
         var valid: Set<Joint> = []
-        func add(_ left: Joint, _ right: Joint, _ width: Double?, _ isValid: Bool) {
+        func add(_ left: Joint, _ right: Joint, _ width: Double?, _ y: Double) {
             guard let width else { return }
-            joints[left] = Point2(x: 200 - width / 2.0, y: 100)
-            joints[right] = Point2(x: 200 + width / 2.0, y: 100)
-            if isValid {
-                valid.insert(left)
-                valid.insert(right)
-            }
+            joints[left] = Point2(x: 200 - width / 2.0, y: y)
+            joints[right] = Point2(x: 200 + width / 2.0, y: y)
+            valid.insert(left)
+            valid.insert(right)
         }
-        add(.leftShoulder, .rightShoulder, shoulderWidth, shoulderValid)
-        add(.leftHip, .rightHip, hipWidth, hipValid)
+        add(.leftShoulder, .rightShoulder, shoulderWidth, 100)
+        add(.leftHip, .rightHip, hipWidth, 220)
         return ProcessedFrame(joints: joints, valid: valid, filled: [])
+    }
+
+    /// One processed frame from explicit joint positions; every joint in
+    /// `positions` is valid unless `valid` says otherwise. This is for the
+    /// geometries the width helper cannot make — a tilted torso, a pair spread
+    /// along the body, a missing joint.
+    private func frame(at positions: [Joint: Point2], valid: Set<Joint>? = nil) -> ProcessedFrame {
+        ProcessedFrame(joints: positions, valid: valid ?? Set(positions.keys), filled: [])
     }
 
     /// A body length whose `totalPx` is exactly `total` — the torso carries
@@ -140,8 +140,8 @@ final class ViewDetectorTests: XCTestCase {
     /// the same two thresholds and the same minimum frame count.
     func testTheConstantsAreThePythonOnes() {
         // = pipeline/handstand/view.py
-        XCTAssertEqual(ViewDetector.sideMax, 0.035)
-        XCTAssertEqual(ViewDetector.notSideMin, 0.042)
+        XCTAssertEqual(ViewDetector.sideMax, 0.030)
+        XCTAssertEqual(ViewDetector.notSideMin, 0.036)
         XCTAssertEqual(ViewDetector.minViewFrames, 15)
         XCTAssertEqual(CameraView.side.rawValue, "side")
         XCTAssertEqual(CameraView.notSide.rawValue, "not_side")
@@ -150,9 +150,10 @@ final class ViewDetectorTests: XCTestCase {
 
     // MARK: - viewWidths
 
-    /// The frame's `view_width` is the mean of the two pair widths over the
-    /// body length: (10 + 6) / 2 / 200 = 0.04.
-    func testViewWidthIsTheMeanOfBothPairWidthsOverBodyLength() {
+    /// A vertical torso with the pairs spread horizontally: the separations are
+    /// already across the body, so `viewWidth` is their mean over the body
+    /// length: (10 + 6) / 2 / 200 = 0.04.
+    func testViewWidthProjectsAcrossAVerticalTorso() {
         let processed = clip([frame(shoulderWidth: 10, hipWidth: 6)], length: 200)
 
         let widths = ViewDetector.viewWidths(processed)
@@ -161,37 +162,86 @@ final class ViewDetectorTests: XCTestCase {
         XCTAssertEqual(widths[0], 0.04, accuracy: 1e-12)
     }
 
-    /// One pair valid is one measurement: 10 / 200 = 0.05, with the hip joints
-    /// present in the frame but not in `valid`.
-    func testViewWidthUsesTheOnePairThatIsValid() {
-        let processed = clip(
-            [frame(shoulderWidth: 10, hipWidth: 6, hipValid: false)], length: 200)
+    /// A pair spread *along* the vertical torso axis and coincident hips: the
+    /// projection across the body is zero, which is what the low floor camera
+    /// needed — those frames used to read front-like.
+    func testViewWidthIgnoresAPairSpreadAlongTheTorso() {
+        let tilted = frame(at: [
+            .leftShoulder: Point2(x: 200, y: 95),
+            .rightShoulder: Point2(x: 200, y: 105),
+            .leftHip: Point2(x: 200, y: 220),
+            .rightHip: Point2(x: 200, y: 220),
+        ])
+        let processed = clip([tilted], length: 200)
 
-        let widths = ViewDetector.viewWidths(processed)
-
-        XCTAssertEqual(widths[0], 0.05, accuracy: 1e-12)
+        XCTAssertEqual(ViewDetector.viewWidths(processed)[0], 0.0, accuracy: 1e-12)
     }
 
-    /// Neither pair valid is no `view_width` at all.
-    func testViewWidthIsNaNWhenNeitherPairIsValid() {
-        let processed = clip(
-            [frame(
-                shoulderWidth: 10, hipWidth: 6,
-                shoulderValid: false, hipValid: false)], length: 200)
+    /// A torso axis at 45°: the across direction is (-1, 1)/√2 and each pair is
+    /// 10 px along it, so the mean is 10 px over 200.
+    func testViewWidthMeasuresAcrossATiltedTorso() {
+        let k = 5.0 / 2.0.squareRoot()
+        let tilted = frame(at: [
+            .leftShoulder: Point2(x: 100 - k, y: 100 + k),
+            .rightShoulder: Point2(x: 100 + k, y: 100 - k),
+            .leftHip: Point2(x: 200 - k, y: 200 + k),
+            .rightHip: Point2(x: 200 + k, y: 200 - k),
+        ])
+        let processed = clip([tilted], length: 200)
+
+        XCTAssertEqual(ViewDetector.viewWidths(processed)[0], 0.05, accuracy: 1e-12)
+    }
+
+    /// Every one of the four joints is required: absent from the frame, or
+    /// present but invalid, both leave the frame unmeasured.
+    func testViewWidthIsNaNWhenAnyOfTheFourJointsIsMissing() {
+        let full: [Joint: Point2] = [
+            .leftShoulder: Point2(x: 195, y: 100),
+            .rightShoulder: Point2(x: 205, y: 100),
+            .leftHip: Point2(x: 197, y: 220),
+            .rightHip: Point2(x: 203, y: 220),
+        ]
+        for missing in ViewDetector.sideJoints {
+            let absent = full.filter { $0.key != missing }
+            let withoutJoint = clip([frame(at: absent)], length: 200)
+            XCTAssertTrue(
+                ViewDetector.viewWidths(withoutJoint)[0].isNaN,
+                "\(missing) absent should be unmeasurable")
+
+            let invalid = clip(
+                [frame(at: full, valid: Set(full.keys).subtracting([missing]))], length: 200)
+            XCTAssertTrue(
+                ViewDetector.viewWidths(invalid)[0].isNaN,
+                "\(missing) invalid should be unmeasurable")
+        }
+    }
+
+    /// Shoulder midpoint and hip midpoint coincide: the torso axis has no
+    /// direction to project across.
+    func testViewWidthIsNaNWhenTheTorsoAxisHasNoLength() {
+        let collapsed = frame(at: [
+            .leftShoulder: Point2(x: 195, y: 100),
+            .rightShoulder: Point2(x: 205, y: 100),
+            .leftHip: Point2(x: 193, y: 100),
+            .rightHip: Point2(x: 207, y: 100),
+        ])
+        let processed = clip([collapsed], length: 200)
 
         XCTAssertTrue(ViewDetector.viewWidths(processed)[0].isNaN)
     }
 
-    /// No body length is no ratio, however wide the shoulders are.
+    /// No body length is no ratio, however wide the shoulders are — and a
+    /// non-positive one is no better.
     func testViewWidthIsNaNWithoutABodyLength() {
-        let processed = clip([frame(shoulderWidth: 10, hipWidth: 6)], length: nil)
+        let measured = [frame(shoulderWidth: 10, hipWidth: 6)]
 
-        XCTAssertTrue(ViewDetector.viewWidths(processed)[0].isNaN)
+        XCTAssertTrue(ViewDetector.viewWidths(clip(measured, length: nil))[0].isNaN)
+        XCTAssertTrue(ViewDetector.viewWidths(clip(measured, length: 0))[0].isNaN)
     }
 
     // MARK: - classify
 
-    /// The threshold rule, case by case: under 0.035 side, at or over 0.042
+    /// The threshold rule, case by case: under 0.030 side, at or over 0.036
     /// not side, the band between unsure — and under 15 finite frames always
     /// unsure.
     func testClassifyThresholds() {
@@ -201,10 +251,12 @@ final class ViewDetectorTests: XCTestCase {
 
         XCTAssertEqual(classify(0.02), .side)
         XCTAssertEqual(classify(0.05), .notSide)
-        XCTAssertEqual(classify(0.038), .unsure)
+        XCTAssertEqual(classify(0.033), .unsure)
         XCTAssertEqual(classify(0.02, count: 10), .unsure, "under MIN_VIEW_FRAMES")
-        XCTAssertEqual(classify(0.035), .unsure, "SIDE_MAX is exclusive")
-        XCTAssertEqual(classify(0.042), .notSide, "NOT_SIDE_MIN is inclusive")
+        XCTAssertEqual(classify(0.030), .unsure, "SIDE_MAX is exclusive")
+        XCTAssertEqual(classify(0.0299), .side, "just under SIDE_MAX")
+        XCTAssertEqual(classify(0.036), .notSide, "NOT_SIDE_MIN is inclusive")
+        XCTAssertEqual(classify(0.0359), .unsure, "just under NOT_SIDE_MIN")
     }
 
     /// An even count takes the mean of the two middle values, as numpy does:

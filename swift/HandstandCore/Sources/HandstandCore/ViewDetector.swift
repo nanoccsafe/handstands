@@ -12,25 +12,31 @@ import Foundation
 //
 // The rule is the lead's measurement: from the side the left and right
 // shoulders (and hips) sit on top of each other in the image, and from the
-// front or at an angle they are apart. Per frame the width between the two
-// shoulders and between the two hips is measured in display pixels and the
-// mean of the ones that are visible is divided by the clip's body length `L`::
+// front or at an angle they are apart. The phone sits low — on the floor,
+// looking up — which spreads the near and the far joint of a pair *along* the
+// body, so the separation is measured only **across** the torso, projected on
+// the axis perpendicular to the shoulder-midpoint-to-hip-midpoint line. Per
+// frame::
 //
-//     view_width = mean(shoulder width, hip width) / L
+//     S = midpoint(shoulders), H = midpoint(hips), axis = H - S
+//     n = unit vector perpendicular to axis
+//     shoulder_across = |(left_shoulder - right_shoulder) . n|
+//     hip_across      = |(left_hip     - right_hip)     . n|
+//     view_width      = (shoulder_across + hip_across) / 2 / L
 //
-// A pair contributes only when **both** its joints are valid and have a
-// position, so a frame that sees one shoulder and not the other has no
-// shoulder width; a frame that sees neither pair, or a clip with no usable
-// `L`, has no `view_width` at all.
+// A frame has a value only when **all four** joints are valid and have a
+// position and the torso axis has a non-zero finite length; one pair alone is
+// not the across-the-body measure. A clip with no positive finite `L` has no
+// `view_width` at all.
 //
 // Per hold, the median of the finite values classifies the view::
 //
-//     median <  SIDE_MAX (0.035)       -> "side"
-//     median >= NOT_SIDE_MIN (0.042)   -> "not_side"
+//     median <  SIDE_MAX (0.030)       -> "side"
+//     median >= NOT_SIDE_MIN (0.036)   -> "not_side"
 //     otherwise, or under MIN_VIEW_FRAMES (15) finite frames -> "unsure"
 //
 // The gap between the two thresholds is deliberate: the labelled side holds
-// measured 0.013–0.030 and the front holds 0.045–0.113, and a median in the
+// measured 0.005–0.026 and the front holds 0.038–0.112, and a median in the
 // band between them is not evidence either way.
 //
 // The file I/O, the hold_views.csv table, the validation report and the CLI of
@@ -80,22 +86,22 @@ public enum ViewDetector {
 
     /// `SIDE_MAX` — a hold whose median `view_width` is under this is a side
     /// view. `= pipeline/handstand/view.py`.
-    public static let sideMax = 0.035
+    public static let sideMax = 0.030
 
     /// `NOT_SIDE_MIN` — a hold whose median `view_width` is at or over this is
     /// not a side view. `= pipeline/handstand/view.py`.
-    public static let notSideMin = 0.042
+    public static let notSideMin = 0.036
 
     /// `MIN_VIEW_FRAMES` — a hold with fewer finite `view_width` frames than
     /// this is never classified: a median of a handful of frames is not a
     /// camera angle. `= pipeline/handstand/view.py`.
     public static let minViewFrames = 15
 
-    /// `_WIDTH_PAIRS` — the joint pairs whose image separation says which way
-    /// the athlete faces the camera, in the order they are averaged.
-    static let widthPairs: [(Joint, Joint)] = [
-        (.leftShoulder, .rightShoulder),
-        (.leftHip, .rightHip),
+    /// The four joints the across-the-body measure is built from (`_SIDE_JOINTS`
+    /// in Python). All four are read together: one pair alone is not the
+    /// measure, so a frame missing any of them is unmeasurable.
+    static let sideJoints: [Joint] = [
+        .leftShoulder, .rightShoulder, .leftHip, .rightHip,
     ]
 
     // MARK: - The measurement, frame by frame
@@ -103,30 +109,61 @@ public enum ViewDetector {
     /// The per-frame `view_width` of a clip: one value per frame, `NaN` where
     /// unmeasured — `view_width`.
     ///
-    /// The mean of the shoulder width and the hip width that this frame can
-    /// see, each the 2D pixel distance between the two joints of the pair and
-    /// counted only when **both** joints are valid and have a position,
-    /// divided by the clip's body length `L`. A frame that sees neither pair,
-    /// and every frame of a clip whose `L` is not a positive finite number, is
-    /// `NaN`: a width over no body length is not a ratio.
+    /// The two pair separations projected **across** the torso axis — the line
+    /// from the shoulder midpoint to the hip midpoint — averaged and divided by
+    /// the clip's body length `L`. Projecting takes out the component along the
+    /// body, which a low camera spreads the near and far joint over, so only
+    /// the genuinely side-on separation remains. A frame needs **all four**
+    /// joints valid with a position and a torso axis of non-zero finite length,
+    /// and a clip needs a positive finite `L`; anything else is `NaN`.
     public static func viewWidths(_ processed: ProcessedClip) -> [Double] {
         let frames = processed.frames.count
-        guard let totalPx = processed.bodyLength.totalPx, totalPx > 0.0 else {
+        guard let totalPx = processed.bodyLength.totalPx, totalPx.isFinite, totalPx > 0.0 else {
             // `totalPx` is nil for an unusable clip and already finite and
             // positive otherwise (a sum of three positive percentiles).
             return [Double](repeating: .nan, count: frames)
         }
         return processed.frames.map { frame in
-            var widths: [Double] = []
-            for (left, right) in widthPairs {
-                guard frame.valid.contains(left), frame.valid.contains(right),
-                    let first = frame.joints[left], let second = frame.joints[right]
-                else { continue }
-                widths.append(hypot(first.x - second.x, first.y - second.y))
-            }
-            guard !widths.isEmpty else { return .nan }
-            return widths.reduce(0.0, +) / Double(widths.count) / totalPx
+            guard let across = acrossBodyWidth(frame) else { return .nan }
+            return across / totalPx
         }
+    }
+
+    /// One frame's width **across** the torso, in display pixels, or `nil` when
+    /// the frame cannot be measured — the numerator of `view_width`.
+    ///
+    /// The shoulders and hips are read together: every one of the four joints
+    /// must be valid and have a position, and the shoulder-midpoint-to-hip-
+    /// midpoint axis must have a non-zero finite length. Each pair's separation
+    /// is projected on the axis turned 90 degrees, so a pair spread along the
+    /// body contributes nothing; the two across widths are averaged.
+    static func acrossBodyWidth(_ frame: ProcessedFrame) -> Double? {
+        guard
+            sideJoints.allSatisfy({ frame.valid.contains($0) && frame.joints[$0] != nil }),
+            let leftShoulder = frame.joints[.leftShoulder],
+            let rightShoulder = frame.joints[.rightShoulder],
+            let leftHip = frame.joints[.leftHip],
+            let rightHip = frame.joints[.rightHip]
+        else { return nil }
+
+        let shoulderMidX = (leftShoulder.x + rightShoulder.x) / 2.0
+        let shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2.0
+        let hipMidX = (leftHip.x + rightHip.x) / 2.0
+        let hipMidY = (leftHip.y + rightHip.y) / 2.0
+        let axisX = hipMidX - shoulderMidX
+        let axisY = hipMidY - shoulderMidY
+        let axisLength = hypot(axisX, axisY)
+        guard axisLength.isFinite, axisLength > 0.0 else { return nil }
+
+        // The unit vector across the torso: the axis turned 90 degrees.
+        let acrossX = -axisY / axisLength
+        let acrossY = axisX / axisLength
+        let shoulderAcross = abs(
+            (leftShoulder.x - rightShoulder.x) * acrossX
+                + (leftShoulder.y - rightShoulder.y) * acrossY)
+        let hipAcross = abs(
+            (leftHip.x - rightHip.x) * acrossX + (leftHip.y - rightHip.y) * acrossY)
+        return (shoulderAcross + hipAcross) / 2.0
     }
 
     /// A hold's median `view_width` and its view, by the threshold rule —
