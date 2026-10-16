@@ -17,12 +17,16 @@ import HandstandCore
 //                       "edges": {"top": 40, "right": 31}},
 //      "dominant_reason": "not_in_frame",
 //      "hold_count": 0, "hold_durations_s": [], "usable": true,
-//      "unusable_reason": ""}
+//      "unusable_reason": "",
+//      "hold_views": [{"hold_id": 0, "view_frames": 84, "view_width": 0.0213,
+//                      "view": "side"}]}
 //
 // Counts only: no keypoints (those are the pose cache's) and no per-frame
 // rows, so the file stays a few KB whatever the take — the point of it is
 // that it can be read off the phone (`xcrun devicectl`) without becoming a
-// second copy of the take. It is local to the phone and never sent
+// second copy of the take. `hold_views` (chainlink #102) is the detected
+// camera view of each hold, a few small objects rather than frames; a file
+// written before that key reads back with `[]`. It is local to the phone and never sent
 // anywhere: `SessionStore.delete` removes it with the recording, and
 // `reconcile()` ignores it (it keeps only the movie's own extension).
 // --------------------------------------------------------------------------- #
@@ -174,8 +178,84 @@ struct AnalysisDiagnostics: Codable, Equatable, Sendable {
     /// when this is `true` — the same two facts the screens read.
     var usable: Bool
     var unusableReason: String
+    /// One entry per hold: the detected camera view and the width behind it
+    /// (chainlink #102). Empty for a take with no hold, and for a document
+    /// written before this key existed — `init(from:)` defaults a missing key
+    /// to `[]` so an old file still reads.
+    var holdViews: [HoldViewEntry]
 
     // MARK: - Building
+
+    /// The memberwise initializer, spelled out because `init(from:)` below
+    /// means the compiler no longer synthesizes one. `holdViews` defaults
+    /// empty, so a caller that does not care about the camera (a test's
+    /// hand-built document) can leave it out.
+    init(
+        schema: Int,
+        appVersion: String,
+        backend: String,
+        analysisVersion: String,
+        analysisWallTimeS: Double,
+        video: Video,
+        analysedFps: Double,
+        framesTotal: Int,
+        framesWithPerson: Int,
+        framesWithPersonPct: Double,
+        unknownReasons: [String: Int],
+        outOfFrame: OutOfFrame,
+        dominantReason: String,
+        holdCount: Int,
+        holdDurationsS: [Double],
+        usable: Bool,
+        unusableReason: String,
+        holdViews: [HoldViewEntry] = []
+    ) {
+        self.schema = schema
+        self.appVersion = appVersion
+        self.backend = backend
+        self.analysisVersion = analysisVersion
+        self.analysisWallTimeS = analysisWallTimeS
+        self.video = video
+        self.analysedFps = analysedFps
+        self.framesTotal = framesTotal
+        self.framesWithPerson = framesWithPerson
+        self.framesWithPersonPct = framesWithPersonPct
+        self.unknownReasons = unknownReasons
+        self.outOfFrame = outOfFrame
+        self.dominantReason = dominantReason
+        self.holdCount = holdCount
+        self.holdDurationsS = holdDurationsS
+        self.usable = usable
+        self.unusableReason = unusableReason
+        self.holdViews = holdViews
+    }
+
+    /// Decodes a document, defaulting a missing `hold_views` to `[]`
+    /// (chainlink #102): a diagnostics file written before the key existed is
+    /// still a document this build understands, and "no views recorded" is
+    /// the honest answer for it. Every other key is required, as the
+    /// compiler's own decoder would have it.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decode(Int.self, forKey: .schema)
+        appVersion = try container.decode(String.self, forKey: .appVersion)
+        backend = try container.decode(String.self, forKey: .backend)
+        analysisVersion = try container.decode(String.self, forKey: .analysisVersion)
+        analysisWallTimeS = try container.decode(Double.self, forKey: .analysisWallTimeS)
+        video = try container.decode(Video.self, forKey: .video)
+        analysedFps = try container.decode(Double.self, forKey: .analysedFps)
+        framesTotal = try container.decode(Int.self, forKey: .framesTotal)
+        framesWithPerson = try container.decode(Int.self, forKey: .framesWithPerson)
+        framesWithPersonPct = try container.decode(Double.self, forKey: .framesWithPersonPct)
+        unknownReasons = try container.decode([String: Int].self, forKey: .unknownReasons)
+        outOfFrame = try container.decode(OutOfFrame.self, forKey: .outOfFrame)
+        dominantReason = try container.decode(String.self, forKey: .dominantReason)
+        holdCount = try container.decode(Int.self, forKey: .holdCount)
+        holdDurationsS = try container.decode([Double].self, forKey: .holdDurationsS)
+        usable = try container.decode(Bool.self, forKey: .usable)
+        unusableReason = try container.decode(String.self, forKey: .unusableReason)
+        holdViews = try container.decodeIfPresent([HoldViewEntry].self, forKey: .holdViews) ?? []
+    }
 
     /// The movie's own numbers, as the document spells them.
     struct Video: Codable, Equatable, Sendable {
@@ -207,6 +287,28 @@ struct AnalysisDiagnostics: Codable, Equatable, Sendable {
             case partly
             case notInFrame = "not_in_frame"
             case edges
+        }
+    }
+
+    /// One hold's detected camera view (chainlink #102), as the document
+    /// spells it: the width behind the verdict is `nil` when the hold had no
+    /// measurable frame, so the JSON stays valid.
+    struct HoldViewEntry: Codable, Equatable, Sendable {
+        /// The hold's number.
+        var holdId: Int
+        /// How many finite `view_width` frames the hold had.
+        var viewFrames: Int
+        /// The hold's median `view_width`, `nil` when it had none.
+        var viewWidth: Double?
+        /// The verdict: `CameraView`'s raw value (`"side"`, `"not_side"`,
+        /// `"unsure"`).
+        var view: String
+
+        private enum CodingKeys: String, CodingKey {
+            case holdId = "hold_id"
+            case viewFrames = "view_frames"
+            case viewWidth = "view_width"
+            case view = "view"
         }
     }
 
@@ -376,7 +478,18 @@ struct AnalysisDiagnostics: Codable, Equatable, Sendable {
             holdCount: analysis.phases.holdCount,
             holdDurationsS: analysis.phases.holdDurationsS().map { round($0, decimals: 2) },
             usable: unusable == nil,
-            unusableReason: unusable ?? ""
+            unusableReason: unusable ?? "",
+            // The detected view of every hold (chainlink #102): the width is
+            // dropped to `nil` when NaN so the file is valid JSON, and the
+            // verdict is the `CameraView` raw value the pipeline's CSV uses.
+            holdViews: analysis.holdViews.map { hold in
+                HoldViewEntry(
+                    holdId: hold.holdId,
+                    viewFrames: hold.viewFrames,
+                    viewWidth: hold.viewWidth.isFinite ? hold.viewWidth : nil,
+                    view: hold.view.rawValue
+                )
+            }
         )
     }
 
@@ -466,5 +579,6 @@ struct AnalysisDiagnostics: Codable, Equatable, Sendable {
         case holdDurationsS = "hold_durations_s"
         case usable
         case unusableReason = "unusable_reason"
+        case holdViews = "hold_views"
     }
 }

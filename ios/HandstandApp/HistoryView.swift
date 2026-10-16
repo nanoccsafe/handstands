@@ -163,7 +163,8 @@ struct HistoryView: View {
                         analyzedAt: session.analyzedAt,
                         clipScore: session.clipScore,
                         analysisNote: session.analysisNote,
-                        holdCount: session.holdCount
+                        holdCount: session.holdCount,
+                        analysisView: session.analysisView
                     )
                 )
                 .font(.caption)

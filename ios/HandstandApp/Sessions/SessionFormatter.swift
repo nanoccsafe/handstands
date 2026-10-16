@@ -1,4 +1,5 @@
 import Foundation
+import HandstandCore
 
 /// The strings the History screens show that are neither durations nor
 /// pixel sizes (`VideoInfoFormatter` owns those): when a take happened and
@@ -29,7 +30,8 @@ enum SessionFormatter {
     /// What the History row and the detail screen's Recording section say
     /// about a take's analysis — one function, so the two screens can never
     /// disagree (chainlink #96). The order matters: a note means the run
-    /// could not measure the clip at all (chainlink #47), a score is the one
+    /// could not measure the clip at all (chainlink #47), an all-notSide take
+    /// with no score says how to get one (chainlink #102), a score is the one
     /// number worth showing, `analyzedAt == nil` is the only "not analysed
     /// yet", and anything left was analysed but produced no score — a take
     /// with no hold that could be scored, or a build with no reference
@@ -39,9 +41,16 @@ enum SessionFormatter {
         analyzedAt: Date?,
         clipScore: Double?,
         analysisNote: String?,
-        holdCount: Int?
+        holdCount: Int?,
+        analysisView: String? = nil
     ) -> String {
         if analysisNote != nil { return "Couldn't measure" }
+        // No score because the camera was not at the side (chainlink #102):
+        // say what to do, before the generic "no score". A score, when there
+        // is one, still wins.
+        if clipScore == nil, analysisView == CameraView.notSide.rawValue {
+            return "Not a side view · no score"
+        }
         if let clipScore { return score(clipScore) }
         if analyzedAt == nil { return "Not analysed yet" }
         if let holdCount, holdCount > 0 {

@@ -20,12 +20,15 @@ final class AnalysisSummaryTests: XCTestCase {
     private static let frameCount = 60
     private static let stepMs = 33
 
-    /// One frame of a handstand held perfectly still: y grows downwards, the
-    /// hands are at y = 300 and the feet at y = 40 — ankles well above the
-    /// wrists (`invertedMin`), hips above the hands (`handsLowMinV`), the
-    /// whole body on one vertical line (`bodyAngle` 0°), and nothing moving
-    /// (no wrist speed, no hand step). Every joint of the 15-joint schema is
-    /// present at visibility 0.9, so every frame is measurable.
+    /// One frame of a handstand held perfectly still, filmed **side on**:
+    /// y grows downwards, the hands are at y = 300 and the feet at y = 40 —
+    /// ankles well above the wrists (`invertedMin`), hips above the hands
+    /// (`handsLowMinV`), the whole body on one vertical line (`bodyAngle` 0°),
+    /// and nothing moving (no wrist speed, no hand step). Every left/right
+    /// pair shares an x, so the shoulder and hip separations the side-view
+    /// detector measures (chainlink #102) are zero — this is a side view, not
+    /// a front one. Every joint of the 15-joint schema is present at
+    /// visibility 0.9, so every frame is measurable.
     private static func holdingFrame(tMs: Int) -> PostProcessInputFrame {
         func point(_ y: Double, x: Double = 96) -> Keypoint {
             Keypoint(x: x, y: y, visibility: 0.9)
@@ -34,20 +37,20 @@ final class AnalysisSummaryTests: XCTestCase {
             // The nose sits off the shoulder→hip line, so the facing sign
             // has a side to read (x = 106 against the body's x = 96).
             .nose: Keypoint(x: 106, y: 195, visibility: 0.9),
-            .leftShoulder: point(210, x: 92),
-            .rightShoulder: point(210, x: 100),
-            .leftElbow: point(250, x: 92),
-            .rightElbow: point(250, x: 100),
-            .leftWrist: point(300, x: 92),
-            .rightWrist: point(300, x: 100),
-            .leftHip: point(150, x: 92),
-            .rightHip: point(150, x: 100),
-            .leftKnee: point(100, x: 92),
-            .rightKnee: point(100, x: 100),
-            .leftAnkle: point(55, x: 92),
-            .rightAnkle: point(55, x: 100),
-            .leftFootIndex: point(40, x: 92),
-            .rightFootIndex: point(40, x: 100),
+            .leftShoulder: point(210),
+            .rightShoulder: point(210),
+            .leftElbow: point(250),
+            .rightElbow: point(250),
+            .leftWrist: point(300),
+            .rightWrist: point(300),
+            .leftHip: point(150),
+            .rightHip: point(150),
+            .leftKnee: point(100),
+            .rightKnee: point(100),
+            .leftAnkle: point(55),
+            .rightAnkle: point(55),
+            .leftFootIndex: point(40),
+            .rightFootIndex: point(40),
         ]
         return PostProcessInputFrame(
             tMs: tMs, detected: true, trainerContact: false, joints: joints)
@@ -193,5 +196,83 @@ final class AnalysisSummaryTests: XCTestCase {
         XCTAssertEqual(summary.frames, frames.count)
         XCTAssertNil(summary.unusableReason, "the clip was measured")
         XCTAssertEqual(summary.holdCount, analysis.phases.holdCount)
+    }
+
+    // MARK: - The side view (chainlink #102)
+
+    /// An `Analysis` over the synthetic hold, with the scores and views a
+    /// test gives it: the app target cannot build a `ProcessedClip` by hand
+    /// (its initializer is internal to HandstandCore), so the clip comes from
+    /// the real `Analyzer` and only the public scores and views are replaced.
+    private func scoredAnalysis(_ holdScores: [HoldScore], views: [HoldView]) -> Analysis {
+        var analysis = Analyzer.analyze(Self.holdingClip(), reference: nil)
+        analysis.holdScores = holdScores
+        analysis.holdViews = views
+        return analysis
+    }
+
+    /// One scored hold at `score`, lasting `durationS`.
+    private func scored(holdId: Int, score: Double, durationS: Double) -> HoldScore {
+        HoldScore(
+            holdId: holdId,
+            holdFrames: 10,
+            validFrames: 10,
+            holdStartMs: 0,
+            holdEndMs: Int(durationS * 1000),
+            holdDurationS: durationS,
+            score: score,
+            reason: "",
+            deviation: 0,
+            penalty: 0,
+            groups: [:],
+            values: [:],
+            z: [:],
+            topFaults: [],
+            missingGroups: []
+        )
+    }
+
+    /// The score a take shows is the side score: the longest scored hold that
+    /// is not notSide, with that hold's view beside it.
+    func testTheSummaryScoresTheLongestHoldThatIsNotASideView() throws {
+        // The longest hold is notSide, the shorter one is side: the number
+        // shown must be the shorter, honest one.
+        let analysis = scoredAnalysis(
+            [
+                scored(holdId: 0, score: 80, durationS: 5),
+                scored(holdId: 1, score: 60, durationS: 2),
+            ],
+            views: [
+                HoldView(holdId: 0, viewFrames: 20, viewWidth: 0.05, view: .notSide),
+                HoldView(holdId: 1, viewFrames: 20, viewWidth: 0.02, view: .side),
+            ]
+        )
+
+        let summary = AnalysisSummary.make(from: analysis, frames: [], hasReference: true)
+
+        XCTAssertEqual(summary.clipScore, 60)
+        XCTAssertEqual(summary.clipView, .side)
+        XCTAssertFalse(summary.notSideView)
+    }
+
+    /// Every scored hold was filmed from the front or at an angle: no score,
+    /// and `notSideView` so the panel says to film from the side.
+    func testAnAllNotSideTakeHasNoScoreAndSaysSo() throws {
+        let analysis = scoredAnalysis(
+            [
+                scored(holdId: 0, score: 80, durationS: 5),
+                scored(holdId: 1, score: 60, durationS: 2),
+            ],
+            views: [
+                HoldView(holdId: 0, viewFrames: 20, viewWidth: 0.05, view: .notSide),
+                HoldView(holdId: 1, viewFrames: 20, viewWidth: 0.06, view: .notSide),
+            ]
+        )
+
+        let summary = AnalysisSummary.make(from: analysis, frames: [], hasReference: true)
+
+        XCTAssertNil(summary.clipScore)
+        XCTAssertNil(summary.clipView)
+        XCTAssertTrue(summary.notSideView)
     }
 }

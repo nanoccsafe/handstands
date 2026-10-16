@@ -209,6 +209,22 @@ the build prints a note and only hand-labelled side clips count, and
 `other line holds in side-view clips` line of the sanity report uses the same
 rule per hold, so it compares side views with side views.
 
+### In the app
+
+The app scores with the same rule and the same constants
+(`swift/HandstandCore/Sources/HandstandCore/ViewDetector.swift`, the port of
+`handstand.view`): every hold's camera view is measured on device from the
+shoulder and hip separations projected **across** the torso axis — the phone
+sits low and spreads the near and far joint *along* the body, so only the
+across-the-body component counts — and `Analysis.sideClipScore` is the clip's
+longest scored hold that was not filmed from the front or at an angle. A hold
+whose median lands in the band between `SIDE_MAX` (0.030) and `NOT_SIDE_MIN`
+(0.036), or with fewer than `MIN_VIEW_FRAMES` (15) measurable frames, is
+`unsure` and still scores — the band is not evidence either way. A take whose
+**every** scored hold is `not_side` shows no number at all: the panel and the
+History row say `No score: film from the side for a score` instead, and an
+`unsure` view is shown with a "the score assumes a side view" footnote.
+
 Each **hold** contributes one value per feature, so every hold weighs the same
 and no long hold outvotes a short one; frames are never pooled. Per feature it
 writes the mean, the **sample** SD (`ddof = 1`) and `n` over the finite hold

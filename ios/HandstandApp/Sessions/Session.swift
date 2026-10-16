@@ -15,7 +15,8 @@ import SwiftData
 /// `cloudKitDatabase: .none`, there is no network code behind this model.
 ///
 /// The analysis columns (`analyzedAt` … `analysisVersion`, plus
-/// `analysisNote` for a clip that could not be measured) are filled in by
+/// `analysisNote` for a clip that could not be measured and `analysisView`
+/// for which way the camera faced, chainlink #102) are filled in by
 /// chainlink #47 once scoring runs on the device; until then they are `nil`,
 /// which the History screens read as "Not analysed yet" — while an analysed
 /// take that produced no score reads "Analysed · no score" (`analysisStatus`,
@@ -56,6 +57,13 @@ final class Session {
     /// needs no migration; the screens read it as "Couldn't measure"
     /// instead of a score or a hold count.
     var analysisNote: String?
+    /// Which camera view the last analysis saw (chainlink #102): `"not_side"`
+    /// when every scored hold was filmed from the front or at an angle, else
+    /// the scored hold's view raw value (`"side"` / `"unsure"`), and `nil`
+    /// before #102 (and for a take that was not scored). Optional, so an
+    /// existing store needs no migration; the screens read it as
+    /// "Not a side view · no score" when there is no score.
+    var analysisView: String?
 
     /// The hold as a `HoldType`: unknown raw values (and holds the MVP
     /// cannot record yet) read as Line, via `HoldType.resolved`.
@@ -73,7 +81,8 @@ final class Session {
         holdCount: Int? = nil,
         longestHoldS: Double? = nil,
         analysisVersion: String? = nil,
-        analysisNote: String? = nil
+        analysisNote: String? = nil,
+        analysisView: String? = nil
     ) {
         self.movieFilename = movieFilename
         self.recordedAt = recordedAt
@@ -87,5 +96,6 @@ final class Session {
         self.longestHoldS = longestHoldS
         self.analysisVersion = analysisVersion
         self.analysisNote = analysisNote
+        self.analysisView = analysisView
     }
 }

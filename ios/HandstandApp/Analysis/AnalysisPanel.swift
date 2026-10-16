@@ -96,16 +96,22 @@ struct AnalysisPanel: View {
                 }
                 if let score = summary.clipScore {
                     LabeledContent("Score", value: SessionFormatter.score(score))
+                    // The view was not clear enough to be sure of a side view
+                    // (chainlink #102): the number is shown, but the panel
+                    // says what it assumes.
+                    if summary.clipView == .unsure {
+                        Text("Camera angle unclear: the score assumes a side view.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     // Without a reference there is nothing to score against —
                     // say so, rather than showing a dash with no explanation.
-                    Text(
-                        summary.hasReference
-                            ? "No score: this take could not be scored"
-                            : "No score yet (no reference)"
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    // A take filmed from the front or at an angle (#102) says
+                    // what to do about it instead of "could not be scored".
+                    Text(noScoreReason(summary))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
                 if !summary.topFaults.isEmpty {
                     Text(
@@ -116,6 +122,15 @@ struct AnalysisPanel: View {
                 }
             }
         }
+    }
+
+    /// What the panel says when there is no score to show: no reference is
+    /// the plainest answer, an all-notSide take tells the user how to get a
+    /// score (chainlink #102), and anything else could not be scored.
+    private func noScoreReason(_ summary: AnalysisSummary) -> String {
+        if !summary.hasReference { return "No score yet (no reference)" }
+        if summary.notSideView { return "No score: film from the side for a score" }
+        return "No score: this take could not be scored"
     }
 
     /// What the screen says when the app could not measure the clip: why,

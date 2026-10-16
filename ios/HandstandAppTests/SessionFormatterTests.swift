@@ -117,4 +117,40 @@ final class SessionFormatterTests: XCTestCase {
             "Couldn't measure"
         )
     }
+
+    // MARK: - The camera view (chainlink #102)
+
+    /// A take whose every scored hold was notSide and so has no score says how
+    /// to get one, instead of the generic "could not be scored".
+    func testANotSideViewWithNoScoreSaysToFilmFromTheSide() {
+        XCTAssertEqual(
+            SessionFormatter.analysisStatus(
+                analyzedAt: afternoon, clipScore: nil, analysisNote: nil,
+                holdCount: 2, analysisView: "not_side"),
+            "Not a side view · no score"
+        )
+    }
+
+    /// A score still wins over a not_side view: the app only stores "not_side"
+    /// when there is no side score, but the row must never lose a number that
+    /// exists.
+    func testAScoreStillWinsOverANotSideView() {
+        XCTAssertEqual(
+            SessionFormatter.analysisStatus(
+                analyzedAt: afternoon, clipScore: 0.87, analysisNote: nil,
+                holdCount: 1, analysisView: "not_side"),
+            "0.87"
+        )
+    }
+
+    /// A side or unsure view with no score reads the generic "Analysed · no
+    /// score": only not_side gets the camera advice.
+    func testASideViewWithNoScoreReadsTheGenericNoScore() {
+        XCTAssertEqual(
+            SessionFormatter.analysisStatus(
+                analyzedAt: afternoon, clipScore: nil, analysisNote: nil,
+                holdCount: 2, analysisView: "side"),
+            "Analysed · 2 holds · no score"
+        )
+    }
 }

@@ -440,6 +440,39 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(session.holdCount, 2)
     }
 
+    /// `recordAnalysis` writes the camera view (chainlink #102) every time,
+    /// like the note: a later run overwrites it, and a run with no view
+    /// clears it to `nil` rather than leaving a stale one.
+    func testRecordAnalysisWritesTheViewAndALaterRunClearsIt() throws {
+        let sut = try makeSUT()
+        defer { try? FileManager.default.removeItem(at: sut.directory) }
+        let movie = try makeMovie(named: "20260928-143059.mov", in: sut.directory)
+        let session = try sut.store.add(
+            movie: movie,
+            metadata: nil,
+            info: VideoInfo(duration: 10, width: 1080, height: 1920)
+        )
+        XCTAssertNil(session.analysisView, "a fresh recording has no view")
+
+        try sut.store.recordAnalysis(
+            for: session, score: nil, holdCount: 2, longestHoldS: 1.5,
+            version: "analysis-1", view: "not_side"
+        )
+        XCTAssertEqual(session.analysisView, "not_side")
+
+        try sut.store.recordAnalysis(
+            for: session, score: 0.87, holdCount: 2, longestHoldS: 1.5,
+            version: "analysis-1", view: "side"
+        )
+        XCTAssertEqual(session.analysisView, "side")
+
+        try sut.store.recordAnalysis(
+            for: session, score: 0.87, holdCount: 2, longestHoldS: 1.5,
+            version: "analysis-1"
+        )
+        XCTAssertNil(session.analysisView, "a run with no view clears the old one")
+    }
+
     // MARK: - The pose cache (chainlink #48)
 
     /// Deleting a recording takes its `.pose.json` with the movie: a cache

@@ -137,7 +137,17 @@ final class AnalysisService {
                     holdCount: unusable == nil ? summary.holdCount : 0,
                     longestHoldS: unusable == nil ? summary.longestHoldS : 0,
                     version: backend.analysisVersion,
-                    note: unusable
+                    note: unusable,
+                    // Which way the camera faced (chainlink #102): an
+                    // all-notSide take stores "not_side" so the History row
+                    // can explain the missing score, otherwise the scored
+                    // hold's own view. `nil` for an unmeasurable clip, like
+                    // the score and hold count beside it.
+                    view: unusable == nil
+                        ? (summary.notSideView
+                            ? CameraView.notSide.rawValue
+                            : summary.clipView?.rawValue)
+                        : nil
                 )
                 // 7. The diagnostics beside the recording (chainlink #93): a
                 //    few KB of numbers — the wall time, the video, the frame
@@ -271,11 +281,22 @@ struct AnalysisSummary: Equatable {
     /// The longest of them, in seconds.
     var longestHoldS: Double
     /// The clip's score; `nil` without a reference (or when no hold could
-    /// be scored against it).
+    /// be scored against it). Since chainlink #102 this is
+    /// `analysis.sideClipScore` — the longest scored hold that was **not**
+    /// filmed from the front or at an angle — so a take that is not a side
+    /// view does not show a misleading number.
     var clipScore: Double?
     /// The scored hold's worst faults, worst first, as the scorer spells
     /// them (`"hip_angle"`) — at most `Scorer.topFaults` of them.
     var topFaults: [String]
+    /// Was every scored hold of this take filmed from the front or at an
+    /// angle (chainlink #102)? Then there is no score to show, only the
+    /// "film from the side" advice.
+    var notSideView: Bool
+    /// The detected view of the hold the score came from, `nil` when there is
+    /// no score — the view of `Analysis.sideClipScore`'s hold. `.unsure` is
+    /// the one the panel adds a footnote for.
+    var clipView: CameraView?
     /// Was a scoring reference available for this run?
     var hasReference: Bool
     /// Why the analysis could not measure the clip at all; `nil` when it
@@ -299,9 +320,12 @@ struct AnalysisSummary: Equatable {
     ///
     /// Holds come from `analysis.phases` (the hold runs), never from the
     /// scores: a clip analysed with no reference still has its holds
-    /// counted and its longest hold timed. The score is `clipScore`'s
-    /// number — the longest *scored* hold, as `Scorer.clipScore` picks it —
-    /// and the faults are that hold's `topFaults`.
+    /// counted and its longest hold timed. The score is `sideClipScore`'s
+    /// number — the longest *scored* hold that was not filmed from the front
+    /// or at an angle (chainlink #102), as `Scorer.clipScore` picks a hold —
+    /// and the faults are that hold's `topFaults`. `notSideView` says every
+    /// scored hold was notSide, which is when the screen says to film from
+    /// the side instead of showing a number.
     ///
     /// `frames` are the frames that went *into* the pipeline: `detected` is
     /// their flag, not something the `Analysis` carries.
@@ -317,14 +341,17 @@ struct AnalysisSummary: Equatable {
     ) -> AnalysisSummary {
         let durations = analysis.phases.holdDurationsS()
         let unusable = unusableReason(of: analysis)
+        let sideScore = analysis.sideClipScore
         return AnalysisSummary(
             frames: analysis.phases.tMs.count,
             holdCount: analysis.phases.holdCount,
             longestHoldS: durations.max() ?? 0,
-            clipScore: analysis.clipScore?.score,
-            topFaults: (analysis.clipScore?.topFaults ?? [])
+            clipScore: sideScore?.score,
+            topFaults: (sideScore?.topFaults ?? [])
                 .prefix(Scorer.topFaults)
                 .map(\.feature),
+            notSideView: analysis.notSideOnly,
+            clipView: sideScore.flatMap { analysis.view(ofHold: $0.holdId) },
             hasReference: hasReference,
             unusableReason: unusable,
             detectedFrames: frames.filter(\.detected).count,

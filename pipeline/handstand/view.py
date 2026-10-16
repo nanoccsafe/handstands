@@ -8,25 +8,30 @@ instead, per hold, so a clip whose cell is empty can still be used.
 
 The rule is the one the lead measured on the hand-labelled clips: from the side
 the left and right shoulders (and hips) sit on top of each other in the image,
-and from the front or at an angle they are apart. Per frame this module
-measures the width between the two shoulders and between the two hips, in
-pixels, and divides the mean of the ones it can see by the clip's body length
-``L``::
+and from the front or at an angle they are apart. The phone usually sits low —
+on the floor, looking up — which spreads the near and the far joint of a pair
+*along* the body, so the separation is measured only **across** the torso,
+projected on the axis perpendicular to the shoulder-midpoint-to-hip-midpoint
+line. Per frame::
 
-    view_width = mean(shoulder width, hip width) / L
+    S = midpoint(shoulders), H = midpoint(hips), axis = H - S
+    n = unit vector perpendicular to axis
+    shoulder_across = |(left_shoulder - right_shoulder) . n|
+    hip_across      = |(left_hip     - right_hip)     . n|
+    view_width      = (shoulder_across + hip_across) / 2 / L
 
-A pair contributes only when *both* its joints are valid, so a frame that sees
-one shoulder and not the other has no shoulder width; a frame that sees neither
-pair, or a clip with no usable ``L``, has no ``view_width`` at all.
+A frame has a value only when **all four** joints are valid and the torso axis
+has a non-zero finite length; one pair alone is not the across-the-body
+measure. A clip with no positive finite ``L`` has no ``view_width`` at all.
 
 Per hold, the median of the finite ``view_width`` values classifies the view::
 
-    median <  SIDE_MAX (0.035)       -> "side"
-    median >= NOT_SIDE_MIN (0.042)   -> "not_side"
+    median <  SIDE_MAX (0.030)       -> "side"
+    median >= NOT_SIDE_MIN (0.036)   -> "not_side"
     otherwise, or under MIN_VIEW_FRAMES (15) finite frames -> "unsure"
 
 The gap between the two thresholds is deliberate: the lead's labelled side
-holds measured 0.013–0.030 and the front holds 0.045–0.113, and a median in the
+holds measured 0.005–0.026 and the front holds 0.038–0.112, and a median in the
 band between them is not evidence either way.
 
 Input and output
@@ -96,11 +101,11 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 
 #: A hold whose median ``view_width`` is under this is a side view.
-SIDE_MAX = 0.035
+SIDE_MAX = 0.030
 
 #: A hold whose median ``view_width`` is at or over this is not a side view.
 #: Between the two the measurement is not evidence either way.
-NOT_SIDE_MIN = 0.042
+NOT_SIDE_MIN = 0.036
 
 #: A hold with fewer finite ``view_width`` frames than this is never classified:
 #: a median of a handful of frames is not a camera angle.
@@ -130,11 +135,14 @@ _VIEW_DIGITS = 4
 #: The catalogue labels :func:`validation_report` counts, in report order.
 _LABELS: tuple[str, ...] = ("side", "front", "other")
 
-#: The joint pairs whose image separation says which way the athlete faces the
-#: camera, in the order they are averaged.
-_WIDTH_PAIRS: tuple[tuple[str, str], ...] = (
-    ("left_shoulder", "right_shoulder"),
-    ("left_hip", "right_hip"),
+#: The four joints the across-the-body measure is built from. All four are read
+#: together: one pair alone is not the measure, so a clip missing any of them is
+#: unmeasurable rather than measured against a phantom joint.
+_SIDE_JOINTS: tuple[str, ...] = (
+    "left_shoulder",
+    "right_shoulder",
+    "left_hip",
+    "right_hip",
 )
 
 
@@ -143,17 +151,17 @@ _WIDTH_PAIRS: tuple[tuple[str, str], ...] = (
 # --------------------------------------------------------------------------- #
 
 
-def _pair_columns(joints: Sequence[str], left: str, right: str) -> tuple[int, int] | None:
-    """The two columns of a joint pair, or ``None`` when this clip has no pair.
+def _joint_columns(joints: Sequence[str], wanted: Sequence[str]) -> tuple[int, ...] | None:
+    """The columns of ``wanted``, or ``None`` when the clip does not report one.
 
     A source that does not report a joint — a future model with no hips, a
-    partially filled schema — simply has no column for it, and the pair is then
-    not measurable rather than measured against a phantom joint.
+    partially filled schema — simply has no column for it, and the measurement
+    is then not taken rather than taken against a phantom joint.
     """
     names = list(joints)
-    if left not in names or right not in names:
+    if any(name not in names for name in wanted):
         return None
-    return names.index(left), names.index(right)
+    return tuple(names.index(name) for name in wanted)
 
 
 def view_width(
@@ -165,38 +173,54 @@ def view_width(
 ) -> np.ndarray:
     """The per-frame ``view_width`` of a clip: ``(frames,)``, NaN where unmeasured.
 
-    The mean of the shoulder width and the hip width that this frame can see,
-    each the 2D pixel distance between the two joints of the pair and counted
-    only when **both** joints are valid, divided by the clip's body length
-    ``L``. A frame that sees neither pair, and every frame of a clip whose ``L``
-    is not a positive finite number, is NaN: a width over no body length is not
-    a ratio.
+    The two pair separations are projected **across** the torso axis — the line
+    from the shoulder midpoint to the hip midpoint — averaged and divided by the
+    clip's body length ``L``. Projecting takes out the component along the body,
+    which a low camera spreads the near and far joint over, so only the
+    genuinely side-on separation remains. A frame needs **all four** joints valid
+    and a torso axis of non-zero finite length, and a clip needs a positive
+    finite ``L``; anything else is NaN, because a width over nothing is not a
+    ratio.
     """
     frames = int(x.shape[0])
-    widths: list[np.ndarray] = []
-    for left, right in _WIDTH_PAIRS:
-        columns = _pair_columns(joints, left, right)
-        if columns is None:
-            continue
-        first, second = columns
-        both = np.asarray(valid, dtype=bool)[:, first] & np.asarray(valid, dtype=bool)[:, second]
-        with np.errstate(invalid="ignore"):
-            distance = np.hypot(
-                x[:, first].astype(np.float64) - x[:, second].astype(np.float64),
-                y[:, first].astype(np.float64) - y[:, second].astype(np.float64),
-            )
-        widths.append(np.where(both, distance, np.nan))
-    if not widths:
+    columns = _joint_columns(joints, _SIDE_JOINTS)
+    if columns is None or not (math.isfinite(body_length) and body_length > 0.0):
         return np.full(frames, np.nan)
-    stacked = np.stack(widths, axis=1)
-    finite = np.isfinite(stacked)
-    count = finite.sum(axis=1)
-    total = np.where(finite, stacked, 0.0).sum(axis=1)
+    left_shoulder, right_shoulder, left_hip, right_hip = columns
+    xf = np.asarray(x, dtype=np.float64)
+    yf = np.asarray(y, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
+    all_valid = (
+        valid[:, left_shoulder]
+        & valid[:, right_shoulder]
+        & valid[:, left_hip]
+        & valid[:, right_hip]
+    )
+
+    shoulder_x = (xf[:, left_shoulder] + xf[:, right_shoulder]) / 2.0
+    shoulder_y = (yf[:, left_shoulder] + yf[:, right_shoulder]) / 2.0
+    hip_x = (xf[:, left_hip] + xf[:, right_hip]) / 2.0
+    hip_y = (yf[:, left_hip] + yf[:, right_hip]) / 2.0
+    axis_x = hip_x - shoulder_x
+    axis_y = hip_y - shoulder_y
+    axis_length = np.hypot(axis_x, axis_y)
+
     with np.errstate(invalid="ignore", divide="ignore"):
-        mean_width = np.where(count > 0, total / np.maximum(count, 1), np.nan)
-    if not (math.isfinite(body_length) and body_length > 0.0):
-        return np.full(frames, np.nan)
-    return mean_width / float(body_length)
+        # The unit vector across the torso: the axis turned 90 degrees.
+        across_x = -axis_y / axis_length
+        across_y = axis_x / axis_length
+        shoulder_across = np.abs(
+            (xf[:, left_shoulder] - xf[:, right_shoulder]) * across_x
+            + (yf[:, left_shoulder] - yf[:, right_shoulder]) * across_y
+        )
+        hip_across = np.abs(
+            (xf[:, left_hip] - xf[:, right_hip]) * across_x
+            + (yf[:, left_hip] - yf[:, right_hip]) * across_y
+        )
+        width = (shoulder_across + hip_across) / 2.0 / float(body_length)
+
+    measurable = all_valid & np.isfinite(axis_length) & (axis_length > 0.0)
+    return np.where(measurable, width, np.nan)
 
 
 def classify(widths: np.ndarray) -> tuple[float, str]:
