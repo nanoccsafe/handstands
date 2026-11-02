@@ -261,6 +261,44 @@ Exit codes:
 - **1** — no features exist for a clip, with the same hint features.py uses:
   `generate them with: cd pipeline && uv run python -m handstand.features --all`.
 
+## Mixed holds (segments)
+
+A hold (`hold_summary.csv`) is one continuous inverted period, so a flow (split
+to line, tuck to line) is one hold whose window mixes shapes. `handstand.segments`
+finds the shape segments inside every hold and summarises each one like a hold,
+so the clean line part of a mixed hold can be used later.
+
+The rule, per hold, over its valid frames in frame order:
+
+1. A frame's shape is `hold_shapes.predict_shape` on that frame's
+   `leg_separation`, `knee_angle` and `hip_angle`.
+2. Runs are consecutive frames of the same shape. An `unmeasured` frame joins the
+   run in progress (leading ones join the first run); a hold with no measured
+   frame is one `unmeasured` segment.
+3. A run lasts from its first frame's `t_ms` to its last frame's.
+4. While there is more than one run and the shortest (first on ties) lasts under
+   `MIN_SEGMENT_MS` (1000 ms), it is merged into its longer neighbour (the
+   previous one when equal) and equal adjacent runs are coalesced.
+5. The runs left are the segments (`segment_id` 0, 1, ...); a hold with more than
+   one is `mixed`.
+
+```sh
+cd pipeline
+uv run python -m handstand.segments build [--data DIR] [--source SRC] [--clips ID ...] [--min-ms 1000]
+uv run python -m handstand.segments show CLIP_ID [--data DIR] [--source SRC]
+```
+
+`build` writes `<data_dir>/features/<source>/hold_segments.csv` (one row per
+segment: identity, `shape_guess`, `mixed`, frame counts, `start_ms`, `end_ms`,
+`duration_s`, then every feature's `_median` and `_iqr` with the hold summary's
+rounding, over the segment's measurable frames) and a report under
+`<data_dir>/reports/segments/`: holds and mixed holds, segments per shape, the
+line seconds inside mixed holds, and the reviewed holds (label by single-segment
+or mixed). Both stay under `data/`.
+
+Phase 1 changes nothing downstream: hold ids, `hold_summary.csv`, the reference,
+the scoring and the app do not read the segment table yet.
+
 ## Tests
 
 `pipeline/tests/test_score.py` builds every table and reference inline (small
