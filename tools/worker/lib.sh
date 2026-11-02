@@ -32,6 +32,9 @@ pids_in_worktree() {
     local cwd; cwd="$(readlink "$d/cwd" 2>/dev/null)" || continue
     [[ "$cwd" == "$wt" || "$cwd" == "$wt"/* ]] && echo "$pid"
   done
+  # Without this the function returns the last [[ ]]'s status (1 when the last /proc entry is not in the
+  # worktree), which under `set -eo pipefail` silently aborts stop.sh / merge.sh.
+  return 0
 }
 
 # Last marker line of the log: DONE / STOPPED / RUNNING / ORPHANED.

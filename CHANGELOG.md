@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Split mixed-shape holds into per-shape segments (#99)
 - Install on iPhone 13 by sideloading (free Apple ID, Xcode on the Mac mini) (#52)
 - App: detect side view per hold and gate the score (#102)
 - Detect side-view holds (pipeline) (#74)
