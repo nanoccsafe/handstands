@@ -222,11 +222,19 @@ def load_clip(
     """
     path = features.output_dir(data, source) / f"{clip_id}.parquet"
     table = features.read_clip_features(path)
-    values: dict[str, np.ndarray] = {
-        name: table[name].to_numpy(dtype=np.float64)
-        for name in (*features.FEATURE_NAMES, *features.COM_COLUMNS)
-        if name in table.columns
-    }
+    # The dtypes features.py itself gives them (see feature_table and
+    # _unusable_features): floats for the measurements, a flag for com_complete,
+    # words (NaN when unknown) for balance_zone.
+    values: dict[str, np.ndarray] = {}
+    for name in (*features.FEATURE_NAMES, *features.COM_COLUMNS):
+        if name not in table.columns:
+            continue
+        if name == "com_complete":
+            values[name] = table[name].to_numpy(dtype=bool)
+        elif name == "balance_zone":
+            values[name] = table[name].to_numpy(dtype=object)
+        else:
+            values[name] = table[name].to_numpy(dtype=np.float64)
     return features.ClipFeatures(
         clip_id=clip_id,
         source=source,
@@ -311,6 +319,7 @@ def build_segments(
     source: str = DEFAULT_SOURCE,
     clips: Sequence[str] | None = None,
     min_ms: int = MIN_SEGMENT_MS,
+    errors: list[str] | None = None,
 ) -> pd.DataFrame:
     """Segment every clip with a features parquet (or only ``clips``) and write the table.
 
@@ -318,8 +327,12 @@ def build_segments(
     the rows of the other clips already in the file are kept, as
     :func:`handstand.features.write_hold_summary` does for the hold summary. The
     file is written through a temporary file and a rename, so an interrupted run
-    cannot leave a half-written table behind. A named clip without a features
-    parquet is a :class:`FileNotFoundError`.
+    cannot leave a half-written table behind.
+
+    One bad clip does not abort the build: its error is printed as
+    ``<clip>: <error>``, appended to ``errors`` (when given) and the clip is
+    skipped; rows it already had in the file are kept. A named clip without a
+    features parquet is such an error.
     """
     root = pathlib.Path(data)
     if clips:
@@ -327,8 +340,17 @@ def build_segments(
     else:
         names = sorted(path.stem for path in features.output_dir(root, source).glob("*.parquet"))
     rows: list[dict[str, object]] = []
+    built: set[str] = set()
     for name in names:
-        rows.extend(clip_segments(load_clip(name, root, source), min_ms))
+        try:
+            rows.extend(clip_segments(load_clip(name, root, source), min_ms))
+        except Exception as error:  # one bad clip must not lose the other clips' segments
+            message = f"{name}: {error}"
+            print(message, file=sys.stderr)
+            if errors is not None:
+                errors.append(message)
+            continue
+        built.add(name)
     table = pd.DataFrame(rows, columns=list(SEGMENT_COLUMNS))
 
     path = segments_path(root, source)
@@ -337,7 +359,7 @@ def build_segments(
         missing = [column for column in SEGMENT_COLUMNS if column not in existing.columns]
         if missing:
             raise ValueError(f"{path}: segment table is missing column(s) {missing}")
-        keep = existing[~existing["clip_id"].astype(str).isin(set(names))]
+        keep = existing[~existing["clip_id"].astype(str).isin(built)]
         if not keep.empty:
             table = pd.concat([keep[list(SEGMENT_COLUMNS)], table], ignore_index=True)
     table = _sorted(table)
@@ -516,7 +538,8 @@ def _show(table: pd.DataFrame, clip_id: str) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Build the segment table and its report, or show one clip's segments.
 
-    Exit codes: **2** when a file cannot be read or written; **0** otherwise.
+    Exit codes: **2** when a file cannot be read or written; **1** when the table was
+    written but some clip failed (named on stderr); **0** otherwise.
     """
     args = build_arg_parser().parse_args(argv)
     root = pathlib.Path(args.data) if args.data is not None else data_dir()
@@ -524,12 +547,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "show":
             print(_show(read_segments(root, args.source), args.clip_id))
             return 0
-        table = build_segments(root, args.source, args.clips, args.min_ms)
+        errors: list[str] = []
+        table = build_segments(root, args.source, args.clips, args.min_ms, errors)
         text = report(table, hold_shapes.load_hold_shapes(root))
         report_path = _write_report(root, text)
         print(text)
         print(f"segments {segments_path(root, args.source)}")
         print(f"report {report_path}")
+        if errors:
+            print(f"segments: {len(errors)} clip(s) failed", file=sys.stderr)
+            return 1
         return 0
     except (OSError, ValueError) as error:
         print(f"segments: {error}", file=sys.stderr)

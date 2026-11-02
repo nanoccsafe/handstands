@@ -54,7 +54,12 @@ def synthetic_clip(
         values["knee_angle"][index] = knee
         # A varying hip so a median over the wrong frames is a different number.
         values["hip_angle"][index] = hip + (index % 4 if hip_noise and shape == "line" else 0)
-    values["com_complete"] = np.zeros(count, dtype=bool)
+    # The two non-float columns, as features.py carries them: a flag and words (NaN unknown).
+    values["com_complete"] = np.array([index % 2 == 0 for index in range(count)], dtype=bool)
+    zones = np.array(["under", "ok", "over"], dtype=object)
+    values["balance_zone"] = np.array(
+        [zones[index % 3] if index % 5 else math.nan for index in range(count)], dtype=object
+    )
     return ft.ClipFeatures(
         clip_id=clip_id,
         source="mediapipe",
@@ -310,9 +315,87 @@ def test_build_with_clips_keeps_the_other_clips_rows(tmp_path: pathlib.Path) -> 
     assert len(other) == 3 and other["mixed"].tolist() == [True, True, False]
 
 
-def test_a_named_clip_without_features_is_an_error(tmp_path: pathlib.Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        segments.build_segments(tmp_path, clips=["nope"])
+def test_load_clip_restores_the_dtypes_the_features_writer_used(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    clip = two_hold_clip()
+    write_features(data, clip)
+
+    loaded = segments.load_clip(CLIP_ID, data)
+
+    assert loaded.value("com_complete").dtype == bool
+    assert loaded.value("balance_zone").dtype == object
+    assert set(loaded.value("balance_zone")[~pd.isna(loaded.value("balance_zone"))]) == {
+        "under",
+        "ok",
+        "over",
+    }
+    assert loaded.value("knee_angle").dtype == np.float64
+    assert loaded.valid.tolist() == clip.valid.tolist()
+    assert [row["shape_guess"] for row in segments.clip_segments(loaded)] == [
+        "straddle",
+        "line",
+        "line",
+    ]
+
+
+def test_a_single_segment_hold_matches_the_hold_summary(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    clip = synthetic_clip(CLIP_ID, [("line", 0, True)] * 15 + [("line", 0, False)] * 2)
+    # Non-trivial numbers in every feature, so equal medians are not equal NaNs.
+    rng = np.random.default_rng(7)
+    for name in ft.FEATURE_NAMES:
+        if name not in ("leg_separation", "knee_angle", "hip_angle"):
+            clip.measured.values[name] = rng.normal(size=clip.frames)
+    write_features(data, clip)
+    loaded = segments.load_clip(CLIP_ID, data)
+
+    [row] = segments.clip_segments(loaded)
+    [summary] = ft.hold_rows(loaded)
+
+    assert row["mixed"] is False
+    assert row["valid_frames"] == summary["valid_frames"]
+    for feature in ft.FEATURES:
+        for statistic in ("median", "iqr"):
+            name = f"{feature.name}_{statistic}"
+            assert row[name] == summary[name] or (
+                math.isnan(row[name]) and math.isnan(summary[name])
+            ), name
+
+
+def test_a_bad_clip_is_reported_and_the_rest_are_built(tmp_path: pathlib.Path, capsys) -> None:
+    data = tmp_path / "data"
+    write_features(data, two_hold_clip(CLIP_ID))
+    broken = ft.output_dir(data) / f"{OTHER_ID}.parquet"
+    pd.DataFrame({"frame_idx": [0]}).to_parquet(broken, index=False)
+
+    errors: list[str] = []
+    table = segments.build_segments(data, errors=errors)
+
+    assert set(table["clip_id"]) == {CLIP_ID}
+    assert len(errors) == 1 and errors[0].startswith(f"{OTHER_ID}: ")
+    assert errors[0] in capsys.readouterr().err
+
+    errors = []
+    segments.build_segments(data, clips=["nope"], errors=errors)
+    assert len(errors) == 1 and errors[0].startswith("nope: ")
+    # The earlier rows of the clip that was not rebuilt are kept.
+    assert set(segments.read_segments(data)["clip_id"]) == {CLIP_ID}
+
+
+def test_the_cli_writes_everything_else_and_exits_1_when_a_clip_fails(
+    tmp_path: pathlib.Path, capsys
+) -> None:
+    data = tmp_path / "data"
+    write_features(data, two_hold_clip(CLIP_ID))
+    pd.DataFrame({"frame_idx": [0]}).to_parquet(
+        ft.output_dir(data) / f"{OTHER_ID}.parquet", index=False
+    )
+
+    assert segments.main(["build", "--data", str(data)]) == 1
+
+    assert set(segments.read_segments(data)["clip_id"]) == {CLIP_ID}
+    assert len(list((data / "reports" / "segments").glob("*.txt"))) == 1
+    assert f"{OTHER_ID}: " in capsys.readouterr().err
 
 
 def test_line_segments_filters_shape_and_length() -> None:
