@@ -67,10 +67,12 @@ CLI::
 
 The build also writes a sanity report to
 ``<data_dir>/reports/reference/<YYYY-MM-DD_HHMMSS>.txt`` and prints it: the
-per-feature table, a leave-one-out of the reference holds, every other line hold
-scored against the full reference, and the subset of those in side-view clips —
-so a person can see that the reference holds score better than the rest before
-anybody trusts the numbers.
+per-feature table, a leave-one-out of the reference holds, every other line
+window (:func:`handstand.segment_shapes.line_windows`) scored against the full
+reference, and the subset of those in side views — so a person can see that the
+reference holds score better than the rest before anybody trusts the numbers.
+The report also keeps the previous rule's whole-hold comparison for one release
+so the two can be compared side by side.
 """
 
 from __future__ import annotations
@@ -88,7 +90,15 @@ from typing import Any
 
 import pandas as pd
 
-from handstand import catalogue, features, hold_shapes, reference_review, score, view
+from handstand import (
+    catalogue,
+    features,
+    hold_shapes,
+    reference_review,
+    score,
+    segment_shapes,
+    view,
+)
 from handstand.paths import data_dir
 from handstand.postprocess import DEFAULT_SOURCE, SOURCES
 
@@ -255,8 +265,7 @@ def filter_side_view(
             )
             continue
         notes.append(
-            f"{clip} h{_hold_number(hold_id)}: not side view "
-            f"(camera_angle={angle or 'empty'})"
+            f"{clip} h{_hold_number(hold_id)}: not side view (camera_angle={angle or 'empty'})"
         )
     return kept, notes
 
@@ -279,6 +288,42 @@ def _is_side_view_hold(
     if detected is None:
         return False
     return detected.get((clip_id, int(hold_id))) == SIDE_VIEW
+
+
+def _is_side_view_window(
+    window: Mapping[str, Any],
+    angles: Mapping[str, str],
+    detected: Mapping[tuple[str, int], str] | None,
+    data: str | pathlib.Path,
+    source: str = DEFAULT_SOURCE,
+) -> bool:
+    """Whether one line window is comparable with the reference, by the same rule.
+
+    The hand label wins: a non-empty ``camera_angle`` is side view only when it
+    is :data:`SIDE_VIEW`. Only an empty cell falls back to a detected view, and
+    only when a ``detected`` map was given. A **segment** window is measured per
+    window (:func:`handstand.view.window_view`), because a mixed hold can change
+    shape — and with it the camera's read — inside itself; a whole-hold window
+    keeps the existing per-hold lookup (``detected[(clip_id, hold_id)]``).
+    """
+    clip_id = str(window["clip_id"])
+    hold_id = int(window["hold_id"])
+    angle = angles.get(clip_id, "")
+    if angle:
+        return angle == SIDE_VIEW
+    if detected is None:
+        return False
+    if window.get("origin") == "segment":
+        _median, detected_view = view.window_view(
+            clip_id,
+            hold_id,
+            window.get("start_ms"),
+            window.get("end_ms"),
+            data,
+            source,
+        )
+        return detected_view == SIDE_VIEW
+    return detected.get((clip_id, hold_id)) == SIDE_VIEW
 
 
 def collect_hold_values(
@@ -504,20 +549,26 @@ def evaluate(
     2. a **leave-one-out** of the reference holds: each hold scored against a
        reference rebuilt from the *other* holds (the same
        :func:`build_reference`), reported as median/min/max;
-    3. every other **line** hold of ``data/labels/hold_shapes.csv`` (the reference
-       holds themselves excluded) scored against the full reference, same
-       statistics plus how many were skipped — and, when ``side_angles`` is given,
-       the subset of those in side-view clips, the only comparable ones;
+    3. every other **line window** of
+       :func:`handstand.segment_shapes.line_windows` — reviewed unmixed line
+       holds plus reviewed line segments of at least two seconds — with the
+       reference holds themselves excluded, each window scored against the full
+       reference on its own frames (:func:`handstand.score.window_table`), same
+       statistics plus how many were skipped, and, when ``side_angles`` is given,
+       the subset of windows in side views, the only comparable ones;
     4. one line comparing the two medians — the check that the reference holds do
-       score better than the rest.
+       score better than the rest. The whole-hold rule of the previous release is
+       reported too, for one release, so the two comparison sets can be read side
+       by side.
 
     ``side_angles`` is :func:`camera_angles` when the build filtered to side
-    views: it adds the subset line in 3 and puts ``skipped_not_side`` in the
+    views: it adds the subset lines in 3 and puts ``skipped_not_side`` in the
     header. The subset uses the same rule the build filtered with — the hand
-    label wins, and an empty cell falls back to ``detected``
-    (:func:`handstand.view.read_hold_views`) — so the report compares side views
-    with side views. ``None`` for ``side_angles`` means every view was used and
-    the report reads as before.
+    label wins, and an empty cell falls back to a detected view
+    (:func:`handstand.view.read_hold_views` for a whole hold,
+    :func:`handstand.view.window_view` for a segment's own frames) — so the
+    report compares side views with side views. ``None`` for ``side_angles``
+    means every view was used and the report reads as before.
 
     Nothing here changes the reference; it only says whether the numbers deserve
     to be trusted.
@@ -560,42 +611,95 @@ def evaluate(
         if result.score is not None:
             loo_scores.append(result.score)
 
-    # Every other line hold (the reference holds excluded) against the full
-    # reference: the reference should pull its own holds to the top.
+    # Every other line WINDOW (the reference holds excluded) against the full
+    # reference: the reference should pull its own holds to the top. A window is
+    # a whole reviewed line hold or a reviewed line segment of at least 2 s
+    # (#103/#105), and each is scored on its own frames.
     reference_keys = {(str(row["clip_id"]), int(row["hold_id"])) for row in rows_ref}
-    shapes = hold_shapes.load_hold_shapes(root)
-    other = sorted(
-        (str(clip_id), int(hold_id))
-        for (clip_id, hold_id), shape in shapes.items()
-        if shape == "line" and (str(clip_id), int(hold_id)) not in reference_keys
-    )
+    try:
+        windows = segment_shapes.line_windows(root, source)
+    except FileNotFoundError:
+        # No hold_summary.csv: nothing defines a whole-hold window, so only the
+        # previous rule below can report anything.
+        windows = []
+    other_windows = [
+        window
+        for window in windows
+        if (str(window["clip_id"]), int(window["hold_id"])) not in reference_keys
+    ]
     other_scores: list[float] = []
     side_scores: list[float] = []
+    scored_holds = scored_segments = side_holds = side_segments = 0
     skipped = 0
-    for clip_id, hold_id in other:
+    for window in other_windows:
+        clip_id = str(window["clip_id"])
+        hold_id = int(window["hold_id"])
         table = _clip_table(clip_id, root, source, cache)
         if table is None:
             skipped += 1
             continue
-        result = score.score_hold(table, hold_id, reference_object)
+        windowed = score.window_table(table, hold_id, window.get("start_ms"), window.get("end_ms"))
+        result = score.score_hold(windowed, hold_id, reference_object)
         if result.score is None:
             skipped += 1
             continue
         other_scores.append(result.score)
-        if side_angles is not None and _is_side_view_hold(
-            clip_id, hold_id, side_angles, detected
+        is_segment = window.get("origin") == "segment"
+        if is_segment:
+            scored_segments += 1
+        else:
+            scored_holds += 1
+        if side_angles is not None and _is_side_view_window(
+            window, side_angles, detected, root, source
         ):
             side_scores.append(result.score)
+            if is_segment:
+                side_segments += 1
+            else:
+                side_holds += 1
+
+    # The previous release's comparison set, kept for one release so the lead can
+    # read the two side by side: whole line holds from hold_shapes.csv, scored
+    # whole, the reference holds excluded.
+    shapes = hold_shapes.load_hold_shapes(root)
+    previous = sorted(
+        (str(clip_id), int(hold_id))
+        for (clip_id, hold_id), shape in shapes.items()
+        if shape == "line" and (str(clip_id), int(hold_id)) not in reference_keys
+    )
+    previous_scores: list[float] = []
+    previous_side: list[float] = []
+    for clip_id, hold_id in previous:
+        table = _clip_table(clip_id, root, source, cache)
+        if table is None:
+            continue
+        result = score.score_hold(table, hold_id, reference_object)
+        if result.score is None:
+            continue
+        previous_scores.append(result.score)
+        if side_angles is not None and _is_side_view_hold(clip_id, hold_id, side_angles, detected):
+            previous_side.append(result.score)
 
     lines += ["", f"leave-one-out of the reference holds: {_score_text(loo_scores)}"]
+    window_counts = f"{scored_holds} holds + {scored_segments} segments"
+    if skipped:
+        window_counts += f", skipped {skipped}"
     lines.append(
-        f"other line holds against the full reference: {_score_text(other_scores)}"
-        + (f" (skipped {skipped})" if skipped else "")
+        "other line windows against the full reference: "
+        f"{_score_text(other_scores)} ({window_counts})"
     )
     if side_angles is not None:
-        lines.append(f"other line holds in side-view clips: {_score_text(side_scores)}")
+        lines.append(
+            "other line windows in side views: "
+            f"{_score_text(side_scores)} ({side_holds} holds + {side_segments} segments)"
+        )
+    lines.append(f"previous rule, whole line holds: {_score_text(previous_scores)}")
+    if side_angles is not None:
+        lines.append(
+            f"previous rule, whole line holds in side-view clips: {_score_text(previous_side)}"
+        )
     lines.append(
-        f"reference holds LOO median {_median_text(loo_scores)} vs other line holds median "
+        f"reference holds LOO median {_median_text(loo_scores)} vs other line windows median "
         f"{_median_text(other_scores)}"
     )
     return "\n".join(lines)
@@ -643,8 +747,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=pathlib.Path,
         default=None,
         help=(
-            "reference to write "
-            f"(default: <data_dir>/{REFERENCE_DIRNAME}/{DEFAULT_REFERENCE_NAME})"
+            f"reference to write (default: <data_dir>/{REFERENCE_DIRNAME}/{DEFAULT_REFERENCE_NAME})"
         ),
     )
     build.add_argument(
@@ -653,8 +756,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_HOLDS,
         metavar="N",
         help=(
-            "refuse to build from fewer than this many usable holds "
-            f"(default: {DEFAULT_MIN_HOLDS})"
+            f"refuse to build from fewer than this many usable holds (default: {DEFAULT_MIN_HOLDS})"
         ),
     )
     build.add_argument(

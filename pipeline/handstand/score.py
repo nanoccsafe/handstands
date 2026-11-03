@@ -124,6 +124,7 @@ __all__ = [
     "score_hold",
     "scores_table",
     "summary",
+    "window_table",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -196,9 +197,7 @@ _DERIVED: tuple[str, ...] = ("com_sway_sd", "hip_angle_sd")
 
 #: The fourteen features whose hold value is a median, in :data:`SCORE_FEATURES`
 #: order: every scored feature but the two spreads.
-_MEDIAN_FEATURES: tuple[str, ...] = tuple(
-    name for name in SCORE_FEATURES if name not in _DERIVED
-)
+_MEDIAN_FEATURES: tuple[str, ...] = tuple(name for name in SCORE_FEATURES if name not in _DERIVED)
 
 #: The groups a hold is judged in, as ``(name, weight, features)``, weights
 #: summing to 1.0. A group is what a judge would say out loud ("the stack is
@@ -229,9 +228,7 @@ GROUPS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
 #: which is exactly what :data:`HoldScore.top_faults` ranks by: a feature's
 #: share of the deviation is ``weight * |z| / size``.
 _GROUP_FOR: Mapping[str, tuple[str, float, int]] = {
-    name: (group, weight, len(members))
-    for group, weight, members in GROUPS
-    for name in members
+    name: (group, weight, len(members)) for group, weight, members in GROUPS for name in members
 }
 
 #: A hold with fewer valid frames than this is not scored: a median of four
@@ -429,6 +426,46 @@ def hold_values(table: pd.DataFrame, hold_id: int) -> dict[str, float]:
     values["com_sway_sd"] = _sd_finite(table["com_forward"].to_numpy(dtype=float)[mask])
     values["hip_angle_sd"] = _sd_finite(table["hip_angle"].to_numpy(dtype=float)[mask])
     return values
+
+
+def window_table(
+    table: pd.DataFrame,
+    hold_id: int,
+    start_ms: int | None,
+    end_ms: int | None,
+) -> pd.DataFrame:
+    """A copy of ``table`` with ``hold_id``'s frames outside ``[start_ms, end_ms]`` renumbered.
+
+    A line window (#105) is a slice of a hold in time — a reviewed line segment of
+    a mixed hold, or a whole reviewed line hold — and the scoring functions only
+    know how to measure a hold id. Cutting the table first is enough: the frames
+    of ``hold_id`` whose ``t_ms`` falls outside the window become ``-1`` (not in a
+    hold), exactly as frames between holds are, while every other hold is left
+    alone. ``score_hold(window_table(...), hold_id, ref)`` and
+    ``hold_values(window_table(...), hold_id)`` then measure the window only, with
+    no change to either function.
+
+    A ``None`` bound means no cut on that side, so ``(None, None)`` is the whole
+    hold and returns an unchanged copy; the input table is never mutated.
+    """
+    result = table.copy()
+    if start_ms is None and end_ms is None:
+        return result
+    hold_column = result["hold_id"].to_numpy()
+    t_ms = result["t_ms"].to_numpy()
+    outside = hold_column == hold_id
+    if start_ms is not None and end_ms is not None:
+        outside &= (t_ms < start_ms) | (t_ms > end_ms)
+    elif start_ms is not None:
+        outside &= t_ms < start_ms
+    elif end_ms is not None:
+        outside &= t_ms > end_ms
+    # Assign a new array rather than editing the view read above: the copy has
+    # its own block, and the original table is not touched either way.
+    column = hold_column.copy()
+    column[outside] = -1
+    result["hold_id"] = column
+    return result
 
 
 # --------------------------------------------------------------------------- #

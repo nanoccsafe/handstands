@@ -479,6 +479,59 @@ def test_the_hold_rows_are_the_ones_the_hold_summary_writes() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The window cut (#105)
+# --------------------------------------------------------------------------- #
+
+
+def test_window_table_excludes_frames_outside_the_window() -> None:
+    table = at_means_table(12)
+    table["off_hip"] = [0.0] * 6 + [1.0] * 6
+
+    windowed = score.window_table(table, 0, 0, 5 * FRAME_MS)
+
+    assert windowed["hold_id"].tolist() == [0] * 6 + [-1] * 6
+    # The medians are over the six frames left in hold 0, not over all twelve.
+    assert score.hold_values(windowed, 0)["off_hip"] == pytest.approx(0.0)
+    assert score.hold_values(table, 0)["off_hip"] == pytest.approx(0.5)
+    result = score.score_hold(windowed, 0, reference())
+    assert result.values["off_hip"] == pytest.approx(0.0)
+
+
+def test_window_table_with_no_bounds_is_the_whole_hold() -> None:
+    table = at_means_table(12, off_hip=[0.0] * 6 + [0.06] * 6)
+
+    whole = score.window_table(table, 0, None, None)
+
+    assert whole["hold_id"].tolist() == [0] * 12
+    for name, value in score.hold_values(table, 0).items():
+        assert score.hold_values(whole, 0)[name] == pytest.approx(value, nan_ok=True)
+
+
+def test_window_table_leaves_the_other_holds_and_the_input_alone() -> None:
+    table = at_means_table(12, hold_id=[0] * 8 + [1] * 4)
+    before = table["hold_id"].to_numpy().copy()
+
+    windowed = score.window_table(table, 0, 2 * FRAME_MS, 5 * FRAME_MS)
+
+    assert (table["hold_id"].to_numpy() == before).all()  # input not mutated
+    assert windowed["hold_id"].tolist() == [-1, -1, 0, 0, 0, 0, -1, -1, 1, 1, 1, 1]
+    # Hold 1 still measures its own four frames.
+    assert windowed.loc[windowed["hold_id"] == 1].shape[0] == 4
+
+
+def test_score_hold_reports_the_window_bounds() -> None:
+    table = at_means_table(12)
+    start_ms, end_ms = 2 * FRAME_MS, 7 * FRAME_MS
+
+    result = score.score_hold(score.window_table(table, 0, start_ms, end_ms), 0, reference())
+
+    assert result.score is not None
+    assert result.hold_start_ms == start_ms
+    assert result.hold_end_ms == end_ms
+    assert result.hold_frames == 6
+
+
+# --------------------------------------------------------------------------- #
 # clip_score
 # --------------------------------------------------------------------------- #
 
@@ -583,9 +636,7 @@ def the_reference_file(tmp_path: pathlib.Path) -> pathlib.Path:
     return write_reference(tmp_path / "reference.json")
 
 
-def test_the_cli_scores_every_clip_and_writes_scores_csv(
-    tmp_path: pathlib.Path, capsys
-) -> None:
+def test_the_cli_scores_every_clip_and_writes_scores_csv(tmp_path: pathlib.Path, capsys) -> None:
     data = tmp_path / "data"
     # Two holds: the ten-frame one scores, the three-frame one cannot.
     write_clip(
@@ -598,9 +649,7 @@ def test_the_cli_scores_every_clip_and_writes_scores_csv(
     )
     reference_path = the_reference_file(tmp_path)
 
-    assert (
-        score.main(["--reference", str(reference_path), "--all", "--data", str(data)]) == 0
-    )
+    assert score.main(["--reference", str(reference_path), "--all", "--data", str(data)]) == 0
 
     out = pd.read_csv(score.output_dir(data) / score.SCORES_NAME)
     assert out["clip_id"].tolist() == [CLIP_ID, CLIP_ID]
@@ -631,9 +680,7 @@ def test_the_cli_scores_only_the_clips_it_was_given(tmp_path: pathlib.Path) -> N
     reference_path = the_reference_file(tmp_path)
 
     assert (
-        score.main(
-            ["--reference", str(reference_path), "--clip", CLIP_ID, "--data", str(data)]
-        )
+        score.main(["--reference", str(reference_path), "--clip", CLIP_ID, "--data", str(data)])
         == 0
     )
     assert [p.name for p in score.output_dir(data).glob("*.csv")] == [score.SCORES_NAME]
@@ -646,9 +693,7 @@ def test_the_cli_refuses_a_missing_or_invalid_reference(tmp_path: pathlib.Path, 
     write_clip(data, CLIP_ID)  # features exist, and are still not read: no yardstick, no score
 
     assert (
-        score.main(
-            ["--reference", str(tmp_path / "absent.json"), "--all", "--data", str(data)]
-        )
+        score.main(["--reference", str(tmp_path / "absent.json"), "--all", "--data", str(data)])
         == 2
     )
     out = capsys.readouterr().out
@@ -691,6 +736,4 @@ def test_the_cli_needs_a_reference_and_exactly_one_selection(tmp_path: pathlib.P
     with pytest.raises(SystemExit):  # both --all and --clip
         score.main(["--reference", "x.json", "--all", "--clip", CLIP_ID, "--data", str(tmp_path)])
     with pytest.raises(SystemExit):  # a source that does not exist
-        score.main(
-            ["--reference", "x.json", "--all", "--source", "nope", "--data", str(tmp_path)]
-        )
+        score.main(["--reference", "x.json", "--all", "--source", "nope", "--data", str(tmp_path)])
