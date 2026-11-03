@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Reference sanity report compares against line windows (holds + reviewed line segments) (#105)
 - Label the segments of mixed holds (#104)
 - Review shapes of mixed-hold segments in Label Studio (3-frame strips) (#103)
 - Split mixed-shape holds into per-shape segments (#99)
