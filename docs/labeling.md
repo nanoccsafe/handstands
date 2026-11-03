@@ -675,6 +675,57 @@ line holds at all. That is the one filter the #28 reference, the #29/#30
 scoring and tuning and the #32–#34 fault classifier need; the #16 bake-off
 takes every hold and reports per shape instead.
 
+## Segments of mixed holds
+
+The hold-shape review shows **one** frame per hold — the middle one — so its
+label describes that snapshot, not the whole hold. That is wrong for a *mixed*
+hold: a flow (split to line, tuck to line) is one hold whose shape changes
+inside itself. `handstand.segments` finds those parts; this review labels each
+part from **several** frames, so the line part of a mixed hold can be used
+without the straddle or tuck around it.
+
+Only segments of a hold that `data/features/mediapipe/hold_segments.csv` marks
+`mixed` get a task. A segment's image is a horizontal **strip of three frames**
+at 25 %, 50 % and 75 % of the segment, decoded in display orientation, scaled
+to the same height (at most 480 px) with the time in seconds drawn in each
+frame's corner. A segment shorter than 300 ms gets its middle frame only — three
+frames of a tenth of a second would be the same picture.
+
+```bash
+cd pipeline
+uv run python -m handstand.segment_shapes prelabel
+uv run python -m handstand.segment_shapes import ../data/label_studio_segment_shapes_export.json
+uv run python -m handstand.segment_shapes summary
+uv run python -m handstand.segment_shapes push
+```
+
+`prelabel` writes `data/label_frames_segments/<clip_id>_h<hold_id>_s<segment_id>.jpg`,
+`manifest.csv`, `data/label_studio_segment_shapes.json` and
+`tools/labeling/segment_shapes_config.xml`. The choices and hotkeys are the
+hold-shape project's own (`line` 1, `straddle` 2, `split_stag` 3, `tuck` 4,
+`pike` 5, `other` 6, `not_a_hold` 7, `walk` 8, `mexican` 9): a clean pass is one
+key plus `Down` per segment. The header says which clip, hold and segment this
+is, its window and duration, and the existing hold label. The segment's
+`shape_guess` arrives preselected when it is a real shape; an unmeasured
+segment has no preselection. `--skip-existing` makes a rerun add only new
+segment keys, exactly like the hold-shape queue.
+
+`push` imports the task file into the project titled
+`handstand-segment-shapes`, creating it with the generated config when it does
+not exist and skipping segment keys the project already holds. It reads the
+same `~/.config/handstand/label-studio.env` credentials as the hold-shape push
+and never prints the password. `summary` prints the queued/reviewed counts, the
+labels per shape (count and seconds), how often the review agreed with the
+guess, and the resulting line windows.
+
+A **mixed hold labelled `line` counts for line uses only through its reviewed
+segments**, never through the hold label itself — that label came from one
+snapshot. An unmixed hold reviewed `line` still counts as a whole hold.
+`handstand.segment_shapes.line_windows()` returns both kinds:
+whole unmixed line holds (`origin="hold"`) and reviewed line segments of at
+least 2 s (`origin="segment"`), so the next issue can use the reference and
+scoring on the line parts only.
+
 ## Reference review (line holds)
 
 The catalogue's annotations are mostly what the pipeline already measured, and

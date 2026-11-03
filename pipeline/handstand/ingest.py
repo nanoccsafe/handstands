@@ -1077,6 +1077,62 @@ class LabelStudioClient:
                 return int(project["id"])
         raise LabelStudioError(f"no Label Studio project titled {title!r}")
 
+    def create_project(self, title: str, label_config: str) -> int:
+        """Create a project with ``title`` and ``label_config``; return its id.
+
+        Used when :meth:`find_project_id` does not find the project a review
+        module pushes to (the segment-shape project, #103).
+        """
+        body = json.dumps({"title": title, "label_config": label_config}).encode()
+        payload = self._call(
+            "POST",
+            f"{self.base_url}/api/projects",
+            body,
+            self._api_headers("application/json"),
+        )
+        try:
+            data = json.loads(payload)
+        except ValueError as error:
+            raise LabelStudioError(
+                f"POST {self.base_url}/api/projects did not answer JSON: {error}"
+            ) from error
+        if isinstance(data, dict) and data.get("id") is not None:
+            return int(data["id"])
+        snippet = payload[:200].decode("utf-8", "replace").replace("\n", " ")
+        raise LabelStudioError(
+            f"POST {self.base_url}/api/projects answered no project id: {snippet}"
+        )
+
+    def existing_keys(self, project_id: int, key_field: str) -> set[str]:
+        """The values of ``key_field`` in every task's ``data`` already present.
+
+        Reads page by page like :meth:`existing_holds`; a task without that
+        field is ignored, so a hand-made task can never collide with an import.
+        """
+        found: set[str] = set()
+        page_size = 100
+        page = 1
+        collected = 0
+        while True:
+            query = urllib.parse.urlencode(
+                {"project": project_id, "page": page, "page_size": page_size}
+            )
+            payload = self._call(
+                "GET", f"{self.base_url}/api/tasks?{query}", headers=self._api_headers()
+            )
+            batch, total = _tasks_page(json.loads(payload))
+            for task in batch:
+                data = task.get("data") if isinstance(task, Mapping) else None
+                if not isinstance(data, Mapping):
+                    continue
+                value = data.get(key_field)
+                if value is not None and str(value).strip():
+                    found.add(str(value))
+            collected += len(batch)
+            if len(batch) < page_size or (total is not None and collected >= total):
+                return found
+            page += 1
+
     def existing_holds(self, project_id: int) -> set[tuple[str, int | str]]:
         """``(clip_id, hold_id)`` of every task the project already holds (#89).
 
