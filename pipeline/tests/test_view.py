@@ -98,9 +98,7 @@ def write_catalogue(data: pathlib.Path, angles: dict[str, str]) -> pathlib.Path:
     path = reference_review.catalogue_path(data)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle, fieldnames=("clip_id", "camera_angle"), lineterminator="\n"
-        )
+        writer = csv.DictWriter(handle, fieldnames=("clip_id", "camera_angle"), lineterminator="\n")
         writer.writeheader()
         for clip_id, angle in angles.items():
             writer.writerow({"clip_id": clip_id, "camera_angle": angle})
@@ -357,6 +355,58 @@ def test_read_hold_views_round_trips_and_is_empty_without_the_file(
     view.write_hold_views(view.hold_views_path(data), table)
 
     assert view.read_hold_views(data) == {("clipA", 0): "side"}
+
+
+# --------------------------------------------------------------------------- #
+# window_view (#105)
+# --------------------------------------------------------------------------- #
+
+
+def test_window_view_classifies_each_half_of_a_hold(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    # One hold whose first twenty frames are side-like and last twenty front-like.
+    write_processed(
+        ft.input_dir(data),
+        CLIP_ID,
+        shoulders=[4.0] * 20 + [20.0] * 20,
+        hips=[6.0] * 20 + [16.0] * 20,
+        length=200.0,
+    )
+    write_clip(data, CLIP_ID, frames=40, hold_id=[0] * 40)
+
+    first_median, first_view = view.window_view(CLIP_ID, 0, 0, 19 * FRAME_MS, data)
+    second_median, second_view = view.window_view(CLIP_ID, 0, 20 * FRAME_MS, 39 * FRAME_MS, data)
+
+    assert first_view == "side"
+    assert first_median == pytest.approx(0.025)
+    assert second_view == "not_side"
+    assert second_median == pytest.approx(0.09)
+
+    # No bounds is the whole hold, exactly the hold's row from clip_hold_views.
+    whole = {row["hold_id"]: row for row in view.clip_hold_views(CLIP_ID, data)}[0]
+    median, classified = view.window_view(CLIP_ID, 0, None, None, data)
+    assert classified == whole["view"]
+    assert median == pytest.approx(whole["view_width"])
+
+
+def test_window_view_is_unsure_under_min_view_frames(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    write_processed(ft.input_dir(data), CLIP_ID, shoulders=[4.0] * 40, hips=[6.0] * 40)
+    write_clip(data, CLIP_ID, frames=40, hold_id=[0] * 40)
+
+    median, classified = view.window_view(
+        CLIP_ID, 0, 0, (view.MIN_VIEW_FRAMES - 6) * FRAME_MS, data
+    )
+
+    assert classified == "unsure"
+    assert median == pytest.approx(0.025)
+
+
+def test_window_view_is_unsure_without_a_processed_parquet(tmp_path: pathlib.Path) -> None:
+    median, classified = view.window_view(CLIP_ID, 0, None, None, tmp_path / "data")
+
+    assert math.isnan(median)
+    assert classified == "unsure"
 
 
 # --------------------------------------------------------------------------- #

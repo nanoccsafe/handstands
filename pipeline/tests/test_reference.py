@@ -16,10 +16,19 @@ import math
 import pathlib
 
 import pytest
-from test_score import GOOD, write_clip
+from test_score import FRAME_MS, GOOD, write_clip
 
-from handstand import features as ft
-from handstand import hold_shapes, reference, reference_review, score, view
+from handstand import (
+    features as ft,
+)
+from handstand import (
+    hold_shapes,
+    reference,
+    reference_review,
+    score,
+    segment_shapes,
+    view,
+)
 
 # test_score builds a per-frame table with every column the scoring functions
 # read, and writes it through read_clip_features' own contract; reusing its
@@ -61,9 +70,7 @@ def write_catalogue(data: pathlib.Path, angles: dict[str, str]) -> pathlib.Path:
     path = reference_review.catalogue_path(data)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle, fieldnames=("clip_id", "camera_angle"), lineterminator="\n"
-        )
+        writer = csv.DictWriter(handle, fieldnames=("clip_id", "camera_angle"), lineterminator="\n")
         writer.writeheader()
         for clip_id, angle in angles.items():
             writer.writerow({"clip_id": clip_id, "camera_angle": angle})
@@ -74,6 +81,162 @@ def good_clips(data: pathlib.Path, clip_ids: list[str]) -> None:
     """One ten-frame, at-the-means clip per id, so a hold scores."""
     for clip_id in clip_ids:
         write_clip(data, clip_id)
+
+
+HOLD_SUMMARY_COLUMNS = (
+    "clip_id",
+    "hold_id",
+    "hold_start_ms",
+    "hold_end_ms",
+    "hold_duration_s",
+)
+
+SEGMENT_COLUMNS = (
+    "clip_id",
+    "hold_id",
+    "segment_id",
+    "shape_guess",
+    "mixed",
+    "start_ms",
+    "end_ms",
+    "duration_s",
+)
+
+
+def write_hold_summary(data: pathlib.Path, rows: list[dict[str, object]]) -> pathlib.Path:
+    """A tiny ``hold_summary.csv``; every other column is blank."""
+    path = ft.output_dir(data) / ft.HOLD_SUMMARY_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(HOLD_SUMMARY_COLUMNS), lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            full = {column: "" for column in HOLD_SUMMARY_COLUMNS}
+            full.update(row)
+            writer.writerow(full)
+    return path
+
+
+def write_segments(data: pathlib.Path, rows: list[dict[str, object]]) -> pathlib.Path:
+    """A tiny ``hold_segments.csv``; every other column is blank."""
+    path = ft.output_dir(data) / "hold_segments.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(SEGMENT_COLUMNS), lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            full = {column: "" for column in SEGMENT_COLUMNS}
+            full.update(row)
+            writer.writerow(full)
+    return path
+
+
+def write_segment_labels(data: pathlib.Path, rows: list[dict[str, object]]) -> pathlib.Path:
+    """A tiny ``segment_shapes.csv`` with both the segment and hold ids written."""
+    path = segment_shapes.labels_path(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=list(segment_shapes.LABEL_COLUMNS), lineterminator="\n"
+        )
+        writer.writeheader()
+        for row in rows:
+            full = {column: "" for column in segment_shapes.LABEL_COLUMNS}
+            full.update(row)
+            writer.writerow(full)
+    return path
+
+
+MIXED_CLIP = "mixed0000001"
+REF_CLIPS = [f"ref{i:09d}" for i in range(5)]
+#: The mixed clip's times are 100 ms apart, so its 40-frame line part is 3.9 s.
+MIXED_FRAME_MS = 100
+LINE_SEGMENT_END_MS = 3900
+HOLD_END_MS = 9900
+
+
+def window_fixture(tmp_path: pathlib.Path) -> tuple[pathlib.Path, list[dict[str, object]], dict]:
+    """A reference plus one mixed hold whose only window is its line segment."""
+    data = tmp_path / "data"
+    good_clips(data, REF_CLIPS)
+    write_clip(
+        data,
+        MIXED_CLIP,
+        frames=100,
+        hold_id=[0] * 100,
+        t_ms=[index * MIXED_FRAME_MS for index in range(100)],
+        # The line segment's frames sit at the good head; the later straddle part
+        # is far off, so the whole hold's score would not be the window's.
+        head=[GOOD["head"][0]] * 40 + [GOOD["head"][0] + 600.0] * 60,
+    )
+    write_shapes(
+        data,
+        [(clip_id, 0, "line") for clip_id in [*REF_CLIPS, MIXED_CLIP]],
+    )
+    write_hold_summary(
+        data,
+        [{"clip_id": clip_id, "hold_id": 0, "hold_end_ms": 9 * FRAME_MS} for clip_id in REF_CLIPS]
+        + [{"clip_id": MIXED_CLIP, "hold_id": 0, "hold_end_ms": HOLD_END_MS}],
+    )
+    write_segments(
+        data,
+        [
+            {
+                "clip_id": MIXED_CLIP,
+                "hold_id": 0,
+                "segment_id": 0,
+                "shape_guess": "line",
+                "mixed": True,
+                "start_ms": 0,
+                "end_ms": LINE_SEGMENT_END_MS,
+                "duration_s": 3.9,
+            },
+            {
+                "clip_id": MIXED_CLIP,
+                "hold_id": 0,
+                "segment_id": 1,
+                "shape_guess": "straddle",
+                "mixed": True,
+                "start_ms": 4000,
+                "end_ms": HOLD_END_MS,
+                "duration_s": 5.9,
+            },
+        ],
+    )
+    write_segment_labels(
+        data,
+        [
+            {
+                "clip_id": MIXED_CLIP,
+                "hold_id": 0,
+                "segment_id": 0,
+                "start_ms": 0,
+                "end_ms": LINE_SEGMENT_END_MS,
+                "shape": "line",
+                "predicted": "line",
+            },
+            {
+                "clip_id": MIXED_CLIP,
+                "hold_id": 0,
+                "segment_id": 1,
+                "start_ms": 4000,
+                "end_ms": HOLD_END_MS,
+                "shape": "straddle",
+                "predicted": "straddle",
+            },
+        ],
+    )
+    rows = [
+        {
+            "clip_id": clip_id,
+            "hold_id": 0,
+            **score.hold_values(
+                ft.read_clip_features(ft.output_dir(data) / f"{clip_id}.parquet"), 0
+            ),
+        }
+        for clip_id in REF_CLIPS
+    ]
+    return data, rows, reference.build_reference(rows, "the tests' inline reference")
 
 
 # --------------------------------------------------------------------------- #
@@ -298,9 +461,7 @@ def test_the_cli_refuses_fewer_than_min_holds(tmp_path: pathlib.Path, capsys) ->
     write_labels(data, [("clipA", 0, "yes"), ("clipB", 0, "yes")])
 
     # --any-view keeps this about the count, not the camera.
-    assert (
-        reference.main(["build", "--data", str(data), "--min-holds", "5", "--any-view"]) == 2
-    )
+    assert reference.main(["build", "--data", str(data), "--min-holds", "5", "--any-view"]) == 2
     assert not reference.default_output(data).is_file()
     assert "only 2 usable hold(s)" in capsys.readouterr().err
 
@@ -386,9 +547,7 @@ def test_the_cli_needs_the_catalogue_unless_any_view(tmp_path: pathlib.Path, cap
     assert "no catalogue" in capsys.readouterr().err
 
     # --any-view never reads the catalogue, so the same data builds.
-    assert (
-        reference.main(["build", "--data", str(data), "--min-holds", "2", "--any-view"]) == 0
-    )
+    assert reference.main(["build", "--data", str(data), "--min-holds", "2", "--any-view"]) == 0
     loaded = score.load_reference(reference.default_output(data))
     assert loaded.n_holds == 2
     assert "side-view" not in loaded.built_from
@@ -404,9 +563,7 @@ def test_the_cli_any_view_keeps_non_side_holds(tmp_path: pathlib.Path) -> None:
     # Default drops the front clip: one side hold, under --min-holds 2.
     assert reference.main(["build", "--data", str(data), "--min-holds", "2"]) == 2
     # --any-view keeps both.
-    assert (
-        reference.main(["build", "--data", str(data), "--min-holds", "2", "--any-view"]) == 0
-    )
+    assert reference.main(["build", "--data", str(data), "--min-holds", "2", "--any-view"]) == 0
     assert score.load_reference(reference.default_output(data)).n_holds == 2
 
 
@@ -427,9 +584,7 @@ def test_the_cli_falls_back_to_detected_views_and_labels_only_skips_them(
     assert score.load_reference(reference.default_output(data)).n_holds == 6
 
     # --labels-only ignores the table: five hand-labelled holds, under the floor.
-    assert (
-        reference.main(["build", "--data", str(data), "--min-holds", "6", "--labels-only"]) == 2
-    )
+    assert reference.main(["build", "--data", str(data), "--min-holds", "6", "--labels-only"]) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -446,9 +601,16 @@ def test_evaluate_scores_reference_holds_and_other_lines(tmp_path: pathlib.Path)
         data,
         [(clip_id, 0, "line") for clip_id in clip_ids] + [("otherclip", 0, "line")],
     )
-    rows = [{"clip_id": clip_id, "hold_id": 0, **score.hold_values(
-        ft.read_clip_features(ft.output_dir(data) / f"{clip_id}.parquet"), 0
-    )} for clip_id in clip_ids]
+    rows = [
+        {
+            "clip_id": clip_id,
+            "hold_id": 0,
+            **score.hold_values(
+                ft.read_clip_features(ft.output_dir(data) / f"{clip_id}.parquet"), 0
+            ),
+        }
+        for clip_id in clip_ids
+    ]
     ref = reference.build_reference(rows, "the tests' inline reference")
 
     report = reference.evaluate(rows, ref, data)
@@ -456,9 +618,10 @@ def test_evaluate_scores_reference_holds_and_other_lines(tmp_path: pathlib.Path)
     assert "features:" in report
     assert "leave-one-out of the reference holds:" in report
     assert "n=6" in report  # six LOO scores
-    # One non-reference line hold scored against the full reference.
-    assert "other line holds against the full reference:" in report
-    assert "n=1" in report
+    # No hold_summary.csv in this fixture, so no window is defined; the old rule
+    # still scores the one non-reference line hold.
+    assert "other line windows against the full reference: none (0 holds + 0 segments)" in report
+    assert "previous rule, whole line holds: median=" in report
     assert "reference holds LOO median" in report
 
 
@@ -492,6 +655,73 @@ def test_evaluate_reports_the_side_view_subset(tmp_path: pathlib.Path) -> None:
     report = reference.evaluate(rows, ref, data, side_angles=angles, skipped_not_side=3)
 
     assert "5 hold(s) used, 3 skipped as not side view" in report
-    # The two other line holds are scored; only the side-view one is in the subset.
-    assert "other line holds against the full reference: median=" in report
-    assert "other line holds in side-view clips: median=" in report
+    # No windows here either; the previous rule still compares the two holds.
+    assert "other line windows against the full reference: none (0 holds + 0 segments)" in report
+    assert "other line windows in side views: none (0 holds + 0 segments)" in report
+    assert "previous rule, whole line holds: median=" in report
+    assert "previous rule, whole line holds in side-view clips: median=" in report
+
+
+def test_evaluate_scores_only_the_line_window_of_a_mixed_hold(tmp_path: pathlib.Path) -> None:
+    data, rows, ref = window_fixture(tmp_path)
+
+    report = reference.evaluate(rows, ref, data)
+
+    table = ft.read_clip_features(ft.output_dir(data) / f"{MIXED_CLIP}.parquet")
+    ref_object = reference._as_reference(ref)
+    expected = score.score_hold(
+        score.window_table(table, 0, 0, LINE_SEGMENT_END_MS),
+        0,
+        ref_object,
+    )
+    assert expected.score is not None
+    # Cutting matters: the whole hold's straddle part scores differently.
+    assert score.score_hold(table, 0, ref_object).score != expected.score
+
+    line = next(
+        text
+        for text in report.splitlines()
+        if text.startswith("other line windows against the full reference:")
+    )
+    # The mixed hold contributes through its line segment only, and the five
+    # reference holds (labelled line here) are excluded.
+    assert "(0 holds + 1 segments)" in line
+    assert f"median={expected.score:.1f} min={expected.score:.1f}" in line
+    assert "n=1" in line
+    assert "previous rule, whole line holds:" in report
+    assert "reference holds LOO median" in report
+
+
+def test_evaluate_measures_a_segment_window_for_the_side_subset(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data, rows, ref = window_fixture(tmp_path)
+    calls: list[tuple[str, int, int | None, int | None]] = []
+
+    def fake_window_view(
+        clip_id: str,
+        hold_id: int,
+        start_ms: int | None,
+        end_ms: int | None,
+        data_arg: pathlib.Path,
+        source: str = "mediapipe",
+    ) -> tuple[float, str]:
+        calls.append((clip_id, hold_id, start_ms, end_ms))
+        assert pathlib.Path(data_arg) == data
+        assert source == "mediapipe"
+        return 0.01, "side"
+
+    monkeypatch.setattr(view, "window_view", fake_window_view)
+    angles = {MIXED_CLIP: "", **{clip_id: "side" for clip_id in REF_CLIPS}}
+
+    report = reference.evaluate(rows, ref, data, side_angles=angles, detected={})
+
+    # The empty camera label falls back to the per-window measurement, with the
+    # reviewed segment's own bounds rather than the whole hold's.
+    assert calls == [(MIXED_CLIP, 0, 0, LINE_SEGMENT_END_MS)]
+    line = next(
+        text for text in report.splitlines() if text.startswith("other line windows in side views:")
+    )
+    assert "(0 holds + 1 segments)" in line
+    assert "n=1" in line
+    assert "previous rule, whole line holds in side-view clips:" in report

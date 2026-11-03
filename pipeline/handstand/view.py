@@ -93,6 +93,7 @@ __all__ = [
     "read_hold_views",
     "validation_report",
     "view_width",
+    "window_view",
     "write_hold_views",
 ]
 
@@ -269,23 +270,12 @@ def clip_hold_views(
     usable frame is reported and called ``"unsure"`` rather than dropped.
     """
     root = pathlib.Path(data)
-    processed = features.input_dir(root, source) / f"{clip_id}.parquet"
-    clip, valid = phases.read_processed(processed)
-    body_length, _reason = phases.read_body_length(processed.with_suffix(".json"))
-    table = features.read_clip_features(features.output_dir(root, source) / f"{clip_id}.parquet")
-    if clip.frames != len(table):
-        raise ValueError(
-            f"{clip_id}: processed has {clip.frames} frames but features has {len(table)}; "
-            "re-run the features stage"
-        )
-    widths = view_width(clip.x, clip.y, valid, clip.joints, body_length)
+    table, widths = _clip_widths(clip_id, root, source)
     hold_column = table["hold_id"].to_numpy()
-    valid_column = table["valid"].to_numpy(dtype=bool)
 
     rows: list[dict[str, Any]] = []
     for hold_id in sorted({int(value) for value in hold_column if int(value) >= 0}):
-        in_hold = (hold_column == hold_id) & valid_column
-        hold_widths = widths[in_hold]
+        hold_widths = widths[_window_mask(table, hold_id, None, None)]
         median, view = classify(hold_widths)
         rows.append(
             {
@@ -297,6 +287,78 @@ def clip_hold_views(
             }
         )
     return rows
+
+
+def _clip_widths(
+    clip_id: str,
+    root: pathlib.Path,
+    source: str,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """One clip's features table and every frame's ``view_width``.
+
+    The processed parquet and its sidecar hold the measurement input, the
+    features parquet holds the holds; they must carry the same frames in the same
+    order, and a mismatch is a :class:`ValueError` rather than a
+    plausible-looking wrong answer.
+    """
+    processed = features.input_dir(root, source) / f"{clip_id}.parquet"
+    clip, valid = phases.read_processed(processed)
+    body_length, _reason = phases.read_body_length(processed.with_suffix(".json"))
+    table = features.read_clip_features(features.output_dir(root, source) / f"{clip_id}.parquet")
+    if clip.frames != len(table):
+        raise ValueError(
+            f"{clip_id}: processed has {clip.frames} frames but features has {len(table)}; "
+            "re-run the features stage"
+        )
+    widths = view_width(clip.x, clip.y, valid, clip.joints, body_length)
+    return table, widths
+
+
+def _window_mask(
+    table: pd.DataFrame,
+    hold_id: int,
+    start_ms: int | None,
+    end_ms: int | None,
+) -> np.ndarray:
+    """The hold's valid frames whose ``t_ms`` is inside ``[start_ms, end_ms]``.
+
+    A ``None`` bound is no cut on that side, so ``(None, None)`` selects the
+    whole hold — exactly the frames :func:`clip_hold_views` measures.
+    """
+    mask = (table["hold_id"].to_numpy() == hold_id) & table["valid"].to_numpy(dtype=bool)
+    if start_ms is not None:
+        mask &= table["t_ms"].to_numpy() >= start_ms
+    if end_ms is not None:
+        mask &= table["t_ms"].to_numpy() <= end_ms
+    return mask
+
+
+def window_view(
+    clip_id: str,
+    hold_id: int,
+    start_ms: int | None,
+    end_ms: int | None,
+    data: str | pathlib.Path,
+    source: str = DEFAULT_SOURCE,
+) -> tuple[float, str]:
+    """One line window's median ``view_width`` and view (#105).
+
+    The per-hold rule of :func:`clip_hold_views` applied to the hold's valid
+    frames whose ``t_ms`` is inside ``[start_ms, end_ms]``: the same measurement,
+    the same length check and the same :func:`classify`. ``None`` bounds are the
+    whole hold and give exactly the hold's row from :func:`clip_hold_views`.
+
+    A missing processed parquet — a clip whose features outlived its input, or a
+    window the report cannot measure — is ``(nan, "unsure")`` rather than an
+    error: the sanity report only needs to know that it cannot call the window
+    side.
+    """
+    root = pathlib.Path(data)
+    try:
+        table, widths = _clip_widths(clip_id, root, source)
+    except FileNotFoundError:
+        return math.nan, "unsure"
+    return classify(widths[_window_mask(table, hold_id, start_ms, end_ms)])
 
 
 def build_hold_views(
@@ -361,8 +423,7 @@ def read_hold_views(
         return {}
     table = pd.read_csv(path)
     return {
-        (str(row.clip_id), int(row.hold_id)): str(row.view)
-        for row in table.itertuples(index=False)
+        (str(row.clip_id), int(row.hold_id)): str(row.view) for row in table.itertuples(index=False)
     }
 
 

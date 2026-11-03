@@ -206,8 +206,18 @@ detected view (`none` when there is no row). The hand label always wins, so a
 `front` clip is dropped however the detector reads it. With no `hold_views.csv`
 the build prints a note and only hand-labelled side clips count, and
 `--labels-only` asks for exactly that even when the table exists. The
-`other line holds in side-view clips` line of the sanity report uses the same
-rule per hold, so it compares side views with side views.
+`other line windows in side views` line of the sanity report uses the same rule,
+per window, so it compares side views with side views.
+
+The sanity report's comparison set is **line windows** rather than whole holds:
+every reviewed unmixed line hold plus every reviewed line segment of at least
+2 seconds (#103/#104), each scored on its own frames. A mixed hold labelled
+`line` therefore contributes only through its reviewed line segments, because
+that hold label came from one middle frame. The reference holds themselves are
+unchanged — the same reviewed good-form holds with the same numbers — so only
+the report's sections 3 and 4 moved. The report keeps the previous whole-hold
+comparison as `previous rule, whole line holds` for one release, so the two
+comparison sets can be read side by side.
 
 ### In the app
 
@@ -233,11 +243,13 @@ out — missing features are allowed by the format. It writes
 `<data_dir>/references/reference-line.json` by default, prints `n_holds` and the
 features written, and writes a sanity report to
 `<data_dir>/reports/reference/<YYYY-MM-DD_HHMMSS>.txt`: the per-feature table, a
-leave-one-out of the reference holds, every other line hold scored against the
-full reference, and the subset of those in side-view clips (the only comparable
-ones). `--min-holds` (default 10) refuses a reference built from too few holds,
-and `--install` copies the file to `ios/LocalResources/reference-line.json`, the
-name the app's `ReferenceLoader` looks for.
+leave-one-out of the reference holds, every other line window scored against the
+full reference, and the subset of those in side views (the only comparable
+ones), plus the previous rule's whole-hold comparison for one release.
+`--min-holds` (default 10) refuses a reference built from
+too few holds, and `--install` copies the file to
+`ios/LocalResources/reference-line.json`, the name the app's `ReferenceLoader`
+looks for.
 
 ## CLI
 
