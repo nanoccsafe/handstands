@@ -875,10 +875,14 @@ class FakeLabelStudio:
     ) -> tuple[int, list[tuple[str, str]], bytes]:
         self.calls.append((method, url, body, dict(headers)))
         if url.endswith("/user/login/") and method == "GET":
-            return 200, [
-                ("Set-Cookie", "csrftoken=tok123; Path=/"),
-                ("Set-Cookie", "sessionid=anon000; Path=/"),
-            ], self.login_page
+            return (
+                200,
+                [
+                    ("Set-Cookie", "csrftoken=tok123; Path=/"),
+                    ("Set-Cookie", "sessionid=anon000; Path=/"),
+                ],
+                self.login_page,
+            )
         if url.endswith("/user/login/") and method == "POST":
             if not self.login_sets_session:
                 # 200, not a redirect: the login form re-rendered, refused.
@@ -1001,8 +1005,7 @@ def test_the_label_studio_api_is_only_used_with_the_flag(tmp_path: pathlib.Path)
     assert "sekret-please" not in with_flag.text
     assert "tester@example.com" not in with_flag.text
     assert (
-        "0 already present, 2 imported into 'handstand-hold-shapes' (project 3)"
-        in with_flag.text
+        "0 already present, 2 imported into 'handstand-hold-shapes' (project 3)" in with_flag.text
     )
     assert with_flag.import_file is None, "with the flag the tasks go to the API"
 
@@ -1072,6 +1075,80 @@ def test_the_api_calls_send_the_sessionid_the_302_set() -> None:
     cookie = http.calls[-1][3]["Cookie"]
     assert "sessionid=sess42" in cookie, "the API call must send the logged-in session"
     assert "anon000" not in cookie, "…never the anonymous session the GET set"
+
+
+class FakeStorageHttp:
+    """``/api/storages/localfiles`` only: list on GET, create on POST."""
+
+    def __init__(self, storages: Sequence[Mapping[str, Any]] = ()) -> None:
+        self.storages = [dict(storage) for storage in storages]
+        self.calls: list[tuple[str, str, bytes | None, dict[str, str]]] = []
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None,
+        headers: Mapping[str, str],
+    ) -> tuple[int, list[tuple[str, str]], bytes]:
+        self.calls.append((method, url, body, dict(headers)))
+        if method == "GET" and url.split("?")[0].endswith("/api/storages/localfiles"):
+            payload = {"count": len(self.storages), "results": self.storages}
+            return 200, [], json.dumps(payload).encode()
+        if method == "POST" and url.endswith("/api/storages/localfiles"):
+            storage = json.loads(body or b"{}")
+            storage["id"] = 9
+            self.storages.append(storage)
+            return 201, [], json.dumps(storage).encode()
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+
+def test_ensure_local_storage_posts_the_hold_shape_settings_when_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = tmp_path / "data" / "label_frames_segments"
+    http = FakeStorageHttp()
+    client = ingest.LabelStudioClient(ingest.DEFAULT_LS_URL, http=http)
+    client.cookies["csrftoken"] = "tok123"
+
+    storage_id = client.ensure_local_storage(7, path, "handstand-segment-shapes frames")
+
+    assert storage_id == 9
+    assert [(method, url) for method, url, _body, _headers in http.calls] == [
+        ("GET", f"{ingest.DEFAULT_LS_URL}/api/storages/localfiles?project=7"),
+        ("POST", f"{ingest.DEFAULT_LS_URL}/api/storages/localfiles"),
+    ]
+    body = json.loads(http.calls[1][2] or b"{}")
+    assert body == {
+        "project": 7,
+        "path": str(path.resolve()),
+        "title": "handstand-segment-shapes frames",
+        "regex_filter": r".*\.jpg",
+        "use_blob_urls": True,
+        "recursive_scan": False,
+    }
+    assert http.calls[1][3]["Content-Type"] == "application/json"
+    assert all("/sync" not in url for _method, url, _body, _headers in http.calls), (
+        "a sync would import every image as an extra, empty task"
+    )
+
+
+def test_ensure_local_storage_reuses_a_storage_with_the_same_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = tmp_path / "data" / "label_frames_segments"
+    http = FakeStorageHttp(
+        [{"id": 4, "project": 7, "path": str(path.resolve()), "title": "frames"}]
+    )
+    client = ingest.LabelStudioClient(ingest.DEFAULT_LS_URL, http=http)
+    client.cookies["csrftoken"] = "tok123"
+
+    storage_id = client.ensure_local_storage(7, path, "handstand-segment-shapes frames")
+
+    assert storage_id == 4
+    assert [method for method, _url, _body, _headers in http.calls] == ["GET"]
+    assert len(http.storages) == 1, "nothing was created"
+    assert all("/sync" not in url for _method, url, _body, _headers in http.calls)
 
 
 def test_a_302_that_keeps_the_anonymous_session_is_a_failed_login() -> None:
@@ -1144,9 +1221,7 @@ def test_urllib_http_does_not_follow_redirects() -> None:
         with urllib.request.urlopen(url, timeout=5) as response:
             assert response.status == 200
             assert response.read() == b"the far page"
-            assert response.headers.get_all("Set-Cookie") == [
-                "sessionid=anonymous; Path=/"
-            ]
+            assert response.headers.get_all("Set-Cookie") == ["sessionid=anonymous; Path=/"]
         assert hits == ["/start", "/end"], "the default really does follow it"
 
         hits.clear()
@@ -1213,9 +1288,7 @@ def test_holds_already_in_the_project_are_not_imported_again(
     )
 
     assert report.ok, report.failures
-    assert (
-        "1 already present, 1 imported into 'handstand-hold-shapes' (project 3)" in report.text
-    )
+    assert "1 already present, 1 imported into 'handstand-hold-shapes' (project 3)" in report.text
     # The project was asked what it holds before anything was POSTed …
     asked = [url for _method, url, _body, _headers in http.calls]
     assert asked[3].split("?")[0].endswith("/api/tasks")
@@ -1241,9 +1314,7 @@ def test_import_only_reports_present_and_imported(tmp_path, capsys) -> None:
 
     # Everything is in the project already (the lead imported the file by hand).
     already = FakeLabelStudio(existing=[(clip_id, 0), (clip_id, 1)])
-    code = ingest.main(
-        ["--import-only", str(tasks_file)], http=already, env_path=credentials
-    )
+    code = ingest.main(["--import-only", str(tasks_file)], http=already, env_path=credentials)
 
     assert code == 0
     out = capsys.readouterr().out

@@ -660,12 +660,21 @@ def test_summary_counts_queued_reviewed_and_line_windows(tmp_path: pathlib.Path)
 class FakeClient:
     """The slice of :class:`handstand.ingest.LabelStudioClient` push needs."""
 
-    def __init__(self, project_id: int | None, existing: set[str]) -> None:
+    def __init__(
+        self,
+        project_id: int | None,
+        existing: set[str],
+        storages: list[dict[str, object]] | None = None,
+    ) -> None:
         self.project_id = project_id
         self.existing = existing
         self.created: tuple[str, str] | None = None
         self.imported: list[dict[str, object]] = []
         self.key_field: str | None = None
+        self.storages = list(storages or [])
+        self.storage_calls: list[tuple[int, str, str]] = []
+        self.storage_created: list[dict[str, object]] = []
+        self.sync_calls: list[int] = []
 
     def find_project_id(self, title: str) -> int:
         if self.project_id is None:
@@ -676,6 +685,25 @@ class FakeClient:
         self.created = (title, label_config)
         self.project_id = 7
         return 7
+
+    def ensure_local_storage(self, project_id: int, path: str, title: str) -> int:
+        self.storage_calls.append((project_id, str(path), title))
+        for storage in self.storages:
+            if storage["path"] == str(path):
+                return int(storage["id"])  # type: ignore[arg-type]
+        storage = {
+            "id": 11 + len(self.storages),
+            "project": project_id,
+            "path": str(path),
+            "title": title,
+        }
+        self.storages.append(storage)
+        self.storage_created.append(storage)
+        return int(storage["id"])  # type: ignore[arg-type]
+
+    def sync_storage(self, storage_id: int) -> None:
+        """Never called by push: a sync would import every image as a task."""
+        self.sync_calls.append(storage_id)
 
     def existing_keys(self, project_id: int, key_field: str) -> set[str]:
         assert project_id == self.project_id
@@ -730,3 +758,46 @@ def test_push_finds_an_existing_project_and_imports_nothing_new(tmp_path: pathli
     assert (report.project_id, report.imported, report.skipped) == (3, 0, 2)
     assert client.imported == []
     assert client.created is None
+
+
+def test_push_creates_the_local_files_storage_once_and_never_syncs(
+    tmp_path: pathlib.Path,
+) -> None:
+    data = tasks_fixture(tmp_path)
+    client = FakeClient(project_id=None, existing=set())
+    expected = segment_shapes.frames_dir(data).resolve()
+
+    first = segment_shapes.push(data=data, client=client)
+
+    assert first.created is True
+    assert client.storage_calls == [(7, str(expected), "handstand-segment-shapes frames")]
+    assert [(storage["project"], storage["path"]) for storage in client.storage_created] == [
+        (7, str(expected))
+    ]
+    assert client.sync_calls == [], "a sync would import every image as a task"
+
+    segment_shapes.push(data=data, client=client)
+
+    assert client.storage_calls == [
+        (7, str(expected), "handstand-segment-shapes frames"),
+        (7, str(expected), "handstand-segment-shapes frames"),
+    ]
+    assert len(client.storage_created) == 1, "the rerun found the storage it created"
+    assert client.sync_calls == []
+
+
+def test_push_keeps_an_existing_storage_for_the_same_path(tmp_path: pathlib.Path) -> None:
+    data = tasks_fixture(tmp_path)
+    expected = segment_shapes.frames_dir(data).resolve()
+    client = FakeClient(
+        project_id=3,
+        existing=set(),
+        storages=[{"id": 5, "project": 3, "path": str(expected)}],
+    )
+
+    report = segment_shapes.push(data=data, client=client)
+
+    assert report.project_id == 3
+    assert client.storage_created == []
+    assert client.storage_calls == [(3, str(expected), "handstand-segment-shapes frames")]
+    assert client.sync_calls == []

@@ -1183,6 +1183,13 @@ def push(
         project_id = client.create_project(PROJECT_TITLE, config_xml())
         created = True
 
+    # The tasks point at /data/local-files/?d=label_frames_segments/…, which
+    # answers 404 unless the project has a local-files storage for that dir.
+    storage = frames_dir(root)
+    if not storage.is_absolute():
+        storage = storage.resolve()
+    client.ensure_local_storage(project_id, storage, "handstand-segment-shapes frames")
+
     existing = client.existing_keys(project_id, "segment_key")
     fresh = [task for task in tasks if _task_key(task) not in existing]
     if fresh:
