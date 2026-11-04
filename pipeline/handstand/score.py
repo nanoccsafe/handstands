@@ -54,9 +54,15 @@ The score
 
 Per feature, ``z = (value - mean) / max(sd, SD_FLOOR)`` (the floor keeps a
 reference with a near-zero SD from turning ordinary noise into an infinite
-score), then ``|z|`` is capped at :data:`Z_CAP`. Each group of :data:`GROUPS`
-takes the mean capped ``|z|`` of the features in it that have both a finite hold
-value and a reference entry — a group with none is *missing*. The deviation is
+score), then ``|z|`` is capped at :data:`Z_CAP`. The two limb angles —
+``knee_angle`` and ``elbow_angle`` — use the larger
+:data:`SD_FLOOR_LIMB_DEG` floor, because their angle jitters by two or three
+degrees inside one hold, and they are **one-sided**: a limb straighter than the
+reference (an angle above the mean, 180 being fully straight) is not a fault,
+so its z is set to 0.0 before the cap rather than scored as a deviation. Each
+group of :data:`GROUPS` takes the mean capped ``|z|`` of the features in it
+that have both a finite hold value and a reference entry — a group with none
+is *missing*. The deviation is
 the weight-averaged group deviation over the groups that are there::
 
     D = sum(w_g * d_g) / sum(w_g)          over the groups that are not missing
@@ -100,6 +106,7 @@ __all__ = [
     "HIP_PENALTY_WEIGHT",
     "MIN_SCORE_FRAMES",
     "NO_REFERENCE_MESSAGE",
+    "ONE_SIDED_STRAIGHT",
     "REFERENCE_SCHEMA",
     "REFERENCE_SIGNS",
     "REFERENCE_VERSION",
@@ -109,6 +116,7 @@ __all__ = [
     "SCORE_FEATURES",
     "SD_FLOOR_DEG",
     "SD_FLOOR_L",
+    "SD_FLOOR_LIMB_DEG",
     "SIGNED_BY_FACING",
     "TOP_FAULTS",
     "Z_CAP",
@@ -249,6 +257,20 @@ SD_FLOOR_L = 0.01
 #: within a degree cannot promise a tenth of one.
 SD_FLOOR_DEG = 1.0
 
+#: The floor for the two limb angles, ``knee_angle`` and ``elbow_angle``, in
+#: degrees: the angle inside one hold jitters by roughly 2.6 (knee) and 1.9
+#: (elbow) degrees of SD, so a reference SD tighter than :data:`SD_FLOOR_DEG`
+#: would measure that jitter rather than the athlete and call six degrees off
+#: the mean the whole scale. Three degrees keeps the legs looking straight on
+#: video from being scored as bent.
+SD_FLOOR_LIMB_DEG = 3.0
+
+#: The two limb angles, which are **one-sided**: the angle is unsigned and 180
+#: is fully straight, so a value above the reference mean (a straighter knee or
+#: elbow) is not a fault and scores a z of 0.0. Below the mean is still scored,
+#: because a bent limb is the fault these two features exist to see.
+ONE_SIDED_STRAIGHT: tuple[str, ...] = ("knee_angle", "elbow_angle")
+
 #: How much of a z of the hip's own sway the one-sided hip penalty takes: a hip
 #: busier than the reference's is paying for the balance out of the score,
 #: at most ``HIP_PENALTY_WEIGHT * Z_CAP`` (0.4) points of deviation.
@@ -262,7 +284,8 @@ TOP_FAULTS = 3
 #: (:data:`SD_FLOOR_L`), angles in degrees (:data:`SD_FLOOR_DEG`). The units
 #: come from :data:`handstand.features.FEATURES` for the thirteen per-frame
 #: features in it, and are spelled out for the three columns that are not —
-#: both CoM numbers are in body lengths like every other length here.
+#: both CoM numbers are in body lengths like every other length here. The two
+#: limb angles override the angle floor with :data:`SD_FLOOR_LIMB_DEG`.
 _SD_FLOORS: Mapping[str, float] = {
     **{
         feature.name: SD_FLOOR_L if feature.unit == "L" else SD_FLOOR_DEG
@@ -272,6 +295,7 @@ _SD_FLOORS: Mapping[str, float] = {
     "com_forward": SD_FLOOR_L,
     "com_sway_sd": SD_FLOOR_L,
     "hip_angle_sd": SD_FLOOR_DEG,
+    **{name: SD_FLOOR_LIMB_DEG for name in ONE_SIDED_STRAIGHT},
 }
 
 
@@ -555,6 +579,11 @@ def score_hold(table: pd.DataFrame, hold_id: int, reference: Reference) -> HoldS
             continue
         mean, sd, _ = entry
         raw = (values[name] - mean) / max(sd, _SD_FLOORS[name])
+        # A straighter limb than the reference is not a fault: the limb angles
+        # are one-sided, so anything above the mean becomes a z of 0.0 — a
+        # comparable feature that is measured and simply not wrong.
+        if name in ONE_SIDED_STRAIGHT:
+            raw = min(raw, 0.0)
         # The z the score is made of: signed, but never beyond the cap, so one
         # broken feature is worth at most Z_CAP like any other.
         z[name] = float(np.clip(raw, -Z_CAP, Z_CAP))

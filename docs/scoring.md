@@ -83,6 +83,16 @@ z = (value - mean) / max(sd, SD_FLOOR)        SD_FLOOR = 0.01 L for lengths,
 z capped at |z| <= Z_CAP = 4.0
 ```
 
+The two limb angles, `knee_angle` and `elbow_angle`, use a larger floor of
+`SD_FLOOR_LIMB_DEG = 3.0` degrees, because the angle of one hold jitters by
+roughly two or three degrees on its own (the knee more than the elbow) and a
+tighter floor would score that jitter as if it were the pose. They are also
+**one-sided**: the angle is unsigned and 180° is fully straight, so a knee or
+elbow *straighter* than the reference mean is not a fault — its `z` is set to
+0.0 before the cap (it still counts as a comparable feature, it is just not
+wrong). A limb below the mean is scored as before. `shoulder_angle` and the
+other angles keep the 1.0° floor and stay two-sided.
+
 Each **group** of the table below takes the mean capped `|z|` over its
 features that have *both* a finite hold value and a reference entry; a group
 with none is `missing` (recorded in `missing_groups`). The deviation is the

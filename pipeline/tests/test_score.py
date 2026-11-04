@@ -227,6 +227,8 @@ def test_the_constants_the_issue_fixes_are_those_values() -> None:
     assert score.Z_CAP == 4.0
     assert score.SD_FLOOR_L == 0.01
     assert score.SD_FLOOR_DEG == 1.0
+    assert score.SD_FLOOR_LIMB_DEG == 3.0
+    assert score.ONE_SIDED_STRAIGHT == ("knee_angle", "elbow_angle")
     assert score.HIP_PENALTY_WEIGHT == 0.10
     assert score.MIN_SCORE_FRAMES == 5
     assert score.SIGNED_BY_FACING == (
@@ -241,8 +243,11 @@ def test_the_constants_the_issue_fixes_are_those_values() -> None:
 def test_the_sd_floor_each_feature_is_divided_by_follows_its_unit() -> None:
     for name in ("off_hip", "line_deviation", "banana", "com_forward", "com_sway_sd"):
         assert score._SD_FLOORS[name] == score.SD_FLOOR_L
-    for name in ("body_angle", "shoulder_angle", "hip_angle", "knee_angle", "hip_angle_sd"):
+    for name in ("body_angle", "shoulder_angle", "hip_angle", "hip_angle_sd"):
         assert score._SD_FLOORS[name] == score.SD_FLOOR_DEG
+    # The two limb angles are the entry override: three degrees, not one.
+    for name in score.ONE_SIDED_STRAIGHT:
+        assert score._SD_FLOORS[name] == score.SD_FLOOR_LIMB_DEG
 
 
 # --------------------------------------------------------------------------- #
@@ -293,22 +298,73 @@ def test_a_z_beyond_the_cap_is_capped_and_the_score_cannot_go_negative() -> None
     assert result.score == 95.0
 
     # And a hold far past the cap on *every* group stops at 0 rather than going
-    # under: D of Z_CAP plus the hip penalty is past the whole scale.
-    columns: dict[str, object] = {name: 1e9 for name in MEDIAN_FEATURES}
-    columns["com_forward"] = spread(1e9, 100.0)
-    columns["hip_angle"] = spread(1e9, 100.0)
+    # under: D of Z_CAP plus the hip penalty is past the whole scale. Every
+    # feature is pushed *below* its mean, because the one-sided knee and elbow
+    # above their mean are not faults any more.
+    columns: dict[str, object] = {name: -1e9 for name in MEDIAN_FEATURES}
+    columns["com_forward"] = spread(-1e9, 100.0)
+    columns["hip_angle"] = spread(-1e9, 100.0)
     hopeless = score.score_hold(at_means_table(**columns), 0, reference())
     assert hopeless.score == 0.0
 
 
 def test_the_sd_floor_divides_a_near_zero_reference_sd() -> None:
     ref = reference({"off_hip": (0.0, 0.001), "knee_angle": (179.0, 0.0)})
-    result = score.score_hold(at_means_table(off_hip=0.02, knee_angle=179.5), 0, ref)
+    result = score.score_hold(at_means_table(off_hip=0.02, knee_angle=178.5), 0, ref)
 
-    # Without the floors these would be z = 20 (0.02 / 0.001) and infinite.
+    # Without the floors these would be z = 20 (0.02 / 0.001) and infinite;
+    # the knee is below the mean (a bent leg is still a fault) so the limb
+    # floor of 3 degrees divides it.
     assert result.z["off_hip"] == pytest.approx(0.02 / score.SD_FLOOR_L)
-    assert result.z["knee_angle"] == pytest.approx(0.5 / score.SD_FLOOR_DEG)
+    assert result.z["knee_angle"] == pytest.approx(-0.5 / score.SD_FLOOR_LIMB_DEG)
     assert math.isfinite(result.deviation)
+
+
+def test_the_limb_floor_turns_six_degrees_into_two_sds_not_the_cap() -> None:
+    # A reference SD of 1.1 degrees is within-hold jitter, so the 3-degree
+    # limb floor divides the six-degree difference: z = -2, not -4 (the cap).
+    ref = reference({"knee_angle": (179.0, 1.1)})
+    result = score.score_hold(at_means_table(knee_angle=173.0), 0, ref)
+
+    assert result.z["knee_angle"] == pytest.approx(-2.0)
+    # knees_toes is knee_angle alone against this partial reference.
+    assert result.groups["knees_toes"] == pytest.approx(2.0)
+
+
+def test_a_limb_straighter_than_the_reference_is_not_a_fault() -> None:
+    ref = reference({**GOOD, "knee_angle": (173.0, 1.1), "elbow_angle": (166.9, 3.9)})
+    result = score.score_hold(at_means_table(knee_angle=179.0, elbow_angle=175.0), 0, ref)
+
+    # Both are above the mean, six and eight degrees straighter: z = 0.0.
+    assert result.z["knee_angle"] == 0.0
+    assert result.z["elbow_angle"] == 0.0
+    # A z of 0.0 still counts as a comparable feature, so the groups are there
+    # and their deviation reflects the straight limb: no fault, no penalty.
+    assert result.groups["knees_toes"] == pytest.approx(0.0)
+    assert result.groups["elbows"] == pytest.approx(0.0)
+    assert result.missing_groups == ()
+    assert result.deviation == pytest.approx(0.0)
+    assert result.score == 100.0
+
+
+def test_an_elbow_below_the_mean_uses_its_own_sd_above_the_floor() -> None:
+    ref = reference({"elbow_angle": (166.9, 3.9)})
+    result = score.score_hold(at_means_table(elbow_angle=160.0), 0, ref)
+
+    # 3.9 degrees is wider than the limb floor, so it is used as it is.
+    assert result.z["elbow_angle"] == pytest.approx(-6.9 / 3.9)
+    assert result.groups["elbows"] == pytest.approx(6.9 / 3.9)
+
+
+def test_another_angle_keeps_the_one_degree_floor_and_stays_two_sided() -> None:
+    ref = reference({"shoulder_angle": (178.0, 0.5)})
+
+    above = score.score_hold(at_means_table(shoulder_angle=179.0), 0, ref)
+    below = score.score_hold(at_means_table(shoulder_angle=177.0), 0, ref)
+
+    # The floor is 1.0 degree, not 3, and a straighter shoulder is still scored.
+    assert above.z["shoulder_angle"] == pytest.approx(1.0)
+    assert below.z["shoulder_angle"] == pytest.approx(-1.0)
 
 
 def test_the_facing_sign_flips_the_image_signed_features_before_scoring() -> None:
