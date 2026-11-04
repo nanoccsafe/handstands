@@ -303,6 +303,8 @@ final class ScorerTests: XCTestCase {
         XCTAssertEqual(Scorer.zCap, 4.0)  // Z_CAP
         XCTAssertEqual(Scorer.sdFloorL, 0.01)  // SD_FLOOR_L
         XCTAssertEqual(Scorer.sdFloorDeg, 1.0)  // SD_FLOOR_DEG
+        XCTAssertEqual(Scorer.sdFloorLimbDeg, 3.0)  // SD_FLOOR_LIMB_DEG
+        XCTAssertEqual(Scorer.oneSidedStraight, ["knee_angle", "elbow_angle"])  // ONE_SIDED_STRAIGHT
         XCTAssertEqual(Scorer.hipPenaltyWeight, 0.10)  // HIP_PENALTY_WEIGHT
         XCTAssertEqual(Scorer.minScoreFrames, 5)  // MIN_SCORE_FRAMES
         XCTAssertEqual(Scorer.topFaults, 3)  // TOP_FAULTS
@@ -330,8 +332,12 @@ final class ScorerTests: XCTestCase {
         for name in ["off_hip", "line_deviation", "banana", "com_forward", "com_sway_sd"] {
             XCTAssertEqual(Scorer.sdFloors[name] ?? .nan, Scorer.sdFloorL, name)
         }
-        for name in ["body_angle", "shoulder_angle", "hip_angle", "knee_angle", "hip_angle_sd"] {
+        for name in ["body_angle", "shoulder_angle", "hip_angle", "hip_angle_sd"] {
             XCTAssertEqual(Scorer.sdFloors[name] ?? .nan, Scorer.sdFloorDeg, name)
+        }
+        // The two limb angles are the entry override: three degrees, not one.
+        for name in Scorer.oneSidedStraight {
+            XCTAssertEqual(Scorer.sdFloors[name] ?? .nan, Scorer.sdFloorLimbDeg, name)
         }
         XCTAssertEqual(Scorer.sdFloors.count, Scorer.scoreFeatures.count)
     }
@@ -394,12 +400,14 @@ final class ScorerTests: XCTestCase {
 
         // And a hold far past the cap on *every* group stops at 0 rather than
         // going under: D of Z_CAP plus the hip penalty is past the whole scale.
+        // Every feature is pushed *below* its mean, because the one-sided knee
+        // and elbow above their mean are not faults any more.
         var columns: [String: [Double]] = [:]
         for name in Scorer.medianFeatures {
-            columns[name] = column(1e9, 10)
+            columns[name] = column(-1e9, 10)
         }
-        columns["com_forward"] = Self.spread(1e9, 100.0)
-        columns["hip_angle"] = Self.spread(1e9, 100.0)
+        columns["com_forward"] = Self.spread(-1e9, 100.0)
+        columns["hip_angle"] = Self.spread(-1e9, 100.0)
         let hopeless = Scorer.scoreHold(
             atMeansTable(overrides: columns), holdId: 0, reference: reference())
         XCTAssertEqual(hopeless.score, 0.0)
@@ -413,15 +421,81 @@ final class ScorerTests: XCTestCase {
         let result = Scorer.scoreHold(
             atMeansTable(overrides: [
                 "off_hip": column(0.02, 10),
-                "knee_angle": column(179.5, 10),
+                "knee_angle": column(178.5, 10),
             ]),
             holdId: 0, reference: reference)
 
-        // Without the floors these would be z = 20 (0.02 / 0.001) and infinite.
+        // Without the floors these would be z = 20 (0.02 / 0.001) and infinite;
+        // the knee is below the mean (a bent leg is still a fault) so the limb
+        // floor of 3 degrees divides it.
         XCTAssertEqual(result.z["off_hip"] ?? .nan, 0.02 / Scorer.sdFloorL, accuracy: 1e-9)
         XCTAssertEqual(
-            result.z["knee_angle"] ?? .nan, 0.5 / Scorer.sdFloorDeg, accuracy: 1e-9)
+            result.z["knee_angle"] ?? .nan,
+            -0.5 / Scorer.sdFloorLimbDeg, accuracy: 1e-9)
         XCTAssertTrue(result.deviation.isFinite)
+    }
+
+    func testTheLimbFloorTurnsSixDegreesIntoTwoSDsNotTheCap() {
+        // A reference SD of 1.1 degrees is within-hold jitter, so the 3-degree
+        // limb floor divides the six-degree difference: z = -2, not -4 (the cap).
+        let reference = reference(["knee_angle": (179.0, 1.1)])
+        let result = Scorer.scoreHold(
+            atMeansTable(overrides: ["knee_angle": column(173.0, 10)]),
+            holdId: 0, reference: reference)
+
+        XCTAssertEqual(result.z["knee_angle"] ?? .nan, -2.0, accuracy: 1e-9)
+        // knees_toes is knee_angle alone against this partial reference.
+        XCTAssertEqual(flatGroups(result.groups)["knees_toes"] ?? .nan, 2.0, accuracy: 1e-9)
+    }
+
+    func testALimbStraighterThanTheReferenceIsNotAFault() {
+        var straighter = Self.good
+        straighter["knee_angle"] = (mean: 173.0, sd: 1.1)
+        straighter["elbow_angle"] = (mean: 166.9, sd: 3.9)
+        let reference = reference(straighter)
+        let result = Scorer.scoreHold(
+            atMeansTable(overrides: [
+                "knee_angle": column(179.0, 10),
+                "elbow_angle": column(175.0, 10),
+            ]),
+            holdId: 0, reference: reference)
+
+        // Both are above the mean, six and eight degrees straighter: z = 0.0.
+        XCTAssertEqual(result.z["knee_angle"] ?? .nan, 0.0, accuracy: 1e-9)
+        XCTAssertEqual(result.z["elbow_angle"] ?? .nan, 0.0, accuracy: 1e-9)
+        // A z of 0.0 still counts as a comparable feature, so the groups are
+        // there and their deviation reflects the straight limb: no fault.
+        XCTAssertEqual(flatGroups(result.groups)["knees_toes"] ?? .nan, 0.0, accuracy: 1e-4)
+        XCTAssertEqual(flatGroups(result.groups)["elbows"] ?? .nan, 0.0, accuracy: 1e-4)
+        XCTAssertTrue(result.missingGroups.isEmpty)
+        XCTAssertEqual(result.deviation, 0.0, accuracy: 1e-4)
+        XCTAssertEqual(result.score, 100.0)
+    }
+
+    func testAnElbowBelowTheMeanUsesItsOwnSDAboveTheFloor() {
+        let reference = reference(["elbow_angle": (166.9, 3.9)])
+        let result = Scorer.scoreHold(
+            atMeansTable(overrides: ["elbow_angle": column(160.0, 10)]),
+            holdId: 0, reference: reference)
+
+        // 3.9 degrees is wider than the limb floor, so it is used as it is.
+        XCTAssertEqual(result.z["elbow_angle"] ?? .nan, -6.9 / 3.9, accuracy: 1e-9)
+        XCTAssertEqual(flatGroups(result.groups)["elbows"] ?? .nan, 6.9 / 3.9, accuracy: 1e-9)
+    }
+
+    func testAnotherAngleKeepsTheOneDegreeFloorAndStaysTwoSided() {
+        let reference = reference(["shoulder_angle": (178.0, 0.5)])
+
+        let above = Scorer.scoreHold(
+            atMeansTable(overrides: ["shoulder_angle": column(179.0, 10)]),
+            holdId: 0, reference: reference)
+        let below = Scorer.scoreHold(
+            atMeansTable(overrides: ["shoulder_angle": column(177.0, 10)]),
+            holdId: 0, reference: reference)
+
+        // The floor is 1.0 degree, not 3, and a straighter shoulder is still scored.
+        XCTAssertEqual(above.z["shoulder_angle"] ?? .nan, 1.0, accuracy: 1e-9)
+        XCTAssertEqual(below.z["shoulder_angle"] ?? .nan, -1.0, accuracy: 1e-9)
     }
 
     func testTheFacingSignFlipsTheImageSignedFeaturesBeforeScoring() {

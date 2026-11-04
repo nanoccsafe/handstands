@@ -438,11 +438,13 @@ What it does, in the order the pipeline does it:
    `MIN_SCORE_FRAMES` (5) valid frames is not scored:
    `"too few valid frames"`.
 3. **The score** — `z = (value - mean) / max(sd, SD_FLOOR)` capped at
-   `Z_CAP`, each group takes the mean capped |z| of the features it could
-   compare, `D` is the weight average over the groups that are there (a
-   missing group renormalises the weights), `P` the one-sided hip penalty,
-   and the score is `round(100 * max(0, 1 - (D + P) / Z_CAP), 1)` — half to
-   even, as Python rounds it. Every group missing is no score at all:
+   `Z_CAP`, the two limb angles using the larger `SD_FLOOR_LIMB_DEG` and
+   one-sided (`raw = min(raw, 0.0)`: a knee or elbow straighter than the
+   reference is not a fault), each group takes the mean capped |z| of the
+   features it could compare, `D` is the weight average over the groups that
+   are there (a missing group renormalises the weights), `P` the one-sided hip
+   penalty, and the score is `round(100 * max(0, 1 - (D + P) / Z_CAP), 1)` —
+   half to even, as Python rounds it. Every group missing is no score at all:
    `"nothing to compare"`. `topFaults` ranks `weight * |z| / size` with ties
    kept in `SCORE_FEATURES` order (Python's stable sort over `z`'s insertion
    order, so Swift's sort is made stable by hand), and `hip_angle_sd` is in
@@ -458,7 +460,9 @@ The constants, each the Python module constant of the same name:
 | `MIN_SCORE_FRAMES` | 5 | `Scorer.minScoreFrames` |
 | `Z_CAP` | 4.0 | `Scorer.zCap` |
 | `SD_FLOOR_L`, `SD_FLOOR_DEG` | 0.01 L, 1.0° | `Scorer.sdFloorL`, `.sdFloorDeg` |
-| `_SD_FLOORS` | per feature, from its unit | `Scorer.sdFloors` |
+| `SD_FLOOR_LIMB_DEG` | 3.0° | `Scorer.sdFloorLimbDeg` |
+| `ONE_SIDED_STRAIGHT` | knee_angle, elbow_angle | `Scorer.oneSidedStraight` |
+| `_SD_FLOORS` | per feature, from its unit (+ the limb override) | `Scorer.sdFloors` |
 | `HIP_PENALTY_WEIGHT` | 0.10 | `Scorer.hipPenaltyWeight` |
 | `TOP_FAULTS` | 3 | `Scorer.topFaults` |
 | `REFERENCE_SCHEMA`, `REFERENCE_VERSION`, `REFERENCE_SIGNS` | handstand-reference, 1, athlete | `Scorer.referenceSchema`, `.referenceVersion`, `.referenceSigns` |

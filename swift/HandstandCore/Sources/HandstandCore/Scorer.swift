@@ -23,7 +23,10 @@ import Foundation
 //   the hold values are medians over the hold's *measurable* frames and the
 //   two spreads are **population** SDs of the same frames' finite values;
 // * per feature `z = (value - mean) / max(sd, SD_FLOOR)` capped at `Z_CAP`,
-//   each group takes the mean capped `|z|` of the features it could compare,
+//   the two limb angles (`knee_angle`, `elbow_angle`) using the larger
+//   `SD_FLOOR_LIMB_DEG` floor and one-sided (`raw = min(raw, 0.0)`: a limb
+//   straighter than the reference is not a fault), each group taking the mean
+//   capped `|z|` of the features it could compare,
 //   the deviation `D` is the weight average over the groups that are there
 //   (so a missing group renormalises the weights), `P` is the one-sided hip
 //   penalty, and the score is Python's `round(…, 1)` — half to even;
@@ -485,6 +488,20 @@ public enum Scorer {
     /// whose good holds agree within a degree cannot promise a tenth of one.
     public static let sdFloorDeg = 1.0
 
+    /// `SD_FLOOR_LIMB_DEG` — the floor for the two limb angles,
+    /// `knee_angle` and `elbow_angle`, in degrees: the angle inside one hold
+    /// jitters by roughly 2.6 (knee) and 1.9 (elbow) degrees of SD, so a
+    /// tighter floor would measure that jitter rather than the athlete and
+    /// call six degrees off the mean the whole scale.
+    public static let sdFloorLimbDeg = 3.0
+
+    /// `ONE_SIDED_STRAIGHT` — the two limb angles, which are **one-sided**:
+    /// the angle is unsigned and 180 is fully straight, so a value above the
+    /// reference mean (a straighter knee or elbow) is not a fault and scores
+    /// a z of 0.0. Below the mean is still scored, because a bent limb is the
+    /// fault these two features exist to see.
+    public static let oneSidedStraight: Set<String> = ["knee_angle", "elbow_angle"]
+
     /// `HIP_PENALTY_WEIGHT` — how much of a z of the hip's own sway the
     /// one-sided hip penalty takes: a hip busier than the reference's is
     /// paying for the balance out of the score, at most `HIP_PENALTY_WEIGHT *
@@ -499,7 +516,8 @@ public enum Scorer {
     /// lengths in body lengths, angles in degrees, taken from the feature's
     /// own unit the way Python reads it off `features.FEATURES`, and spelled
     /// out for the three columns that are not in it (both CoM numbers are in
-    /// body lengths like every other length here).
+    /// body lengths like every other length here). The two limb angles
+    /// override the angle floor with `sdFloorLimbDeg`.
     static let sdFloors: [String: Double] = {
         var floors: [String: Double] = [:]
         for spec in Features.all where Scorer.scoreFeatures.contains(spec.name) {
@@ -508,6 +526,9 @@ public enum Scorer {
         floors["com_forward"] = Scorer.sdFloorL
         floors["com_sway_sd"] = Scorer.sdFloorL
         floors["hip_angle_sd"] = Scorer.sdFloorDeg
+        for name in Scorer.oneSidedStraight {
+            floors[name] = Scorer.sdFloorLimbDeg
+        }
         return floors
     }()
 
@@ -631,7 +652,14 @@ public enum Scorer {
                 continue
             }
             let floor = sdFloors[name] ?? sdFloorL
-            let raw = (value - stat.mean) / Swift.max(stat.sd, floor)
+            var raw = (value - stat.mean) / Swift.max(stat.sd, floor)
+            // A straighter limb than the reference is not a fault: the limb
+            // angles are one-sided, so anything above the mean becomes a z of
+            // 0.0 — a comparable feature that is measured and not wrong. A
+            // NaN must stay NaN, not become 0.
+            if oneSidedStraight.contains(name), !raw.isNaN {
+                raw = Swift.min(raw, 0.0)
+            }
             // The z the score is made of: signed, but never beyond the cap, so
             // one broken feature is worth at most Z_CAP like any other. Only a
             // NaN input can pass a NaN through the cap, as numpy's clip does.
