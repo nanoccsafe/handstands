@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- Score: knee/elbow SD floor 3 deg and one-sided straight limbs (Python + Swift) (#107)
 - segment_shapes push: also create the project's local-files storage (images 404 otherwise) (#106)
 - Reference sanity report compares against line windows (holds + reviewed line segments) (#105)
 - Label the segments of mixed holds (#104)
