@@ -1103,6 +1103,72 @@ class LabelStudioClient:
             f"POST {self.base_url}/api/projects answered no project id: {snippet}"
         )
 
+    def ensure_local_storage(
+        self, project_id: int, path: str | pathlib.Path, title: str
+    ) -> int | None:
+        """Make sure the project has a local-files storage at ``path``.
+
+        Label Studio serves ``/data/local-files/?d=…`` image URLs only from a
+        storage registered on the project; without one every task image answers
+        HTTP 404. The project's storages are listed first and a storage whose
+        ``path`` is already ``path`` is reused, so a rerun creates nothing. A
+        missing storage is POSTed with the hold-shape project's settings:
+        JPEGs only (``.*\\.jpg``), blob URLs on, no recursive scan.
+
+        The storage's **sync** endpoint is never called: a sync would import
+        every image in the directory as an extra, empty task.
+        """
+        wanted = pathlib.Path(path).expanduser().resolve()
+        query = urllib.parse.urlencode({"project": int(project_id)})
+        payload = self._call(
+            "GET",
+            f"{self.base_url}/api/storages/localfiles?{query}",
+            headers=self._api_headers(),
+        )
+        data = json.loads(payload)
+        storages: Any = data
+        if isinstance(data, dict):
+            found = data.get("results")
+            if not isinstance(found, list):
+                found = data.get("storages")
+            storages = found if isinstance(found, list) else []
+        for storage in storages if isinstance(storages, list) else []:
+            if not isinstance(storage, Mapping):
+                continue
+            stored = str(storage.get("path") or "")
+            if stored and pathlib.Path(stored).expanduser().resolve() == wanted:
+                identifier = storage.get("id")
+                return int(identifier) if identifier is not None else None
+
+        body = json.dumps(
+            {
+                "project": int(project_id),
+                "path": str(wanted),
+                "title": title,
+                "regex_filter": r".*\.jpg",
+                "use_blob_urls": True,
+                "recursive_scan": False,
+            }
+        ).encode()
+        payload = self._call(
+            "POST",
+            f"{self.base_url}/api/storages/localfiles",
+            body,
+            self._api_headers("application/json"),
+        )
+        try:
+            created = json.loads(payload)
+        except ValueError as error:
+            raise LabelStudioError(
+                f"POST {self.base_url}/api/storages/localfiles did not answer JSON: {error}"
+            ) from error
+        if isinstance(created, dict) and created.get("id") is not None:
+            return int(created["id"])
+        snippet = payload[:200].decode("utf-8", "replace").replace("\n", " ")
+        raise LabelStudioError(
+            f"POST {self.base_url}/api/storages/localfiles answered no storage id: {snippet}"
+        )
+
     def existing_keys(self, project_id: int, key_field: str) -> set[str]:
         """The values of ``key_field`` in every task's ``data`` already present.
 

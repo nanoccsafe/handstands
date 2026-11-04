@@ -712,8 +712,12 @@ segment keys, exactly like the hold-shape queue.
 
 `push` imports the task file into the project titled
 `handstand-segment-shapes`, creating it with the generated config when it does
-not exist and skipping segment keys the project already holds. It reads the
-same `~/.config/handstand/label-studio.env` credentials as the hold-shape push
+not exist and skipping segment keys the project already holds. After the
+project is found or created it also makes sure the project has a local-files
+storage for `data/label_frames_segments` (JPEGs only, blob URLs, no recursive
+scan — the same settings as the hold-shape project), so the task images load
+instead of answering 404. It reads the same
+`~/.config/handstand/label-studio.env` credentials as the hold-shape push
 and never prints the password. `summary` prints the queued/reviewed counts, the
 labels per shape (count and seconds), how often the review agreed with the
 guess, and the resulting line windows.
