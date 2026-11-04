@@ -217,6 +217,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   orientation excuse to fall back on
 
 ### Changed
+- segment_shapes push: also create the project's local-files storage (images 404 otherwise) (#106)
 - Reference sanity report compares against line windows (holds + reviewed line segments) (#105)
 - Label the segments of mixed holds (#104)
 - Review shapes of mixed-hold segments in Label Studio (3-frame strips) (#103)
